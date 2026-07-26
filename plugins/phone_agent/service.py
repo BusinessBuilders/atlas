@@ -70,6 +70,10 @@ Business config (~/.config/atlas-phone/businesses.toml):
   owner_name = "Jo"                         # who calls the caller back
   greeting = "Hi, this is ..."              # first thing the caller hears
   assistant_name = "Atlas"                  # optional, default "Atlas"
+  forward_to = "+15085550100"               # optional; enables live transfer —
+                                            # "connect me to a person" forwards
+                                            # the call to this number. Omit it
+                                            # and the agent takes messages only.
   facts = '''                               # optional; the ONLY specifics the
   Email: office@acmeplumbing.com            # agent may state as fact. Omit it
   Hours: Mon-Fri 8am-5pm                    # and the agent takes a message
@@ -127,9 +131,15 @@ if bool(NTFY_URL) != bool(NTFY_TOPIC):
 MAX_HISTORY_TURNS = 20          # user+assistant message pairs kept per call
 MODEL_TIMEOUT_SECONDS = 45      # hard cap on one model reply
 
-# The model ends its goodbye with this exact text to hang up. The scrubber
-# below guarantees the marker itself is never spoken.
+# In-band control markers. The model ends its goodbye with END_CALL_MARKER to
+# hang up, or ends a connecting-you sentence with TRANSFER_MARKER to forward
+# the call (only offered when the profile configures forward_to). The scrubber
+# below guarantees markers are never spoken, and honor_markers() refuses to
+# act on a marker glued to a question — a small model once hung up mid-intake
+# ("what time works best for you? [END CALL]"), so the bridge, not the model,
+# has the last word.
 END_CALL_MARKER = "[END CALL]"
+TRANSFER_MARKER = "[TRANSFER CALL]"
 
 SPOKEN_ERROR_TEMPLATE = (
     "I'm sorry, I'm having trouble thinking right now. "
@@ -175,9 +185,18 @@ PHONE_PERSONA_TEMPLATE = (
     "KNOWN FACTS — the only specifics you may state:\n"
     "{facts}\n"
     "\n"
-    "ENDING THE CALL: when the caller is finished — they say goodbye, ask you to hang up, or "
-    "the conversation is clearly over — reply with ONE short goodbye sentence and end it with "
-    "the exact text {marker}. Never use {marker} at any other time."
+    "ENDING THE CALL: only the CALLER decides the call is over. When they say goodbye, tell "
+    "you to hang up, or confirm there is nothing else they need, reply with ONE short goodbye "
+    "sentence and end it with the exact text {marker}. NEVER use {marker} in a reply that asks "
+    "the caller a question — if you just asked for their name, number, or anything else, you "
+    "are waiting for an answer, not ending the call. When unsure, ask \"Is there anything else "
+    "I can help you with?\" and wait.{transfer_section}"
+)
+TRANSFER_SECTION_TEMPLATE = (
+    "\n\nTRANSFERRING THE CALL: if the caller asks to speak with {owner_name} or a real "
+    "person, or clearly needs more than you can do on this call, say one short sentence that "
+    "you are connecting them now — not a question — and end it with the exact text {tmarker}. "
+    "Never use {tmarker} for anything else, and never promise a transfer without doing it."
 )
 NO_FACTS_LINE = (
     "- No specifics are on file. For prices, contact details, hours, or anything "
@@ -185,6 +204,7 @@ NO_FACTS_LINE = (
 )
 
 _PROFILE_REQUIRED_KEYS = ("business_name", "services", "owner_name", "greeting")
+_E164_RE = re.compile(r"^\+[0-9]{7,15}$")
 
 
 def load_business_config(path: str) -> tuple[dict, dict]:
@@ -225,6 +245,13 @@ def load_business_config(path: str) -> tuple[dict, dict]:
                 "profile %r is missing required keys %s — refusing to start", key, missing
             )
             sys.exit(1)
+        forward_to = str(profile.get("forward_to", "")).strip()
+        if forward_to and not _E164_RE.match(forward_to):
+            log.error(
+                "profile %r forward_to %r is not an E.164 number like +15085551234 — "
+                "refusing to start", key, forward_to,
+            )
+            sys.exit(1)
     return numbers, profiles
 
 
@@ -235,6 +262,11 @@ def build_system_prompt(profile: dict) -> str:
             line if line.lstrip().startswith("-") else f"- {line.strip()}"
             for line in facts.splitlines() if line.strip()
         )
+    transfer_section = ""
+    if str(profile.get("forward_to", "")).strip():
+        transfer_section = TRANSFER_SECTION_TEMPLATE.format(
+            owner_name=profile["owner_name"], tmarker=TRANSFER_MARKER,
+        )
     return PHONE_PERSONA_TEMPLATE.format(
         assistant_name=str(profile.get("assistant_name", "")).strip() or "Atlas",
         business_name=profile["business_name"],
@@ -242,6 +274,7 @@ def build_system_prompt(profile: dict) -> str:
         owner_name=profile["owner_name"],
         facts=facts or NO_FACTS_LINE,
         marker=END_CALL_MARKER,
+        transfer_section=transfer_section,
     )
 
 
@@ -257,31 +290,43 @@ log.info(
 
 # ----------------------------------------------------- end-call scrubbing --
 
-class EndCallScrubber:
-    """Streams text through while guaranteeing END_CALL_MARKER is never
-    emitted. feed()/flush() return text that is safe to speak; .ended flips
-    when the marker was seen. Pure logic — unit-tested."""
+class MarkerScrubber:
+    """Streams text through while guaranteeing control markers are never
+    emitted. feed()/flush() return text that is safe to speak; .found collects
+    the names of markers seen. Pure logic — unit-tested."""
 
-    def __init__(self) -> None:
+    def __init__(self, markers: dict[str, str] | None = None) -> None:
+        self._markers = markers or {"end": END_CALL_MARKER, "transfer": TRANSFER_MARKER}
         self._buf = ""
-        self.ended = False
+        self.found: set[str] = set()
 
     def _held_prefix_len(self) -> int:
         """Length of the longest tail of the buffer that could still grow
-        into the marker — hold it back until we know."""
-        limit = min(len(self._buf), len(END_CALL_MARKER) - 1)
-        for k in range(limit, 0, -1):
-            if self._buf.endswith(END_CALL_MARKER[:k]):
-                return k
-        return 0
+        into some marker — hold it back until we know."""
+        best = 0
+        for marker in self._markers.values():
+            limit = min(len(self._buf), len(marker) - 1)
+            for k in range(limit, best, -1):
+                if self._buf.endswith(marker[:k]):
+                    best = k
+                    break
+        return best
 
     def feed(self, token: str) -> str:
         self._buf += token
         out: list[str] = []
-        while (i := self._buf.find(END_CALL_MARKER)) != -1:
-            self.ended = True
+        while True:
+            hit = min(
+                ((i, name) for name, m in self._markers.items()
+                 if (i := self._buf.find(m)) != -1),
+                default=None,
+            )
+            if hit is None:
+                break
+            i, name = hit
+            self.found.add(name)
             out.append(self._buf[:i])
-            self._buf = self._buf[i + len(END_CALL_MARKER):]
+            self._buf = self._buf[i + len(self._markers[name]):]
         held = self._held_prefix_len()
         cut = len(self._buf) - held
         out.append(self._buf[:cut])
@@ -291,6 +336,16 @@ class EndCallScrubber:
     def flush(self) -> str:
         out, self._buf = self._buf, ""
         return out
+
+
+def honor_markers(reply_text: str, found: set) -> str | None:
+    """The bridge's last word on in-band markers. Returns 'transfer', 'end',
+    'blocked' (marker glued to a question — ignore it), or None."""
+    if not found:
+        return None
+    if reply_text.rstrip().rstrip('"”’').endswith("?"):
+        return "blocked"
+    return "transfer" if "transfer" in found else "end"
 
 
 def speech_seconds(text: str) -> float:
@@ -466,14 +521,71 @@ async def voice_incoming(request: web.Request) -> web.Response:
         PUBLIC_BASE.replace("https://", "wss://")
         + f"/voice/relay?token={WS_TOKEN}&profile={profile_key}"
     )
+    # action: Twilio calls back here when the relay session ends, letting us
+    # forward the call (<Dial>) or hang up based on the session's handoffData.
+    action_url = f"{PUBLIC_BASE}/voice/action?profile={profile_key}"
+    attr = {chr(34): "&quot;"}
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response><Connect>"
-        f'<ConversationRelay url="{xml_escape(ws_url, {chr(34): "&quot;"})}" '
-        f'welcomeGreeting="{xml_escape(str(profile["greeting"]), {chr(34): "&quot;"})}" />'
+        f'<Response><Connect action="{xml_escape(action_url, attr)}">'
+        f'<ConversationRelay url="{xml_escape(ws_url, attr)}" '
+        f'welcomeGreeting="{xml_escape(str(profile["greeting"]), attr)}" />'
         "</Connect></Response>"
     )
     return web.Response(text=twiml, content_type="text/xml")
+
+
+def action_response_twiml(reason: str, forward_to: str) -> str:
+    """TwiML for the <Connect> action callback: forward on transfer, hang up
+    otherwise. Pure — unit-tested."""
+    if reason == "transfer" and forward_to:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f"<Response><Dial><Number>{xml_escape(forward_to)}</Number></Dial>"
+            f"<Say>{xml_escape('Sorry, no one could pick up. Please call back and leave a message.')}</Say>"
+            "<Hangup/></Response>"
+        )
+    return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+
+
+async def voice_action(request: web.Request) -> web.Response:
+    """Twilio's callback when a relay session ends. Decides what the call
+    does next: forward to the profile's forward_to, or hang up."""
+    form = dict(await request.post())
+    path_and_query = "/voice/action" + (("?" + request.query_string) if request.query_string else "")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not twilio_signature_valid(path_and_query, form, signature):
+        log.warning("rejected /voice/action: bad Twilio signature (CallSid=%s)",
+                    form.get("CallSid", "?"))
+        return web.Response(status=403, text="signature check failed")
+
+    profile_key = request.query.get("profile", "")
+    profile = PROFILES.get(profile_key)
+    if profile is None:
+        log.error("/voice/action with unknown profile %r — hanging up (CallSid=%s)",
+                  profile_key, form.get("CallSid"))
+        return web.Response(text=action_response_twiml("", ""), content_type="text/xml")
+
+    # Twilio passes back the end message's handoffData; be tolerant about the
+    # parameter's case, strict about its meaning.
+    raw = str(form.get("HandoffData") or form.get("handoffData") or "")
+    reason = ""
+    if raw:
+        try:
+            reason = str(json.loads(raw).get("reason", ""))
+        except (ValueError, AttributeError):
+            log.error("unparseable HandoffData %r (CallSid=%s) — hanging up",
+                      raw[:200], form.get("CallSid"))
+    forward_to = str(profile.get("forward_to", "")).strip()
+    if reason == "transfer" and not forward_to:
+        log.error("transfer requested but profile %r has no forward_to — hanging up "
+                  "(CallSid=%s)", profile_key, form.get("CallSid"))
+    log.info("action callback CallSid=%s profile=%s reason=%s -> %s",
+             form.get("CallSid"), profile_key, reason or "(none)",
+             "dial " + forward_to if reason == "transfer" and forward_to else "hangup")
+    return web.Response(
+        text=action_response_twiml(reason, forward_to), content_type="text/xml"
+    )
 
 
 async def stream_reply(
@@ -482,18 +594,18 @@ async def stream_reply(
     http: aiohttp.ClientSession,
     system_prompt: str,
     model: str,
-) -> tuple[str, bool]:
+) -> tuple[str, set]:
     """Stream one model reply to Twilio as ConversationRelay text tokens.
 
-    Returns (spoken_text, end_call). Raises on model failure. The end-call
-    marker is scrubbed from the stream — the caller never hears it.
+    Returns (spoken_text, markers_found). Raises on model failure. Control
+    markers are scrubbed from the stream — the caller never hears them.
     """
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}] + history,
         "stream": True,
     }
-    scrubber = EndCallScrubber()
+    scrubber = MarkerScrubber()
     spoken: list[str] = []
 
     async def say(text: str) -> None:
@@ -519,7 +631,7 @@ async def stream_reply(
                 await say(scrubber.feed(token))
     await say(scrubber.flush())
     await ws.send_json({"type": "text", "token": "", "last": True})
-    return "".join(spoken).strip(), scrubber.ended
+    return "".join(spoken).strip(), scrubber.found
 
 
 async def voice_relay(request: web.Request) -> web.WebSocketResponse:
@@ -581,18 +693,30 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
 
                 async def respond(hist_snapshot: list) -> None:
                     try:
-                        reply, end_call = await stream_reply(
+                        reply, found = await stream_reply(
                             ws, hist_snapshot, http, system_prompt, model
                         )
                         history.append({"role": "assistant", "content": reply})
                         log.info("atlas (%s): %s", call_sid, reply)
-                        if end_call:
-                            # Let the goodbye play out, then hang up. A new
+                        decision = honor_markers(reply, found)
+                        if decision == "blocked":
+                            log.warning(
+                                "model tried to %s on a QUESTION — ignored (%s): %s",
+                                "/".join(sorted(found)), call_sid, reply,
+                            )
+                        elif decision:
+                            # Let the last sentence play out, then act. A new
                             # caller prompt cancels this task — and with it
-                            # the hangup — so "wait, one more thing" works.
+                            # the hangup/transfer — so "wait, one more thing"
+                            # works.
                             await asyncio.sleep(speech_seconds(reply))
-                            log.info("atlas ended the call (%s)", call_sid)
-                            await ws.send_json({"type": "end"})
+                            log.info("atlas %s the call (%s)",
+                                     "is transferring" if decision == "transfer" else "ended",
+                                     call_sid)
+                            await ws.send_json({
+                                "type": "end",
+                                "handoffData": json.dumps({"reason": decision}),
+                            })
                     except asyncio.CancelledError:
                         log.info("reply interrupted by caller (%s)", call_sid)
                         raise
@@ -651,6 +775,7 @@ async def health(_: web.Request) -> web.Response:
 def main() -> None:
     app = web.Application()
     app.router.add_post("/voice/incoming", voice_incoming)
+    app.router.add_post("/voice/action", voice_action)
     app.router.add_get("/voice/relay", voice_relay)
     app.router.add_get("/health", health)
     log.info("atlas-phone-bridge listening on 127.0.0.1:%d (public: %s)", BRIDGE_PORT, PUBLIC_BASE)

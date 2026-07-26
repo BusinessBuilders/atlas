@@ -157,7 +157,7 @@ def test_service_config_validation_is_fail_closed(tmp_path):
 
 # ---- service module unit tests (persona sandbox + end-call scrubbing) ------
 
-def _import_service(tmp_path, monkeypatch, extra_env=None):
+def _import_service(tmp_path, monkeypatch, extra_env=None, cfg_extra=""):
     """Import service.py in-process with a stub env and a valid config."""
     import importlib.util
 
@@ -166,7 +166,7 @@ def _import_service(tmp_path, monkeypatch, extra_env=None):
         '[numbers]\n"+15550001111" = "acme"\n\n'
         "[profiles.acme]\nbusiness_name = \"Acme Co\"\nservices = \"widget repair\"\n"
         "owner_name = \"Jo\"\ngreeting = \"hi\"\n"
-        "facts = \"Email: office@acme.test\\nHours: 9-5\"\n",
+        "facts = \"Email: office@acme.test\\nHours: 9-5\"\n" + cfg_extra,
         encoding="utf-8",
     )
     for k in ("NTFY_URL", "NTFY_TOPIC", "MESSAGES_FILE"):
@@ -206,7 +206,7 @@ def test_persona_is_self_contained(tmp_path, monkeypatch):
 
 def test_scrubber_marker_split_across_tokens(tmp_path, monkeypatch):
     svc = _import_service(tmp_path, monkeypatch)
-    scrubber = svc.EndCallScrubber()
+    scrubber = svc.MarkerScrubber()
     spoken = ""
     for token in ["Goodbye, have a great day! ", "[EN", "D CA", "LL]"]:
         spoken += scrubber.feed(token)
@@ -214,26 +214,80 @@ def test_scrubber_marker_split_across_tokens(tmp_path, monkeypatch):
     assert svc.END_CALL_MARKER not in spoken
     assert "[" not in spoken
     assert spoken.strip() == "Goodbye, have a great day!"
-    assert scrubber.ended is True
+    assert scrubber.found == {"end"}
 
 
 def test_scrubber_plain_text_passes_through(tmp_path, monkeypatch):
     svc = _import_service(tmp_path, monkeypatch)
-    scrubber = svc.EndCallScrubber()
+    scrubber = svc.MarkerScrubber()
     spoken = ""
     for token in ["We build ", "websites [really ", "nice ones] daily."]:
         spoken += scrubber.feed(token)
     spoken += scrubber.flush()
     assert spoken == "We build websites [really nice ones] daily."
-    assert scrubber.ended is False
+    assert scrubber.found == set()
 
 
 def test_scrubber_text_after_marker_still_spoken(tmp_path, monkeypatch):
     svc = _import_service(tmp_path, monkeypatch)
-    scrubber = svc.EndCallScrubber()
+    scrubber = svc.MarkerScrubber()
     spoken = scrubber.feed("Bye now! [END CALL] Take care.") + scrubber.flush()
     assert spoken == "Bye now!  Take care."
-    assert scrubber.ended is True
+    assert scrubber.found == {"end"}
+
+
+def test_scrubber_transfer_marker(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    scrubber = svc.MarkerScrubber()
+    spoken = ""
+    for token in ["Connecting you now. ", "[TRANSFER", " CALL]"]:
+        spoken += scrubber.feed(token)
+    spoken += scrubber.flush()
+    assert spoken.strip() == "Connecting you now."
+    assert scrubber.found == {"transfer"}
+
+
+def test_honor_markers_blocks_questions(tmp_path, monkeypatch):
+    """The 2026-07-22 bug: the model glued [END CALL] to an intake question
+    ('what time works best for you?') and hung up mid-call. The bridge, not
+    the model, has the last word."""
+    svc = _import_service(tmp_path, monkeypatch)
+    assert svc.honor_markers("What time works best for you?", {"end"}) == "blocked"
+    assert svc.honor_markers('May I have your name?"', {"transfer"}) == "blocked"
+    assert svc.honor_markers("Goodbye, have a great day!", {"end"}) == "end"
+    assert svc.honor_markers("Connecting you now.", {"transfer"}) == "transfer"
+    assert svc.honor_markers("Connecting you now.", {"transfer", "end"}) == "transfer"
+    assert svc.honor_markers("Anything else?", set()) is None
+
+
+def test_action_twiml(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    dial = svc.action_response_twiml("transfer", "+15085550100")
+    assert "<Dial><Number>+15085550100</Number></Dial>" in dial
+    assert "<Hangup/>" in dial  # no-answer fallback still ends the call
+    assert svc.action_response_twiml("end", "+15085550100") == (
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    )
+    # transfer requested but no forward number configured -> hang up, never 500
+    assert "<Dial>" not in svc.action_response_twiml("transfer", "")
+
+
+def test_transfer_section_only_with_forward_to(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    assert "TRANSFERRING" not in svc.SYSTEM_PROMPTS["acme"]
+
+    svc2 = _import_service(
+        tmp_path, monkeypatch, cfg_extra='forward_to = "+15085550100"\n'
+    )
+    assert "TRANSFERRING" in svc2.SYSTEM_PROMPTS["acme"]
+    assert svc2.TRANSFER_MARKER in svc2.SYSTEM_PROMPTS["acme"]
+
+
+def test_bad_forward_to_refused(tmp_path, monkeypatch):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        _import_service(tmp_path, monkeypatch, cfg_extra='forward_to = "call my cell"\n')
 
 
 def test_message_entry_format(tmp_path, monkeypatch):

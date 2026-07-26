@@ -92,7 +92,16 @@ the journal at ERROR.
 - To hang up, the model ends its goodbye with the literal `[END CALL]`; the
   bridge scrubs the marker from speech, lets the goodbye play, then sends
   Twilio's end-session message. A caller speaking during that window cancels
-  the hangup and the conversation continues.
+  the hangup and the conversation continues. **The bridge has the last
+  word** — `honor_markers()` ignores (and WARN-logs) any marker glued to a
+  reply that asks the caller a question, because a small model will
+  eventually hang up mid-intake if only the prompt forbids it.
+- Profiles with `forward_to = "+1..."` can **transfer the call**: the model
+  ends a connecting sentence with `[TRANSFER CALL]`, the session ends with
+  a transfer handoff, and Twilio's `<Connect action>` callback
+  (`/voice/action`, signature-checked) answers with `<Dial>` to the forward
+  number — original caller ID shown, apology + hangup on no answer.
+  Profiles without `forward_to` never offer transfers.
 
 ## Operating
 
