@@ -103,6 +103,19 @@ the journal at ERROR.
   number — original caller ID shown, apology + hangup on no answer.
   Profiles without `forward_to` never offer transfers.
 
+## Owner dashboard
+
+Set `ADMIN_TOKEN` in the env file and the bridge also serves a control
+panel on `127.0.0.1:ADMIN_PORT` (default 8891) — expose it to the owner
+**tailnet-only** (e.g. `tailscale serve --bg --https=8447
+http://127.0.0.1:8891`), never on the public path Twilio uses. It edits
+the number→business mapping and every profile field (greeting, services,
+facts, extra prompt instructions, forward number), shows the exact live
+prompt per business, and tails the message pad and call transcripts.
+Saves go through the same fail-closed validation as boot — a bad edit is
+rejected with the reason and changes nothing — and good saves hot-apply
+with no restart; in-flight calls keep the settings they started with.
+
 ## Operating
 
 - Every call is transcribed in `journalctl --user -u atlas-phone-bridge`.

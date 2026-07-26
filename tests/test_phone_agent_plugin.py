@@ -290,6 +290,129 @@ def test_bad_forward_to_refused(tmp_path, monkeypatch):
         _import_service(tmp_path, monkeypatch, cfg_extra='forward_to = "call my cell"\n')
 
 
+# ---- dashboard plumbing (emitter, hot-apply, admin app) --------------------
+
+def test_emit_business_toml_roundtrips(tmp_path, monkeypatch):
+    import tomllib
+
+    svc = _import_service(tmp_path, monkeypatch)
+    numbers = {"+15550001111": "acme"}
+    profiles = {"acme": {
+        "business_name": 'Acme "Co"', "services": "widget repair",
+        "owner_name": "Jo", "greeting": "hi",
+        "facts": "Email: office@acme.test\nHours: 9-5",
+        "hand_added_key": "survives",
+    }}
+    text = svc.emit_business_toml(numbers, profiles)
+    n2, p2 = svc.parse_business_config(tomllib.loads(text))
+    assert n2 == numbers
+    assert p2["acme"]["business_name"] == 'Acme "Co"'
+    assert p2["acme"]["facts"] == "Email: office@acme.test\nHours: 9-5"
+    assert p2["acme"]["hand_added_key"] == "survives"
+
+
+def test_apply_config_text_is_fail_closed_and_hot(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    before_prompt = svc.SYSTEM_PROMPTS["acme"]
+
+    errors = svc.apply_config_text("this is [ not toml")
+    assert errors and "TOML" in errors[0]
+    errors = svc.apply_config_text(
+        '[numbers]\n"+15550001111" = "ghost"\n\n'
+        '[profiles.real]\nbusiness_name = "X"\nservices = "y"\n'
+        'owner_name = "Z"\ngreeting = "hi"\n'
+    )
+    assert errors and "not defined" in errors[0]
+    assert svc.SYSTEM_PROMPTS["acme"] == before_prompt  # nothing changed
+
+    good = svc.emit_business_toml(
+        {"+15550001111": "acme"},
+        {"acme": {"business_name": "Acme Co", "services": "widget repair",
+                  "owner_name": "Jo", "greeting": "hello there"}},
+    )
+    assert svc.apply_config_text(good) == []
+    assert svc.PROFILES["acme"]["greeting"] == "hello there"
+    assert "hello there" not in before_prompt
+    with open(svc.BUSINESS_CONFIG, encoding="utf-8") as f:
+        assert 'greeting = "hello there"' in f.read()
+
+
+def test_extra_instructions_added_to_prompt(tmp_path, monkeypatch):
+    svc = _import_service(
+        tmp_path, monkeypatch,
+        cfg_extra='extra_instructions = "Mention the summer special."\n',
+    )
+    assert "Mention the summer special." in svc.SYSTEM_PROMPTS["acme"]
+    assert "never override the HARD RULES" in svc.SYSTEM_PROMPTS["acme"]
+
+
+def test_admin_app_auth_and_save(tmp_path, monkeypatch):
+    """The dashboard: no token -> login page; wrong token -> rejected; right
+    token -> dashboard; a bad save is rejected and changes nothing."""
+    import importlib.util
+
+    import aiohttp
+    from aiohttp import web
+
+    svc = _import_service(tmp_path, monkeypatch)
+    spec = importlib.util.spec_from_file_location(
+        "phone_agent_admin_under_test", PLUGINS_DIR / "phone_agent" / "admin.py"
+    )
+    assert spec is not None and spec.loader is not None
+    admin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admin)
+
+    async def snapshot():
+        return {"bridge": "ok", "model_backend": "ok", "model": "m",
+                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
+
+    app = admin.build_admin_app(
+        token="sesame", health_snapshot=snapshot,
+        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_prompts=lambda: svc.SYSTEM_PROMPTS,
+        apply_config_text=svc.apply_config_text,
+        emit_business_toml=svc.emit_business_toml,
+        messages_file=str(tmp_path / "messages.md"),
+        known_keys=svc._PROFILE_KNOWN_KEYS,
+    )
+
+    async def drive():
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        base = f"http://127.0.0.1:{port}"
+        results = {}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(base + "/") as r:
+                results["anon"] = await r.text()
+            async with s.post(base + "/login", data={"token": "wrong"}) as r:
+                results["bad_login"] = await r.text()
+            async with s.post(base + "/login", data={"token": "sesame"},
+                              allow_redirects=False) as r:
+                results["login_status"] = r.status
+                cookie = r.cookies.get(admin.COOKIE)
+                assert cookie is not None
+            s.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
+            async with s.get(base + "/") as r:
+                results["dash"] = await r.text()
+            async with s.post(base + "/save",
+                              data={"numbers_text": "+15550001111 = ghost"}) as r:
+                results["bad_save"] = await r.text()
+        await runner.cleanup()
+        return results
+
+    results = asyncio.run(drive())
+    assert "Admin token" in results["anon"]          # login gate
+    assert "acme" not in results["anon"]             # nothing leaks pre-auth
+    assert "Wrong token" in results["bad_login"]
+    assert results["login_status"] == 303
+    assert "profile: acme" in results["dash"]
+    assert "Not applied" in results["bad_save"]
+    assert svc.NUMBERS == {"+15550001111": "acme"}   # unchanged by bad save
+
+
 def test_message_entry_format(tmp_path, monkeypatch):
     svc = _import_service(tmp_path, monkeypatch)
     entry = svc.format_message_entry(

@@ -59,6 +59,12 @@ Config file (systemd loads it via EnvironmentFile): ~/.config/atlas-phone/env
   NTFY_URL/NTFY_TOPIC  optional pair; when both are set, each new message
                        is also pushed (self-hosted ntfy). Setting only one
                        of the two is a config error (fail-closed).
+  ADMIN_TOKEN          optional; when set, the owner dashboard (admin.py)
+                       runs on 127.0.0.1:ADMIN_PORT (default 8891) — edit
+                       businesses/prompts, read messages and transcripts,
+                       hot-apply config. Expose it TAILNET-ONLY via
+                       tailscale serve; never on the public funnel path.
+  ADMIN_PORT           optional, default 8891.
 
 Business config (~/.config/atlas-phone/businesses.toml):
   [numbers]
@@ -127,6 +133,11 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 if bool(NTFY_URL) != bool(NTFY_TOPIC):
     log.error("NTFY_URL and NTFY_TOPIC must be set together (or neither) — refusing to start")
     sys.exit(1)
+# Dashboard: local-only admin UI, enabled by setting ADMIN_TOKEN. Exposed to
+# the owner via a tailnet-only tailscale serve mapping — NEVER on the public
+# funnel path that Twilio uses.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8891").strip() or "8891")
 
 MAX_HISTORY_TURNS = 20          # user+assistant message pairs kept per call
 MODEL_TIMEOUT_SECONDS = 45      # hard cap on one model reply
@@ -207,12 +218,45 @@ _PROFILE_REQUIRED_KEYS = ("business_name", "services", "owner_name", "greeting")
 _E164_RE = re.compile(r"^\+[0-9]{7,15}$")
 
 
-def load_business_config(path: str) -> tuple[dict, dict]:
-    """Parse and validate businesses.toml. Returns (numbers, profiles).
+def parse_business_config(data: dict) -> tuple[dict, dict]:
+    """Validate a parsed businesses.toml. Returns (numbers, profiles), raises
+    ValueError with a human sentence on any problem. Shared by the fail-closed
+    boot path and the dashboard's validate-before-apply path."""
+    numbers = data.get("numbers")
+    profiles = data.get("profiles")
+    if not isinstance(numbers, dict) or not numbers:
+        raise ValueError("config has no [numbers] mapping")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("config has no [profiles.*] sections")
+    for number, profile_key in numbers.items():
+        if not _E164_RE.match(str(number)):
+            raise ValueError(
+                f"number {number!r} is not an E.164 number like +15085551234"
+            )
+        if profile_key not in profiles:
+            raise ValueError(
+                f"number {number} maps to profile {profile_key!r} which is not defined"
+            )
+    for key, profile in profiles.items():
+        if not re.match(r"^[A-Za-z0-9_-]+$", str(key)):
+            raise ValueError(
+                f"profile name {key!r} must be letters/digits/underscores only"
+            )
+        missing = [k for k in _PROFILE_REQUIRED_KEYS if not str(profile.get(k, "")).strip()]
+        if missing:
+            raise ValueError(f"profile {key!r} is missing required keys {missing}")
+        forward_to = str(profile.get("forward_to", "")).strip()
+        if forward_to and not _E164_RE.match(forward_to):
+            raise ValueError(
+                f"profile {key!r} forward_to {forward_to!r} is not an E.164 "
+                "number like +15085551234"
+            )
+    return numbers, profiles
 
-    Every reject here exits the process: a phone agent with a half-valid
-    business config must not answer customer calls.
-    """
+
+def load_business_config(path: str) -> tuple[dict, dict]:
+    """Boot path: parse and validate businesses.toml or refuse to start.
+    A phone agent with a half-valid business config must not answer calls."""
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -222,37 +266,44 @@ def load_business_config(path: str) -> tuple[dict, dict]:
     except tomllib.TOMLDecodeError as e:
         log.error("business config %s is not valid TOML: %s — refusing to start", path, e)
         sys.exit(1)
+    try:
+        return parse_business_config(data)
+    except ValueError as e:
+        log.error("business config %s: %s — refusing to start", path, e)
+        sys.exit(1)
 
-    numbers = data.get("numbers")
-    profiles = data.get("profiles")
-    if not isinstance(numbers, dict) or not numbers:
-        log.error("business config has no [numbers] mapping — refusing to start")
-        sys.exit(1)
-    if not isinstance(profiles, dict) or not profiles:
-        log.error("business config has no [profiles.*] sections — refusing to start")
-        sys.exit(1)
-    for number, profile_key in numbers.items():
-        if profile_key not in profiles:
-            log.error(
-                "number %s maps to profile %r which is not defined — refusing to start",
-                number, profile_key,
-            )
-            sys.exit(1)
+
+# Field order for the emitter; unknown keys a human hand-added are preserved
+# after these. `facts` and `extra_instructions` may be multiline.
+_PROFILE_KNOWN_KEYS = (
+    "business_name", "services", "owner_name", "greeting", "assistant_name",
+    "forward_to", "model", "facts", "extra_instructions",
+)
+
+
+def _toml_str(value: str) -> str:
+    return '"' + (
+        str(value).replace("\\", "\\\\").replace('"', '\\"')
+        .replace("\r", "").replace("\n", "\\n")
+    ) + '"'
+
+
+def emit_business_toml(numbers: dict, profiles: dict) -> str:
+    """Serialize the config back to TOML (round-trips through tomllib).
+    Used by the dashboard; hand edits with unknown keys survive a save."""
+    lines = ["[numbers]"]
+    for number, key in numbers.items():
+        lines.append(f"{_toml_str(number)} = {_toml_str(key)}")
     for key, profile in profiles.items():
-        missing = [k for k in _PROFILE_REQUIRED_KEYS if not str(profile.get(k, "")).strip()]
-        if missing:
-            log.error(
-                "profile %r is missing required keys %s — refusing to start", key, missing
-            )
-            sys.exit(1)
-        forward_to = str(profile.get("forward_to", "")).strip()
-        if forward_to and not _E164_RE.match(forward_to):
-            log.error(
-                "profile %r forward_to %r is not an E.164 number like +15085551234 — "
-                "refusing to start", key, forward_to,
-            )
-            sys.exit(1)
-    return numbers, profiles
+        lines += ["", f"[profiles.{key}]"]
+        for field in _PROFILE_KNOWN_KEYS:
+            value = str(profile.get(field, "")).strip()
+            if value:
+                lines.append(f"{field} = {_toml_str(value)}")
+        for field, value in profile.items():
+            if field not in _PROFILE_KNOWN_KEYS:
+                lines.append(f"{field} = {_toml_str(str(value))}")
+    return "\n".join(lines) + "\n"
 
 
 def build_system_prompt(profile: dict) -> str:
@@ -267,7 +318,7 @@ def build_system_prompt(profile: dict) -> str:
         transfer_section = TRANSFER_SECTION_TEMPLATE.format(
             owner_name=profile["owner_name"], tmarker=TRANSFER_MARKER,
         )
-    return PHONE_PERSONA_TEMPLATE.format(
+    prompt = PHONE_PERSONA_TEMPLATE.format(
         assistant_name=str(profile.get("assistant_name", "")).strip() or "Atlas",
         business_name=profile["business_name"],
         services=profile["services"],
@@ -276,6 +327,13 @@ def build_system_prompt(profile: dict) -> str:
         marker=END_CALL_MARKER,
         transfer_section=transfer_section,
     )
+    extra = str(profile.get("extra_instructions", "")).strip()
+    if extra:
+        prompt += (
+            "\n\nADDITIONAL INSTRUCTIONS from the business owner (they never "
+            "override the HARD RULES above):\n" + extra
+        )
+    return prompt
 
 
 NUMBERS, PROFILES = load_business_config(BUSINESS_CONFIG)
@@ -287,6 +345,31 @@ log.info(
     "%d business profile(s) loaded: %s (self-contained phone persona, no resident import)",
     len(PROFILES), ", ".join(sorted(PROFILES)),
 )
+
+
+def apply_config_text(text: str) -> list[str]:
+    """Validate a full config and hot-apply it: write the file atomically and
+    swap the live state. Returns [] on success, else human-readable errors —
+    and on any error neither the file nor the live config changes (calls in
+    progress keep the profile they started with either way)."""
+    global NUMBERS, PROFILES, SYSTEM_PROMPTS
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return [f"not valid TOML: {e}"]
+    try:
+        numbers, profiles = parse_business_config(data)
+        prompts = {k: build_system_prompt(p) for k, p in profiles.items()}
+    except (ValueError, KeyError) as e:
+        return [str(e)]
+    tmp = BUSINESS_CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, BUSINESS_CONFIG)
+    NUMBERS, PROFILES, SYSTEM_PROMPTS = numbers, profiles, prompts
+    log.info("config hot-applied from dashboard: %d profile(s), %d number(s)",
+             len(profiles), len(numbers))
+    return []
 
 # ----------------------------------------------------- end-call scrubbing --
 
@@ -753,8 +836,8 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-async def health(_: web.Request) -> web.Response:
-    """Health check: verifies the model backend is actually reachable."""
+async def health_snapshot() -> tuple[dict, bool]:
+    """Health facts shared by /health and the dashboard."""
     try:
         async with aiohttp.ClientSession() as http:
             async with http.get(f"{OLLAMA_URL}/models",
@@ -768,20 +851,55 @@ async def health(_: web.Request) -> web.Response:
         "model": DEFAULT_MODEL,
         "profiles": sorted(PROFILES),
         "numbers": len(NUMBERS),
+        "ntfy": "on" if NTFY_URL else "off",
     }
+    return body, model_ok
+
+
+async def health(_: web.Request) -> web.Response:
+    """Health check: verifies the model backend is actually reachable."""
+    body, model_ok = await health_snapshot()
     return web.json_response(body, status=200 if model_ok else 503)
 
 
-def main() -> None:
+async def _serve() -> None:
     app = web.Application()
     app.router.add_post("/voice/incoming", voice_incoming)
     app.router.add_post("/voice/action", voice_action)
     app.router.add_get("/voice/relay", voice_relay)
     app.router.add_get("/health", health)
-    log.info("atlas-phone-bridge listening on 127.0.0.1:%d (public: %s)", BRIDGE_PORT, PUBLIC_BASE)
     # access_log off: our handlers log every call event explicitly, and the
     # default access log would write the WS_TOKEN query param into journald.
-    web.run_app(app, host="127.0.0.1", port=BRIDGE_PORT, print=None, access_log=None)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", BRIDGE_PORT).start()
+    log.info("atlas-phone-bridge listening on 127.0.0.1:%d (public: %s)",
+             BRIDGE_PORT, PUBLIC_BASE)
+
+    if ADMIN_TOKEN:
+        import admin
+        admin_app = admin.build_admin_app(
+            token=ADMIN_TOKEN,
+            health_snapshot=health_snapshot,
+            get_state=lambda: (NUMBERS, PROFILES),
+            get_prompts=lambda: SYSTEM_PROMPTS,
+            apply_config_text=apply_config_text,
+            emit_business_toml=emit_business_toml,
+            messages_file=MESSAGES_FILE,
+            known_keys=_PROFILE_KNOWN_KEYS,
+        )
+        admin_runner = web.AppRunner(admin_app, access_log=None)
+        await admin_runner.setup()
+        await web.TCPSite(admin_runner, "127.0.0.1", ADMIN_PORT).start()
+        log.info("admin dashboard on 127.0.0.1:%d — expose it tailnet-only "
+                 "(tailscale serve), NEVER on the public funnel path", ADMIN_PORT)
+    else:
+        log.info("admin dashboard: off (ADMIN_TOKEN unset)")
+    await asyncio.Event().wait()
+
+
+def main() -> None:
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":
