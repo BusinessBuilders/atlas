@@ -247,17 +247,44 @@ def test_scrubber_transfer_marker(tmp_path, monkeypatch):
     assert scrubber.found == {"transfer"}
 
 
-def test_honor_markers_blocks_questions(tmp_path, monkeypatch):
-    """The 2026-07-22 bug: the model glued [END CALL] to an intake question
-    ('what time works best for you?') and hung up mid-call. The bridge, not
-    the model, has the last word."""
+def test_gates_built_at_boot_and_hot_apply(tmp_path, monkeypatch):
     svc = _import_service(tmp_path, monkeypatch)
-    assert svc.honor_markers("What time works best for you?", {"end"}) == "blocked"
-    assert svc.honor_markers('May I have your name?"', {"transfer"}) == "blocked"
-    assert svc.honor_markers("Goodbye, have a great day!", {"end"}) == "end"
-    assert svc.honor_markers("Connecting you now.", {"transfer"}) == "transfer"
-    assert svc.honor_markers("Connecting you now.", {"transfer", "end"}) == "transfer"
-    assert svc.honor_markers("Anything else?", set()) is None
+    assert "acme" in svc.GATES
+    assert svc.GATES["acme"].transfer_available is False  # stub has no forward_to
+    good = svc.emit_business_toml(
+        {"+15550001111": "acme"},
+        {"acme": {"business_name": "Acme Co", "services": "x", "owner_name": "Jo",
+                  "greeting": "hi", "forward_to": "+15085550100",
+                  "transfer_phrases": "front desk please"}},
+    )
+    assert svc.apply_config_text(good) == []
+    assert svc.GATES["acme"].transfer_available is True
+    joined = svc.normalize_speech("front desk please")
+    assert any(p.search(joined) for p in svc.GATES["acme"].transfer_patterns)
+
+
+def test_bad_phrase_config_refused(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    bad = svc.emit_business_toml(
+        {"+15550001111": "acme"},
+        {"acme": {"business_name": "A", "services": "x", "owner_name": "J",
+                  "greeting": "hi", "transfer_phrases": "y" * 121}},
+    )
+    errors = svc.apply_config_text(bad)
+    assert errors and "transfer_phrases" in errors[0]
+
+
+def test_persona_transfer_and_honesty_rules(tmp_path, monkeypatch):
+    svc = _import_service(
+        tmp_path, monkeypatch, cfg_extra='forward_to = "+15085550100"\n'
+    )
+    prompt = svc.SYSTEM_PROMPTS["acme"]
+    assert "operator" in prompt                       # explicit-ask instruction
+    assert "is NOT a request" in prompt               # name-mention loophole closed
+    assert "never state that an appointment" in prompt.lower() or \
+        "never say an appointment" in prompt.lower()
+    assert "did not give as their own" in prompt      # no invented names
+    assert "never guess or extrapolate" in prompt     # D6 one-source-of-truth rule
 
 
 def test_action_twiml(tmp_path, monkeypatch):
@@ -346,6 +373,265 @@ def test_extra_instructions_added_to_prompt(tmp_path, monkeypatch):
     assert "never override the HARD RULES" in svc.SYSTEM_PROMPTS["acme"]
 
 
+# ---- call-control gates (spec 2026-07-26, rev 2) ---------------------------
+
+def test_normalize_speech(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    # U+2019 apostrophe, casing, punctuation, whitespace
+    assert svc.normalize_speech("That’s ALL, thanks!!") == "that's all thanks"
+    assert svc.normalize_speech("  Hang   up.  ") == "hang up"
+    assert svc.normalize_speech("") == ""
+
+
+def test_parse_phrase_lines_caps_and_hygiene(tmp_path, monkeypatch):
+    import pytest
+
+    svc = _import_service(tmp_path, monkeypatch)
+    # blank/whitespace lines dropped BEFORE the empty check; dedupe keeps order
+    assert svc.parse_phrase_lines("operator\n\n   \nOperator\nreal person\n") == [
+        "operator", "real person",
+    ]
+    assert svc.parse_phrase_lines("   \n\n") == []
+    with pytest.raises(ValueError):
+        svc.parse_phrase_lines("\n".join(f"phrase {i}" for i in range(65)))
+    with pytest.raises(ValueError):
+        svc.parse_phrase_lines("x" * 121)
+
+
+def test_owner_token_short_name_rule(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    assert svc.owner_token("William Donovan") == "william"
+    # first name under 3 chars -> full name is used (EDGE: syllable collisions)
+    assert svc.owner_token("Jo Smith") == "jo smith"
+
+
+def test_compile_phrases_escaping_and_owner_expansion(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    pats = svc.compile_phrases(["talk to {owner}", "price (usd)"], "William D")
+    joined = svc.normalize_speech("can i talk to william about the price (usd)?")
+    assert any(p.search(joined) for p in pats[:1])
+    assert any(p.search(joined) for p in pats[1:])  # metachars escaped, not a crash
+    # word boundaries: 'bye' phrase must not match 'buyer'
+    pats2 = svc.compile_phrases(["bye now"], "W")
+    assert not any(p.search(svc.normalize_speech("the buyer now wants two")) for p in pats2)
+
+
+def test_bare_owner_phrase_rejected_loudly(tmp_path, monkeypatch):
+    import pytest
+
+    svc = _import_service(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        svc.parse_phrase_lines("operator\n{owner}\n")
+    # case-variant placeholder is canonicalized, not silently degraded (BLIND-4)
+    assert svc.parse_phrase_lines("speak to {OWNER}") == ["speak to {owner}"]
+    assert svc.parse_phrase_lines("speak to { Owner }") == ["speak to {owner}"]
+
+
+def test_transfer_hint_uses_profiles_own_phrase(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    default_gates = svc.build_call_gates(
+        {"business_name": "A", "services": "x", "owner_name": "Jo Smith",
+         "greeting": "hi", "forward_to": "+15085550100"}
+    )
+    assert default_gates.transfer_hint == "operator"
+    custom = svc.build_call_gates(
+        {"business_name": "A", "services": "x", "owner_name": "Jo Smith",
+         "greeting": "hi", "forward_to": "+15085550100",
+         "transfer_phrases": "front desk please\noperator"}
+    )
+    assert custom.transfer_hint == "front desk please"  # BLIND-2: never lie
+
+
+def test_loose_marker_detection(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    assert svc.loose_marker_spoken("Goodbye! [ END CALL ]") is True
+    assert svc.loose_marker_spoken("Goodbye! [end  call]") is True
+    assert svc.loose_marker_spoken("Goodbye now, take care.") is False
+
+
+def test_default_phrases_have_no_bare_owner_or_bare_transfer(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    assert "{owner}" not in svc.DEFAULT_TRANSFER_PHRASES  # only inside verb phrases
+    assert all(p != "transfer" for p in svc.DEFAULT_TRANSFER_PHRASES)
+    bare_owner = [p for p in svc.DEFAULT_TRANSFER_PHRASES if p.strip() == "{owner}"]
+    assert bare_owner == []
+    # every owner-referencing default is verb-framed (ARCH-1)
+    for p in svc.DEFAULT_TRANSFER_PHRASES:
+        if "{owner}" in p:
+            assert any(v in p for v in ("speak", "talk", "get")), p
+
+
+def test_scrubber_case_variant_marker_caught(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    scrubber = svc.MarkerScrubber()
+    spoken = scrubber.feed("Goodbye now! [end call]") + scrubber.flush()
+    assert "end call" not in spoken.lower()
+    assert scrubber.found == {"end"}
+    scrubber2 = svc.MarkerScrubber()
+    spoken2 = scrubber2.feed("Bye! [End Call]") + scrubber2.flush()
+    assert "[" not in spoken2
+    assert scrubber2.found == {"end"}
+
+
+def test_scrubber_truncated_marker_never_spoken(tmp_path, monkeypatch):
+    """A stream cut mid-marker must not say '[END' to a customer."""
+    svc = _import_service(tmp_path, monkeypatch)
+    scrubber = svc.MarkerScrubber()
+    spoken = scrubber.feed("Goodbye! [END CA")
+    spoken += scrubber.flush()  # stream truncated here
+    assert spoken.strip() == "Goodbye!"
+    assert scrubber.found == set()
+
+
+def test_overpromise_detector(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    hits = svc.detect_overpromise(
+        "Got it, Alice! William will meet with you at 9 AM tomorrow — you're booked."
+    )
+    assert "booked" in hits
+    assert svc.detect_overpromise("I've sent the estimate to your email.") != []
+    # the persona's legitimate repeat-back flow must NOT trip the detector
+    assert svc.detect_overpromise("Let me confirm your number: 555-0100?") == []
+    assert svc.detect_overpromise("William will get back to you to confirm.") == []
+
+
+def _gates(svc, forward=True, transfer_raw="", end_raw=""):
+    profile = {
+        "business_name": "Acme Co", "services": "x", "owner_name": "William D",
+        "greeting": "hi",
+    }
+    if forward:
+        profile["forward_to"] = "+15085550100"
+    if transfer_raw:
+        profile["transfer_phrases"] = transfer_raw
+    if end_raw:
+        profile["end_phrases"] = end_raw
+    return svc.build_call_gates(profile)
+
+
+def test_incident_replay_never_authorizes(tmp_path, monkeypatch):
+    """The 2026-07-26 call: caller says the owner's name, model marks
+    transfer. Must be blocked with no-caller-request."""
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    utts = [
+        "I wanted to make an appointment with William.",
+        "Yeah. It would be tomorrow at 9AM.",
+        "Never told you my name. My name is William, actually.",
+    ]
+    action, reason = svc.decide_call_action(
+        "Oh, hello William! Let me start again. I'll connect you now.",
+        {"transfer"}, utts, gates,
+    )
+    assert action is None
+    assert reason == "no-caller-request"
+
+
+def test_operator_authorizes_transfer(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    action, reason = svc.decide_call_action(
+        "Of course, connecting you now.", {"transfer"},
+        ["Operator, please."], gates,
+    )
+    assert (action, reason) == ("transfer", "authorized")
+    action, _ = svc.decide_call_action(
+        "Connecting you now.", {"transfer"},
+        ["Can I speak with William please"], gates,
+    )
+    assert action == "transfer"
+
+
+def test_affirmation_flow_and_stale_consent(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    # operator -> (agent question) -> "yes" => authorized
+    action, _ = svc.decide_call_action(
+        "Connecting you now.", {"transfer"},
+        ["I need the operator", "yes please"], gates,
+    )
+    assert action == "transfer"
+    # stale consent: phrase 3 turns back but last utterance is NOT an affirmation
+    action, reason = svc.decide_call_action(
+        "Connecting you now.", {"transfer"},
+        ["get me the operator", "actually about my invoice", "the total looks wrong"],
+        gates,
+    )
+    assert action is None
+    assert reason == "no-caller-request"
+    # BLIND-1: a "yes" answering an UNRELATED question must not ride an
+    # "operator" from two turns earlier — consent and confirmation adjacent only
+    action, reason = svc.decide_call_action(
+        "Connecting you now.", {"transfer"},
+        ["operator", "what are your hours", "yes"], gates,
+    )
+    assert action is None
+    assert reason == "no-caller-request"
+    # AUDIT-1: "do it" is not in the spec's affirmation set
+    action, _ = svc.decide_call_action(
+        "Connecting you now.", {"transfer"}, ["operator", "do it"], gates,
+    )
+    assert action is None
+
+
+def test_question_in_reply_blocks_everything(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    for q in ["Shall I connect you?", "Connecting now, okay？", "جاهز؟"]:
+        action, reason = svc.decide_call_action(q, {"transfer"}, ["operator"], gates)
+        assert action is None
+        assert reason == "question-in-reply"
+
+
+def test_end_gate_standalone_no_vs_sentence(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    action, _ = svc.decide_call_action("Goodbye!", {"end"}, ["No."], gates)
+    assert action == "end"
+    action, reason = svc.decide_call_action(
+        "Goodbye!", {"end"}, ["no, actually can you also check hosting"], gates
+    )
+    assert action is None
+    assert reason == "no-caller-request"
+    action, _ = svc.decide_call_action(
+        "Thanks for calling. Goodbye!", {"end"}, ["that's all, goodbye"], gates
+    )
+    assert action == "end"
+
+
+def test_both_markers_each_own_gate(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    # only END is caller-authorized -> end wins even though transfer marked
+    action, _ = svc.decide_call_action(
+        "Goodbye!", {"end", "transfer"}, ["nothing else, goodbye"], gates
+    )
+    assert action == "end"
+    # only TRANSFER authorized -> transfer
+    action, _ = svc.decide_call_action(
+        "Connecting you.", {"end", "transfer"}, ["operator"], gates
+    )
+    assert action == "transfer"
+
+
+def test_transfer_unavailable_without_forward_to(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc, forward=False)
+    action, reason = svc.decide_call_action(
+        "Connecting you now.", {"transfer"}, ["operator"], gates
+    )
+    assert action is None
+    assert reason == "transfer-unavailable"
+
+
+def test_no_marker_reason(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = _gates(svc)
+    assert svc.decide_call_action("Hello!", set(), ["operator"], gates) == (
+        None, "no-marker",
+    )
+
+
 def test_admin_app_auth_and_save(tmp_path, monkeypatch):
     """The dashboard: no token -> login page; wrong token -> rejected; right
     token -> dashboard; a bad save is rejected and changes nothing."""
@@ -409,6 +695,11 @@ def test_admin_app_auth_and_save(tmp_path, monkeypatch):
     assert "Wrong token" in results["bad_login"]
     assert results["login_status"] == 303
     assert "profile: acme" in results["dash"]
+    # phrase gates are dashboard-editable as MULTILINE fields (ARCH-8: a
+    # single-line input would silently collapse the newline list on save)
+    assert "name='acme::transfer_phrases'" in results["dash"]
+    assert "name='acme::end_phrases'" in results["dash"]
+    assert results["dash"].count("<textarea") >= 5  # facts, extra, 2 phrase fields, numbers
     assert "Not applied" in results["bad_save"]
     assert svc.NUMBERS == {"+15550001111": "acme"}   # unchanged by bad save
 

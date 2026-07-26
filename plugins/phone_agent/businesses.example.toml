@@ -16,6 +16,15 @@ greeting = "Hi, you've reached Acme Plumbing. How can I help you today?"
 # forward_to = "+15085550100"     # optional; enables live call transfer to
 #                                 # this number ("connect me to a person").
 #                                 # Omit it and the agent takes messages only.
+# transfer_phrases = '''          # optional; a caller must SAY one of these
+# operator                        # before any transfer happens ({owner} =
+# speak to {owner}                # the owner's first name). Empty -> the
+# '''                             # standard set. The AI alone can never
+#                                 # transfer a call.
+# end_phrases = '''               # optional; same rule before the agent may
+# goodbye                         # hang up. Empty -> the standard set.
+# that's all
+# '''
 # facts = '''                     # optional; the ONLY specifics the agent may
 # Email: office@acmeplumbing.com  # state as fact (hours, contact, service
 # Hours: Mon-Fri 8am-5pm          # area, pricing posture). Omit it and the

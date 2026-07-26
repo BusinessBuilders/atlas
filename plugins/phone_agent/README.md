@@ -96,12 +96,26 @@ the journal at ERROR.
   word** — `honor_markers()` ignores (and WARN-logs) any marker glued to a
   reply that asks the caller a question, because a small model will
   eventually hang up mid-intake if only the prompt forbids it.
-- Profiles with `forward_to = "+1..."` can **transfer the call**: the model
-  ends a connecting sentence with `[TRANSFER CALL]`, the session ends with
-  a transfer handoff, and Twilio's `<Connect action>` callback
-  (`/voice/action`, signature-checked) answers with `<Dial>` to the forward
-  number — original caller ID shown, apology + hangup on no answer.
-  Profiles without `forward_to` never offer transfers.
+- Profiles with `forward_to = "+1..."` can **transfer the call** via
+  Twilio's `<Connect action>` callback (`/voice/action`, signature-checked)
+  answering `<Dial>` to the forward number — original caller ID shown,
+  apology + hangup on no answer. Profiles without `forward_to` never offer
+  transfers, and a hallucinated transfer marker there is blocked rather
+  than becoming a silent hangup.
+- **The caller decides, not the AI.** A model marker alone never acts:
+  `decide_call_action()` requires the CALLER to have explicitly asked —
+  transfer needs a phrase like "operator" / "speak to a person" /
+  "talk to {owner}" in the caller's recent words (or such a request plus a
+  fresh "yes"), hangup needs a goodbye phrase or a standalone "no". Blocked
+  attempts are WARNING-logged with the reason, and a blocked "connecting
+  you now" is corrected out loud. Phrase lists are per-profile
+  (`transfer_phrases` / `end_phrases`, dashboard-editable; empty = the
+  standard set). Replies containing a question can never trigger an action.
+- **Overpromise flagging**: commitment language the persona forbids
+  ("booked", "you're all set", "I've sent") is detected deterministically —
+  WARNING in the journal plus a ⚠ REVIEW prefix on the pad entry and push.
+  Design + review record: `docs/superpowers/specs/2026-07-26-phone-call-
+  control-hardening-design.md`.
 
 ## Owner dashboard
 

@@ -94,7 +94,7 @@ def build_admin_app(
         def field(name: str, label: str, tall: bool = False, hint: str = "") -> str:
             value = html.escape(str(profile.get(name, "")))
             h = f"<div class='hint'>{html.escape(hint)}</div>" if hint else ""
-            if name in ("facts", "extra_instructions"):
+            if name in ("facts", "extra_instructions", "transfer_phrases", "end_phrases"):
                 return (f"<label>{html.escape(label)}</label>"
                         f"<textarea class='{'tall' if tall else ''}' "
                         f"name='{key}::{name}'>{value}</textarea>{h}")
@@ -113,6 +113,10 @@ def build_admin_app(
             + field("model", "Model override (optional; must be a non-thinking model)")
             + field("facts", "Known facts — the ONLY specifics the agent may state (email, hours, service area, pricing posture; one per line)", tall=True)
             + field("extra_instructions", "Extra instructions — appended to this business's prompt (cannot override the safety rules)", tall=True)
+            + field("transfer_phrases", "Transfer phrases — a caller must say one of these before a transfer can happen (one per line; {owner} = the owner's first name)",
+                    hint="Leave empty to use the standard set (operator, transfer me, speak to a person, talk to {owner}, …). Listing your own REPLACES the standard set.")
+            + field("end_phrases", "Hang-up phrases — a caller must say one of these before the agent may end the call (one per line)",
+                    hint="Leave empty to use the standard set (goodbye, that's all, nothing else, hang up, …). Listing your own REPLACES the standard set.")
             + f"<label class='del'><input type='checkbox' name='{key}::__delete'> delete this profile</label>"
             "</div>"
         )
