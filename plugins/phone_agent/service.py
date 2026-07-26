@@ -185,6 +185,15 @@ PHONE_PERSONA_TEMPLATE = (
     "STYLE: Warm, professional, human. One to three short sentences per reply — this is a "
     "spoken conversation. No lists, no formatting, no emojis. Plain everyday words.\n"
     "\n"
+    "VOICE CONTEXT: you hear the caller through automatic speech recognition, so the text "
+    "you receive can contain mishearings. Your own name, {assistant_name}, is often "
+    "transcribed as a similar-sounding name (for example \"Alice\" or \"at last\") — a "
+    "greeting like \"hey Alice\" is almost certainly the caller talking TO YOU, never their "
+    "own name; just carry on naturally as {assistant_name} without making a point of it. "
+    "Only treat something as the caller's name when they clearly introduce themselves. "
+    "Names, phone numbers, and emails get garbled easily — repeat them back to confirm "
+    "before relying on them.\n"
+    "\n"
     "HARD RULES — these override everything else:\n"
     "- You have NO tools and can take NO actions. You cannot send emails or texts, book or "
     "schedule anything, look anything up, transfer the call, or open apps. NEVER say you did, "
@@ -396,6 +405,22 @@ def detect_overpromise(reply: str) -> list[str]:
     return [t for t, p in zip(_COMMITMENT_TERMS, _COMMITMENT_PATTERNS) if p.search(norm)]
 
 
+# STT mishearing aliases for the assistant's own name: a live call showed
+# Twilio transcribing "hi Atlas" as "Hey, Alice", and the model adopting
+# Alice as the caller's name from history — and an in-context hint note both
+# failed to stick on the 7B AND got mimicked into spoken replies. So the fix
+# is deterministic: rewrite the mishearing in the inbound text before the
+# model ever sees it — UNLESS the caller is introducing themself by that
+# name ("my name is Alice" stays untouched; a business with a real Alice
+# clears the alias on the dashboard). Defaults apply only to the stock
+# assistant name; per-profile `assistant_aliases` overrides.
+DEFAULT_ASSISTANT_ALIASES = {"atlas": ["alice", "at last", "atlus", "atlass"]}
+_INTRO_TEMPLATES = (
+    "my name is {a}", "name is {a}", "this is {a}", "i am {a}", "i'm {a}",
+    "im {a}", "call me {a}", "{a} speaking", "names {a}", "name's {a}",
+)
+
+
 @dataclass(frozen=True)
 class CallGates:
     """Per-profile compiled authorization state, built once at boot/apply."""
@@ -406,6 +431,23 @@ class CallGates:
     # own first phrase, never a hardcoded "operator" that a customized line
     # wouldn't honor (BLIND-2).
     transfer_hint: str = "operator"
+    # (alias_text, compiled_raw_pattern) pairs + the name they resolve to.
+    alias_patterns: tuple = ()
+    assistant_name: str = "Atlas"
+
+
+def resolve_alias_mishearing(text: str, gates: CallGates) -> str:
+    """Rewrite a known mishearing of the assistant's name in the inbound
+    utterance ("Hey, Alice" -> "Hey, Atlas") so the model never sees the
+    wrong name — deterministic, at the source. A caller INTRODUCING
+    themself by the alias is left untouched: their name is their name."""
+    norm = normalize_speech(text)
+    for alias, pattern in gates.alias_patterns:
+        if pattern.search(text):
+            if any(t.replace("{a}", alias) in norm for t in _INTRO_TEMPLATES):
+                continue
+            return pattern.sub(gates.assistant_name, text)
+    return text
 
 
 def build_call_gates(profile: dict) -> CallGates:
@@ -425,11 +467,21 @@ def build_call_gates(profile: dict) -> CallGates:
         if expanded:
             hint = expanded
             break
+    assistant_name = str(profile.get("assistant_name", "")).strip() or "Atlas"
+    aliases = parse_phrase_lines(str(profile.get("assistant_aliases", ""))) \
+        or list(DEFAULT_ASSISTANT_ALIASES.get(normalize_speech(assistant_name), []))
+    alias_patterns = tuple(
+        (a, re.compile(r"\b" + re.escape(a).replace(r"\ ", r"\s+") + r"\b",
+                       re.IGNORECASE))
+        for a in aliases
+    )
     return CallGates(
         transfer_patterns=tuple(compile_phrases(transfer, owner)),
         end_patterns=tuple(compile_phrases(end, owner)),
         transfer_available=bool(str(profile.get("forward_to", "")).strip()),
         transfer_hint=hint,
+        alias_patterns=alias_patterns,
+        assistant_name=assistant_name,
     )
 
 
@@ -565,7 +617,7 @@ def load_business_config(path: str) -> tuple[dict, dict]:
 _PROFILE_KNOWN_KEYS = (
     "business_name", "services", "owner_name", "greeting", "assistant_name",
     "forward_to", "model", "facts", "extra_instructions",
-    "transfer_phrases", "end_phrases",
+    "transfer_phrases", "end_phrases", "assistant_aliases",
 )
 
 
@@ -1087,7 +1139,10 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                 log.info("caller (%s): %s", call_sid, text)
                 if reply_task and not reply_task.done():
                     reply_task.cancel()
-                history.append({"role": "user", "content": text})
+                resolved = resolve_alias_mishearing(text, gates)
+                if resolved != text:
+                    log.info("alias rewrite (%s): %r -> %r", call_sid, text, resolved)
+                history.append({"role": "user", "content": resolved})
                 del history[:-MAX_HISTORY_TURNS * 2]
                 turn_state["n"] += 1
 

@@ -285,6 +285,10 @@ def test_persona_transfer_and_honesty_rules(tmp_path, monkeypatch):
         "never say an appointment" in prompt.lower()
     assert "did not give as their own" in prompt      # no invented names
     assert "never guess or extrapolate" in prompt     # D6 one-source-of-truth rule
+    # the agent must know it's hearing STT text and that its own name gets
+    # misheard ("hi Atlas" -> "Hey, Alice" on a real call)
+    assert "speech recognition" in prompt
+    assert "similar-sounding name" in prompt
 
 
 def test_action_twiml(tmp_path, monkeypatch):
@@ -440,6 +444,38 @@ def test_transfer_hint_uses_profiles_own_phrase(tmp_path, monkeypatch):
          "transfer_phrases": "front desk please\noperator"}
     )
     assert custom.transfer_hint == "front desk please"  # BLIND-2: never lie
+
+
+def test_alias_mishearing_rewritten_at_source(tmp_path, monkeypatch):
+    """'hi Atlas' arrives from STT as 'Hey, Alice' — the inbound text is
+    rewritten to the assistant's real name so the model never sees the wrong
+    one. A caller INTRODUCING themself as Alice is untouched."""
+    svc = _import_service(tmp_path, monkeypatch)
+    gates = svc.build_call_gates(
+        {"business_name": "A", "services": "x", "owner_name": "Jo Smith",
+         "greeting": "hi", "forward_to": "+15085550100"}
+    )
+    assert svc.resolve_alias_mishearing("Hey, Alice. How's it going?", gates) == \
+        "Hey, Atlas. How's it going?"
+    assert svc.resolve_alias_mishearing("Is at last there?", gates) == \
+        "Is Atlas there?"
+    # a real Alice keeps her name
+    assert svc.resolve_alias_mishearing("Hi, my name is Alice Green.", gates) == \
+        "Hi, my name is Alice Green."
+    assert svc.resolve_alias_mishearing("This is Alice from the bakery.", gates) == \
+        "This is Alice from the bakery."
+    # untouched when no alias appears
+    assert svc.resolve_alias_mishearing("I need a website quote.", gates) == \
+        "I need a website quote."
+    # custom assistant name gets no stock aliases; profile overrides do
+    custom = svc.build_call_gates(
+        {"business_name": "A", "services": "x", "owner_name": "Jo Smith",
+         "greeting": "hi", "assistant_name": "Nova",
+         "assistant_aliases": "nover\nnova scotia"}
+    )
+    assert svc.resolve_alias_mishearing("hi nover, you there?", custom) == \
+        "hi Nova, you there?"
+    assert svc.resolve_alias_mishearing("Hey, Alice.", custom) == "Hey, Alice."
 
 
 def test_loose_marker_detection(tmp_path, monkeypatch):

@@ -94,7 +94,8 @@ def build_admin_app(
         def field(name: str, label: str, tall: bool = False, hint: str = "") -> str:
             value = html.escape(str(profile.get(name, "")))
             h = f"<div class='hint'>{html.escape(hint)}</div>" if hint else ""
-            if name in ("facts", "extra_instructions", "transfer_phrases", "end_phrases"):
+            if name in ("facts", "extra_instructions", "transfer_phrases", "end_phrases",
+                        "assistant_aliases"):
                 return (f"<label>{html.escape(label)}</label>"
                         f"<textarea class='{'tall' if tall else ''}' "
                         f"name='{key}::{name}'>{value}</textarea>{h}")
@@ -117,6 +118,8 @@ def build_admin_app(
                     hint="Leave empty to use the standard set (operator, transfer me, speak to a person, talk to {owner}, …). Listing your own REPLACES the standard set.")
             + field("end_phrases", "Hang-up phrases — a caller must say one of these before the agent may end the call (one per line)",
                     hint="Leave empty to use the standard set (goodbye, that's all, nothing else, hang up, …). Listing your own REPLACES the standard set.")
+            + field("assistant_aliases", "Name mishearings — words the transcriber confuses with the assistant's name (one per line)",
+                    hint="Callers greeting the agent get transcribed imperfectly (\"Atlas\" often arrives as \"Alice\"). The agent is told these are probably itself, not the caller's name. Empty = the standard set for the name Atlas.")
             + f"<label class='del'><input type='checkbox' name='{key}::__delete'> delete this profile</label>"
             "</div>"
         )
