@@ -45,8 +45,13 @@ Config file (systemd loads it via EnvironmentFile): ~/.config/atlas-phone/env
   PUBLIC_BASE          public https base Twilio uses, INCLUDING the serve
                        path mount, e.g.
                        https://magiccat.tail09c6c9.ts.net:10000/phone
-  WS_TOKEN             shared secret in the wss URL; only Twilio ever sees
-                       the TwiML that carries it
+  WS_TOKEN             legacy shared secret in the wss URL. Still required,
+                       but only ACCEPTED while WS_SECRET is unset.
+  WS_SECRET            any long random string. When set, every call gets its
+                       own short-lived, single-use websocket token signed with
+                       this (and the shared WS_TOKEN stops being accepted) —
+                       so a relay URL read out of the public nginx access log
+                       is worthless minutes later. Set it.
   OLLAMA_URL           OpenAI-compatible base, e.g. http://127.0.0.1:11434/v1
   MODEL                default model name — MUST be non-thinking (see above)
   BUSINESS_CONFIG      optional path to businesses.toml (default: next to
@@ -127,6 +132,7 @@ import tomllib
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
 import aiohttp
@@ -139,6 +145,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import wstoken  # noqa: E402  (needs the sys.path line above)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("atlas-phone")
@@ -178,6 +185,30 @@ AUTH_TOKEN = _require("TWILIO_AUTH_TOKEN")
 BRIDGE_PORT = int(_require("BRIDGE_PORT"))
 PUBLIC_BASE = _require("PUBLIC_BASE").rstrip("/")
 WS_TOKEN = _require("WS_TOKEN")
+# Per-call websocket tokens (H-8). With WS_SECRET set, every call gets its own
+# short-lived, single-use token and the shared WS_TOKEN stops being accepted.
+WS_SECRET = os.getenv("WS_SECRET", "").encode()
+if not WS_SECRET:
+    log.warning(
+        "WS_SECRET is not set — the relay still accepts the shared static WS_TOKEN, "
+        "which never rotates and rides in the relay URL through nginx's access log. "
+        "Put WS_SECRET=<a long random string> in the phone env file and restart to "
+        "switch to per-call tokens; the static token stops working then. This "
+        "back-compat lasts one release."
+    )
+# Tokens already spent, with the expiry that lets them be pruned. Twilio opens
+# exactly one websocket per TwiML, so a second use is a replay.
+_CONSUMED_WS_TOKENS: dict[str, int] = {}
+
+
+def _consume_ws_token(token: str, now: float) -> bool:
+    """True the first time a token is presented, False on every replay."""
+    for stale in [t for t, exp in _CONSUMED_WS_TOKENS.items() if exp <= now]:
+        _CONSUMED_WS_TOKENS.pop(stale, None)
+    if token in _CONSUMED_WS_TOKENS:
+        return False
+    _CONSUMED_WS_TOKENS[token] = wstoken.expiry_of(token)
+    return True
 OLLAMA_URL = _require("OLLAMA_URL").rstrip("/")
 DEFAULT_MODEL = _require("MODEL")
 BUSINESS_CONFIG = os.environ.get("BUSINESS_CONFIG", "").strip() or os.path.expanduser(
@@ -1229,9 +1260,14 @@ async def voice_incoming(request: web.Request) -> web.Response:
     profile = PROFILES[profile_key]
     log.info("incoming call CallSid=%s from=%s to=%s profile=%s",
              form.get("CallSid"), form.get("From"), dialed, profile_key)
+    call_sid = str(form.get("CallSid", ""))
+    # The relay URL travels through nginx on the public VPS, whose access log
+    # records the full request URI. A per-call token makes that log entry
+    # worthless minutes later; the static one was a key to every call (H-8).
+    ws_token = wstoken.mint(WS_SECRET, call_sid, time.time()) if WS_SECRET else WS_TOKEN
     ws_url = (
         PUBLIC_BASE.replace("https://", "wss://")
-        + f"/voice/relay?token={WS_TOKEN}&profile={profile_key}"
+        + f"/voice/relay?token={ws_token}&call={quote(call_sid)}&profile={profile_key}"
     )
     # action: Twilio calls back here when the relay session ends, letting us
     # forward the call (<Dial>) or hang up based on the session's handoffData.
@@ -1360,9 +1396,24 @@ async def stream_reply(
 
 
 async def voice_relay(request: web.Request) -> web.WebSocketResponse:
-    if request.query.get("token") != WS_TOKEN:
-        log.warning("rejected /voice/relay: bad or missing token")
-        raise web.HTTPForbidden(text="bad token")
+    # Authorization happens BEFORE the websocket is accepted, so a rejected
+    # peer gets a plain 401 on the upgrade request and never reaches the loop.
+    token = request.query.get("token", "")
+    query_call = request.query.get("call", "")
+    if WS_SECRET:
+        now = time.time()
+        if not wstoken.verify(WS_SECRET, token, query_call, now):
+            record_event("error", "ws_auth_rejected",
+                         "per-call token missing, tampered, expired, or minted for "
+                         "another call", query_call or None)
+            raise web.HTTPUnauthorized(text="bad token")
+        if not _consume_ws_token(token, now):
+            record_event("error", "ws_auth_rejected",
+                         "per-call token replayed", query_call or None)
+            raise web.HTTPUnauthorized(text="token already used")
+    elif not hmac.compare_digest(token, WS_TOKEN):
+        record_event("error", "ws_auth_rejected", "static token missing or wrong", None)
+        raise web.HTTPUnauthorized(text="bad token")
     profile_key = request.query.get("profile", "")
     if profile_key not in PROFILES:
         # Only our own TwiML mints this URL, so an unknown profile means the
@@ -1403,6 +1454,14 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
 
                     if etype == "setup":
                         call_sid = event.get("callSid", "?")
+                        if query_call and call_sid != query_call:
+                            record_event(
+                                "error", "ws_setup_callsid_mismatch",
+                                f"setup names a different call than the token ({query_call})",
+                                call_sid,
+                            )
+                            await ws.close(code=4401, message=b"call mismatch")
+                            break
                         if event.get("accountSid") != ACCOUNT_SID:
                             log.warning("relay setup with foreign accountSid — closing (CallSid=%s)", call_sid)
                             await ws.close()

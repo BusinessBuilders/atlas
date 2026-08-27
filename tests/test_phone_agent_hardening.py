@@ -11,11 +11,13 @@
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
+import pytest
 from aiohttp import web
 from test_phone_agent_plugin import _import_service
 
@@ -376,8 +378,9 @@ async def test_a_failing_push_degrades_health_until_it_recovers(tmp_path, monkey
         assert line.pad.exists()                       # the pad entry still landed
 
         line.ntfy.status = 200
-        await run_call(line, [setup_frame(), prompt_frame("hello again")],
-                       call_sid="CAtest00000000002")
+        second = "CAtest00000000002"
+        await run_call(line, [setup_frame(call_sid=second), prompt_frame("hello again")],
+                       call_sid=second)
         assert line.svc.NTFY_FAILURES == 0
         assert line.svc.public_health() == (200, {"status": "ok"})
 
@@ -443,3 +446,130 @@ async def test_health_snapshot_carries_the_recent_events(tmp_path, monkeypatch):
         assert [e["kind"] for e in body["recent_events"]] == ["unhandled_relay_event"]
         assert body["last_delivery"]["ok"] is True
         assert body["last_delivery"]["call_sid"] == CALL_SID
+
+
+# ------------------------------- H-8: the websocket token is per-call now --
+
+WS_SECRET = "test-secret"
+
+
+def _twilio_post_kwargs(line, path: str, form: dict) -> dict:
+    """A correctly signed Twilio webhook POST (signature validation itself is
+    unchanged; this is just how a real request reaches the handler)."""
+    signature = line.svc._signature_for(line.svc.PUBLIC_BASE + path, form)
+    return {"data": form, "headers": {"X-Twilio-Signature": signature}}
+
+
+async def _relay_url_from_twiml(line, call_sid=CALL_SID) -> str:
+    form = {"To": "+15550001111", "From": "+15550001234", "CallSid": call_sid}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{line.base}/voice/incoming",
+                                **_twilio_post_kwargs(line, "/voice/incoming", form)) as resp:
+            assert resp.status == 200
+            twiml = await resp.text()
+    url = twiml.split('ConversationRelay url="', 1)[1].split('"', 1)[0]
+    return url.replace("&amp;", "&")
+
+
+async def _connect_expecting_status(line, url: str) -> int:
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(aiohttp.WSServerHandshakeError) as caught:
+            async with session.ws_connect(url):
+                pass
+    return caught.value.status
+
+
+async def test_twiml_mints_a_token_bound_to_this_call(tmp_path, monkeypatch):
+    async with phone_line(tmp_path, monkeypatch,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        url = await _relay_url_from_twiml(line)
+        query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
+        assert query["call"] == CALL_SID
+        assert query["profile"] == "acme"
+        assert query["token"] != line.svc.WS_TOKEN          # not the shared secret
+        assert wstoken_module().verify(WS_SECRET.encode(), query["token"],
+                                       CALL_SID, time.time())
+
+
+def wstoken_module():
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "plugins" / "phone_agent" / "wstoken.py"
+    spec = importlib.util.spec_from_file_location("wstoken_for_hardening_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def test_a_minted_token_opens_the_relay_exactly_once(tmp_path, monkeypatch):
+    """Single use: Twilio opens one websocket per TwiML, so a second attempt
+    with the same token is a replay of a URL somebody read out of a log."""
+    async with phone_line(tmp_path, monkeypatch,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        token = wstoken_module().mint(WS_SECRET.encode(), CALL_SID, time.time())
+        await run_call(line, [setup_frame(), prompt_frame("hello")], token=token)
+        assert "hello" in line.brain.summarizer_transcript
+
+        replay = f"{line.base}/voice/relay?token={token}&call={CALL_SID}&profile=acme"
+        assert await _connect_expecting_status(line, replay) == 401
+        kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
+        assert "ws_auth_rejected" in kinds
+
+
+async def test_stolen_expired_and_tampered_tokens_are_refused(tmp_path, monkeypatch):
+    async with phone_line(tmp_path, monkeypatch,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        wst = wstoken_module()
+        now = time.time()
+        good = wst.mint(WS_SECRET.encode(), CALL_SID, now)
+        expired = wst.mint(WS_SECRET.encode(), CALL_SID, now - 600)
+        tampered = good[:-1] + ("0" if good[-1] != "0" else "1")
+
+        base = f"{line.base}/voice/relay"
+        # a token minted for a different call
+        assert await _connect_expecting_status(
+            line, f"{base}?token={good}&call=CAsomeoneelse&profile=acme") == 401
+        assert await _connect_expecting_status(
+            line, f"{base}?token={expired}&call={CALL_SID}&profile=acme") == 401
+        assert await _connect_expecting_status(
+            line, f"{base}?token={tampered}&call={CALL_SID}&profile=acme") == 401
+        # the old shared static token no longer opens anything
+        assert await _connect_expecting_status(
+            line, f"{base}?token={line.svc.WS_TOKEN}&call={CALL_SID}&profile=acme") == 401
+
+
+async def test_setup_callsid_must_match_the_token(tmp_path, monkeypatch):
+    """The token is checked before the upgrade; the setup event is checked
+    again, so a token cannot be pointed at another call once connected."""
+    async with phone_line(tmp_path, monkeypatch,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        token = wstoken_module().mint(WS_SECRET.encode(), CALL_SID, time.time())
+        url = f"{line.base}/voice/relay?token={token}&call={CALL_SID}&profile=acme"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+                await ws.send_str(json.dumps(setup_frame(call_sid="CAsomeoneelse")))
+                msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+        assert msg.type is aiohttp.WSMsgType.CLOSE
+        assert msg.data == 4401
+        kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
+        assert "ws_setup_callsid_mismatch" in kinds
+
+
+async def test_without_ws_secret_the_static_token_still_works_and_warns(tmp_path, monkeypatch, caplog):
+    """One release of back-compat: the deployed line keeps answering while
+    WS_SECRET is added to its env file — but it says so at boot, every boot."""
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+            assert b"" == line.svc.WS_SECRET
+            await run_call(line, [setup_frame(), prompt_frame("hello")])
+            assert "hello" in line.brain.summarizer_transcript
+            wrong = f"{line.base}/voice/relay?token=nope&call={CALL_SID}&profile=acme"
+            assert await _connect_expecting_status(line, wrong) == 401
+    assert "WS_SECRET is not set" in caplog.text
+
+
+async def test_with_ws_secret_boot_does_not_warn(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        async with phone_line(tmp_path, monkeypatch, ntfy=False,
+                              extra_env={"WS_SECRET": WS_SECRET}) as line:
+            assert line.svc.WS_SECRET == WS_SECRET.encode()
+    assert "WS_SECRET is not set" not in caplog.text
