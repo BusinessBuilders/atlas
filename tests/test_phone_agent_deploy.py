@@ -201,6 +201,66 @@ def test_install_refuses_a_directory_that_is_not_a_checkout(tmp_path):
     assert not (tmp_path / ".config").exists()
 
 
+def test_install_never_tells_anyone_to_restart_the_phone_line():
+    """install.sh must not restart anything, and must not print a restart
+    command either: the Twilio webhook and the VPS fallback have to be in place
+    BEFORE the switch, so the only safe instruction it can give is 'follow the
+    runbook'. A restart command sitting in its output is an invitation to skip
+    that and drop callers onto a line that answers with nothing."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "systemctl --user restart" not in text
+    assert "README.md" in text          # it points at the runbook instead
+    assert "Cutover" in text
+
+
+def test_install_tells_you_how_to_make_the_checkout_correctly():
+    """The refusal message is the one command a non-developer will copy, so it
+    has to work: `git worktree add` must run inside a repo, and without
+    --detach git refuses outright when the branch is checked out elsewhere."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "cd ~/atlas && git worktree add --detach" in text
+
+
+def test_readme_worktree_command_is_detached_and_run_from_the_repo():
+    text = (PHONE / "README.md").read_text(encoding="utf-8")
+    line = next(
+        ln for ln in text.splitlines() if "git worktree add" in ln
+    )
+    assert "--detach" in line
+    assert "cd ~/atlas" in line
+    # And the way back from a bad update: re-pin to a known commit.
+    assert "git checkout --detach" in text
+
+
+def test_install_accepts_a_detached_checkout(tmp_path):
+    """A deployment is pinned to a commit, so its checkout has no branch. The
+    'is this a checkout?' test must not quietly depend on one."""
+    repo = tmp_path / "atlas-phone-deploy"
+    repo.mkdir()
+    git = ["git", "-C", str(repo)]
+    subprocess.run(git + ["init", "-q"], check=True)
+    (repo / "plugins" / "phone_agent").mkdir(parents=True)
+    (repo / "plugins" / "phone_agent" / "service.py").write_text("", "utf-8")
+    subprocess.run(git + ["add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        git + ["-c", "user.email=t@t", "-c", "user.name=t",
+               "commit", "-qm", "init"],
+        check=True, capture_output=True,
+    )
+    head = subprocess.run(
+        git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(git + ["checkout", "-q", "--detach", head], check=True)
+
+    # Run it with a different HOME so the very next check (the path check)
+    # stops it: that proves the checkout test passed on a detached HEAD
+    # without spending a minute building a venv here.
+    proc = _run_install(repo, tmp_path / "elsewhere")
+    assert proc.returncode != 0
+    assert "not a git checkout" not in proc.stderr
+    assert "the unit files run" in proc.stderr
+
+
 def test_install_refuses_a_missing_directory(tmp_path):
     proc = _run_install(tmp_path / "nope", tmp_path)
     assert proc.returncode != 0

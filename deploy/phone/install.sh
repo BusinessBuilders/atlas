@@ -35,7 +35,7 @@ target="$(cd "$target" && pwd -P)"
 # that fails at every start, which is worse than not installing at all.
 top="$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$top" != "$target" ] || [ ! -f "$target/plugins/phone_agent/service.py" ]; then
-  die "'$target' is not a git checkout of the Atlas repo containing plugins/phone_agent/service.py. Create one first: git worktree add \"\$HOME/$DEPLOY_DIR_NAME\" feat/phone-agent-product"
+  die "'$target' is not a git checkout of the Atlas repo containing plugins/phone_agent/service.py. Create one first (a deploy is pinned to a commit, hence --detach): cd ~/atlas && git worktree add --detach \"\$HOME/$DEPLOY_DIR_NAME\" feat/phone-agent-product"
 fi
 
 # The unit files hardcode %h/atlas-phone-deploy (systemd expands %h to $HOME),
@@ -109,8 +109,9 @@ Next steps (full runbook: $target/deploy/phone/README.md):
        ls -l \$HOME/.config/atlas-phone/env \$HOME/.config/atlas-phone/businesses.toml
   2. Check the venv can load what the bridge needs:
        $venv/bin/python -c "import aiohttp, jinja2; print('deps ok')"
-  3. When you are ready to switch the line over (this DOES interrupt calls):
-       systemctl --user restart atlas-phone-bridge.service
-  4. Verify, then archive the old directory — see README.md, "Cutover" and
-     "If something goes wrong".
+  3. DO NOT restart the phone line yet. The Twilio webhook and the VPS
+     fallback have to be in place BEFORE the switch, or a caller can hit a
+     line that answers with nothing. Follow the runbook from its "Cutover"
+     section, in order, all the way through the verification list:
+       $target/deploy/phone/README.md
 EOF

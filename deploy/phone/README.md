@@ -60,9 +60,19 @@ units that point at nothing.
 ## Installing
 
 ```bash
-git worktree add ~/atlas-phone-deploy feat/phone-agent-product
+cd ~/atlas && git worktree add --detach ~/atlas-phone-deploy feat/phone-agent-product
 ~/atlas-phone-deploy/deploy/phone/install.sh ~/atlas-phone-deploy
 ```
+
+Two details in that first command matter:
+
+- **`cd ~/atlas` first.** `git worktree add` only works from inside the repo,
+  and `~/atlas` is the main copy of it.
+- **`--detach`.** A deployment is pinned to one exact commit, not following a
+  branch that someone might push to while a call is in progress. Detached also
+  means it does not collide with the same branch being checked out somewhere
+  else on this machine (git refuses that, which is what you would hit without
+  the flag).
 
 `install.sh` creates `~/atlas-phone-deploy/.venv` (Python 3.11 or newer —
 older versions cannot read the TOML config), installs `aiohttp` and `jinja2`
@@ -169,9 +179,42 @@ notification on the phone. If instead you see an error about `NTFY_URL` /
 `NTFY_TOPIC`, the pager is not configured — fix that before trusting the line
 unattended, because a failure at 2am would then be silent.
 
+## Updating the deployed code later
+
+The deployment is pinned to one commit and stays there until you move it. To
+put newer code on the line:
+
+```bash
+cd ~/atlas-phone-deploy
+git log --oneline -1                    # WRITE THIS DOWN — it is your way back
+git fetch
+git checkout --detach feat/phone-agent-product   # or an exact commit id
+./deploy/phone/install.sh ~/atlas-phone-deploy   # picks up unit/dependency changes
+systemctl --user restart atlas-phone-bridge.service
+systemctl --user restart atlas-phone-tunnel.service
+systemctl --user is-active atlas-phone-bridge.service atlas-phone-tunnel.service
+curl -s http://127.0.0.1:8890/health
+```
+
+Write down the commit id from before the update. That one line is the whole
+rollback plan.
+
 ## If something goes wrong
 
-Put the old setup back — it is still on disk:
+**If you have already been running this deployment and an update broke it** —
+go back to the commit you wrote down:
+
+```bash
+cd ~/atlas-phone-deploy
+git checkout --detach <the commit id from before the update>
+./deploy/phone/install.sh ~/atlas-phone-deploy
+systemctl --user restart atlas-phone-bridge.service
+systemctl --user restart atlas-phone-tunnel.service
+curl -s http://127.0.0.1:8890/health
+```
+
+**If the first cutover itself went wrong** — put the old setup back; it is
+still on disk:
 
 ```bash
 systemctl --user stop atlas-phone-bridge.service
@@ -182,8 +225,13 @@ cp ~/atlas-phone-bridge.unit.backup-2026-08-27 \
    ~/.config/systemd/user/atlas-phone-bridge.service
 systemctl --user daemon-reload
 systemctl --user start atlas-phone-bridge.service
+systemctl --user restart atlas-phone-tunnel.service
 curl -s http://127.0.0.1:8890/health
 ```
+
+The tunnel is restarted at the end because it only carries port 8890 — it does
+not care which copy of the code is answering — so restarting it re-runs the
+guard and gives the restored line a fresh, working forward.
 
 The old directory's contents are also committed on the `deploy-archive/2026-08-27`
 branch, so nothing is lost even if the directory is deleted. Keep the archived
