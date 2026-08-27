@@ -36,15 +36,26 @@ async def handle_phone_line_status(params):
         )
         return
 
-    degraded = body.get("model_backend") != "ok"
-    await params.result_callback(
-        {"ok": True,
-         "line": ("DEGRADED — bridge up but model backend unreachable, "
-                  "callers hear an apology line") if degraded else "up",
-         "model": body.get("model"),
-         "profiles": body.get("profiles"),
-         "numbers_mapped": body.get("numbers")}
-    )
+    # /health used to answer with the model, the profile keys and the number
+    # count; it is publicly reachable, so it now answers with a status and a
+    # short reason and nothing else (audit H-9). Both shapes are read here: a
+    # bridge that has not been restarted yet still sends the old one.
+    if "status" in body:
+        degraded = body["status"] != "ok"
+        reason = str(body.get("reason") or "the bridge is reporting a problem")
+    else:
+        degraded = body.get("model_backend") != "ok"
+        reason = "model backend unreachable, callers hear an apology line"
+    result = {
+        "ok": True,
+        "line": f"DEGRADED — {reason}" if degraded else "up",
+    }
+    # only present on a pre-H-9 bridge; the detail lives on the owner dashboard
+    for key, field in (("model", "model"), ("profiles", "profiles"),
+                       ("numbers_mapped", "numbers")):
+        if field in body:
+            result[key] = body[field]
+    await params.result_callback(result)
 
 
 TOOLS = [

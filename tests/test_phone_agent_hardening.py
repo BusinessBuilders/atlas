@@ -799,3 +799,48 @@ async def test_duplicate_numbers_in_the_dashboard_are_refused(tmp_path, monkeypa
     assert "Not applied" in text
     assert "more than once" in text
     assert svc.NUMBERS == {"+15550001111": "acme"}
+
+
+# ---- the two consumers of /health must both still work after the H-9 trim --
+
+async def test_public_health_still_degrades_when_the_brain_is_dead(tmp_path, monkeypatch):
+    """The body no longer names the brain, but the STATUS CODE is what the
+    external tripwire pages on — a brain the bridge cannot reach must still
+    turn it red."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.models_status = 500
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{line.base}/health") as resp:
+                assert resp.status == 503
+                body = await resp.json()
+        assert body == {"status": "degraded", "reason": "model backend unreachable"}
+
+
+async def test_the_owner_status_tool_reads_the_trimmed_health(tmp_path, monkeypatch):
+    """phone_line_status is how the owner asks Atlas 'is the line up?'. It read
+    model_backend, which the public body no longer carries — it must not start
+    answering DEGRADED for a healthy line."""
+    from test_phone_agent_plugin import _load_handler
+
+    handler = _load_handler()
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        monkeypatch.setenv("ATLAS_PHONE_HEALTH_URL", f"{line.base}/health")
+
+        async def ask() -> dict:
+            captured: dict = {}
+
+            async def capture(result):
+                captured.update(result)
+
+            await handler(SimpleNamespace(arguments={}, result_callback=capture))
+            return captured
+
+        healthy = await ask()
+        assert healthy["ok"] is True
+        assert healthy["line"] == "up"
+
+        line.brain.models_status = 500
+        degraded = await ask()
+        assert degraded["ok"] is True
+        assert degraded["line"].startswith("DEGRADED")
+        assert "model backend unreachable" in degraded["line"]
