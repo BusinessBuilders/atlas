@@ -64,6 +64,13 @@ Config file (systemd loads it via EnvironmentFile): ~/.config/atlas-phone/env
   NTFY_URL/NTFY_TOPIC  optional pair; when both are set, each new message
                        is also pushed (self-hosted ntfy). Setting only one
                        of the two is a config error (fail-closed).
+  PHONE_DATA_DIR       optional directory for the call store (default
+                       ~/.local/share/atlas-phone). Holds calls.db: every
+                       call, turn, message and operational event. Created
+                       0700 at boot; if it cannot be created, or the database
+                       cannot be opened, the bridge refuses to start — a line
+                       that answers calls and records nothing is worse than a
+                       line that is down.
   ADMIN_TOKEN          optional; when set, the owner dashboard (admin.py)
                        runs on 127.0.0.1:ADMIN_PORT (default 8891) — edit
                        businesses/prompts, read messages and transcripts,
@@ -145,20 +152,32 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import callstore  # noqa: E402  (needs the sys.path line above)
 import wstoken  # noqa: E402  (needs the sys.path line above)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("atlas-phone")
 
+# The call store, opened at boot further down. It is declared here because
+# record_event() writes to it and is defined before the config section runs —
+# a config refusal must never trip over a name that does not exist yet.
+STORE: "callstore.CallStore | None" = None
+
 # ------------------------------------------------------------- event ring --
 # Operational events worth a human's attention, kept in memory so the owner
 # dashboard can show what went wrong on this line without anyone reading
 # journald. Nothing a caller SAID goes in here — CallSid, kind and counts only.
+# The ring is the DASHBOARD's view (small, collapsed); the store keeps every
+# single event.
 RECENT_EVENTS: collections.deque = collections.deque(maxlen=200)
 
 
 MAX_EVENT_DETAIL_CHARS = 300
 MAX_CALL_SID_CHARS = 64
+# A port scanner rattling the relay produces one ws_auth_rejected per attempt,
+# and 200 of them flush every other event out of the ring the dashboard reads.
+# Repeats of the same kind inside this window become one entry with a count.
+EVENT_COLLAPSE_SECONDS = 60
 # Every control character becomes a space: a newline in attacker-supplied text
 # would otherwise write a line of its own into the journal, which reads exactly
 # like a log entry the bridge never made.
@@ -171,12 +190,34 @@ def _scrub(text, limit: int) -> str:
     return " ".join(str(text).translate(_CONTROL_TO_SPACE).split())[:limit]
 
 
-def record_event(level: str, kind: str, detail: str, call_sid: str | None = None) -> None:
+def _ring_append(level: str, kind: str, detail: str, call_sid: str | None) -> int:
+    """Put one event in the dashboard's ring, collapsing a repeat of the same
+    kind inside EVENT_COLLAPSE_SECONDS into the entry already there. Returns
+    how many times that entry has now fired."""
+    now = time.time()
+    for entry in reversed(RECENT_EVENTS):
+        if entry["kind"] != kind:
+            continue
+        if now - entry["ts"] <= EVENT_COLLAPSE_SECONDS:
+            entry.update(ts=now, level=level, detail=detail, call_sid=call_sid,
+                         count=entry["count"] + 1)
+            return entry["count"]
+        break
+    RECENT_EVENTS.append({
+        "ts": now, "level": level, "kind": kind,
+        "detail": detail, "call_sid": call_sid, "count": 1,
+    })
+    return 1
+
+
+def record_event(level: str, kind: str, detail: str, call_sid: str | None = None,
+                 profile_key: str | None = None) -> None:
     """Record one operational event AND log it at the matching level.
 
-    Both, always: the log line is what wakes an operator tonight, the ring is
-    what the dashboard shows tomorrow. A failure that only appends here would
-    be exactly the silent failure this pass exists to remove.
+    Three places, always: the log line is what wakes an operator tonight, the
+    ring is what the dashboard shows now, and the store is what answers "when
+    did this start" next week. A failure that only appended here would be
+    exactly the silent failure this pass exists to remove.
 
     `detail` and `call_sid` can be attacker-supplied — a rejected websocket's
     `?call=` is whatever the peer put in the URL — so both are scrubbed and
@@ -185,12 +226,21 @@ def record_event(level: str, kind: str, detail: str, call_sid: str | None = None
     """
     safe_detail = _scrub(detail, MAX_EVENT_DETAIL_CHARS)
     safe_call_sid = None if call_sid is None else _scrub(call_sid, MAX_CALL_SID_CHARS)
-    RECENT_EVENTS.append({
-        "ts": time.time(), "level": level, "kind": kind,
-        "detail": safe_detail, "call_sid": safe_call_sid,
-    })
+    count = _ring_append(level, kind, safe_detail, safe_call_sid)
     emit = log.error if level == "error" else log.warning
     emit("%s: %s (CallSid=%s)", kind, safe_detail, safe_call_sid or "-")
+    if count > 1 and count % 50 == 0:
+        emit("%s has now fired %d times in a row — something is hammering this line",
+             kind, count)
+    if STORE is not None:
+        try:
+            STORE.add_event(profile_key, safe_call_sid, level, kind, safe_detail)
+        except Exception:
+            # Deliberately NOT record_event(): a store that cannot take an
+            # event must not recurse through the code that records events.
+            # The journal line above has already fired, so nothing is lost
+            # quietly — the store is simply missing this one.
+            log.exception("call store: could not keep the %r event", kind)
 
 # ---------------------------------------------------------------- config ---
 
@@ -271,6 +321,52 @@ if bool(NTFY_URL) != bool(NTFY_TOPIC):
 # funnel path that Twilio uses.
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8891").strip() or "8891")
+
+# ------------------------------------------------------------ call store ---
+# The record of what happened on this line: every call, every turn, every
+# message, every operational event. Before it existed the only record was a
+# journald line holding the caller's own words — no retention window, no way
+# to delete one caller's data when they ask (audit H-7, M-1).
+PHONE_DATA_DIR = os.environ.get("PHONE_DATA_DIR", "").strip() or os.path.expanduser(
+    "~/.local/share/atlas-phone"
+)
+try:
+    # 0700: the file holds what strangers said out loud to a business. Nobody
+    # else on the box needs to read it. makedirs' mode is masked by the umask,
+    # so it is set again explicitly on a directory we created.
+    fresh_dir = not os.path.isdir(PHONE_DATA_DIR)
+    os.makedirs(PHONE_DATA_DIR, mode=0o700, exist_ok=True)
+    if fresh_dir:
+        os.chmod(PHONE_DATA_DIR, 0o700)
+    STORE = callstore.CallStore(os.path.join(PHONE_DATA_DIR, "calls.db"))
+except Exception as exc:
+    log.error(
+        "cannot open the call store in %s (%s: %s) — every call, message and "
+        "transcript would go unrecorded. Set PHONE_DATA_DIR to a writable "
+        "directory or fix the permissions on that one. Refusing to start.",
+        PHONE_DATA_DIR, type(exc).__name__, exc,
+    )
+    sys.exit(1)
+log.info("call store: %s", os.path.join(PHONE_DATA_DIR, "calls.db"))
+
+
+def _store_write(what: str, call_sid, profile_key, /, *args, **kwargs):
+    """Run one CallStore method (named by `what`) loudly.
+
+    The store is the RECORD, not the product: a caller on the line must never
+    lose their call because SQLite is unhappy. But a write that did not happen
+    is a hole in the record, so it lands in the journal and the ring. Returns
+    the write's result, or None when it failed.
+    """
+    store = STORE
+    if store is None:
+        return None
+    try:
+        return getattr(store, what)(*args, **kwargs)
+    except Exception as e:
+        record_event("error", "store_write_failed", f"{what}: {type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        return None
 
 MAX_HISTORY_TURNS = 20          # user+assistant message pairs kept per call
 MODEL_TIMEOUT_SECONDS = 45      # hard cap on one model reply
@@ -1199,6 +1295,68 @@ SUMMARIZER_PROMPT = (
 )
 
 
+# What can be read out of a summarizer note with confidence, for the columns
+# the owner's message list shows. The note itself is ALWAYS kept whole in
+# `summary` — this is a convenience, never a replacement for the words.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# A line that is nothing but a phone number, in any shape a summarizer writes
+# one: E.164, spaced digits, dashes, or an area code in parentheses.
+_PHONE_LINE_RE = re.compile(r"^\+?[\d][\d\s().+-]{6,20}$")
+_NAME_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z.'\-]*(?: [A-Za-z][A-Za-z.'\-]*){0,3}$")
+_FIELD_LABELS = {
+    "caller_name": ("caller", "name", "caller name", "from"),
+    "callback": ("callback", "callback number", "best callback number", "phone",
+                 "phone number", "number", "best number", "call back"),
+    "email": ("email", "email address", "e-mail"),
+    "need": ("need", "needs", "needed", "reason", "request", "regarding",
+             "wants", "looking for", "about"),
+}
+NO_MESSAGE_PREFIX = "no message"
+
+
+def parse_message_fields(note: str) -> dict:
+    """Best-effort structure for a free-text note: name, callback, email, need.
+
+    The summarizer writes 2-6 plain lines with no fixed shape, so this reads
+    only what is unambiguous — an explicit `Label: value`, an email address, a
+    line that is nothing but a phone number, and a short opening line that
+    looks like a person's name. Everything else becomes `need` (the first
+    sentence-shaped line). A "No message" note yields nothing, which is the
+    honest answer and the one that makes the call's outcome `no_info_given`.
+    """
+    fields: dict = {"caller_name": None, "callback": None, "email": None, "need": None}
+    opening_line = True
+    for raw in str(note or "").splitlines():
+        line = raw.strip().lstrip("*-• ").strip()
+        if not line or line.startswith(">"):
+            continue
+        if line.lower().startswith(NO_MESSAGE_PREFIX):
+            continue
+        first = opening_line
+        opening_line = False
+        label, _, value = line.partition(":")
+        value = value.strip()
+        key = next((k for k, names in _FIELD_LABELS.items()
+                    if label.strip().lower() in names), None)
+        if key and value:
+            fields[key] = fields[key] or value
+            continue
+        found_email = _EMAIL_RE.search(line)
+        if found_email and not fields["email"]:
+            fields["email"] = found_email.group(0)
+            if _EMAIL_RE.fullmatch(line):
+                continue
+        if _PHONE_LINE_RE.match(line):
+            fields["callback"] = fields["callback"] or line
+            continue
+        if first and _NAME_LINE_RE.match(line) and not fields["caller_name"]:
+            fields["caller_name"] = line
+            continue
+        if not fields["need"] and len(line.split()) > 2:
+            fields["need"] = line
+    return fields
+
+
 def format_message_entry(*, when: str, business_name: str, caller_id: str,
                          note: str, call_sid: str, turns: int) -> str:
     return (
@@ -1254,36 +1412,61 @@ async def summarize_call(http: aiohttp.ClientSession, history: list,
 
 
 async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
-                               caller_id: str, profile: dict, history: list,
-                               model: str, brain: Brain,
-                               overpromise_terms: list | None = None) -> None:
-    """Summarize the finished call onto the message pad (and push if ntfy is
-    configured).
+                               caller_id: str, profile: dict, profile_key: str,
+                               history: list, model: str, brain: Brain,
+                               overpromise_terms: list | None = None) -> dict:
+    """Summarize the finished call into the call store and onto the message pad
+    (and push if ntfy is configured).
 
     A message must never vanish silently, so every step degrades loudly rather
     than dropping anything: a failed summary still writes a pad entry saying so,
     a pad the process cannot write escalates to an urgent push plus a fallback
     file, and a failed push degrades public_health() until one succeeds.
+
+    Returns what the caller's `finally:` needs to finish the call row:
+    `{"ok": whether the message was delivered, "message_id": the store row (or
+    None), "no_info": the caller left nothing to act on}`.
     """
     global NTFY_FAILURES
     caller_turns = sum(1 for m in history if m["role"] == "user")
     when = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
+    summary_failed = False
     try:
         note = await summarize_call(http, history, profile, caller_id, model, brain)
     except Exception as e:
         log.exception("call summarizer FAILED (%s) — writing fallback pad entry", call_sid)
-        record_event("error", "summarizer_failed", f"{type(e).__name__}: {e}", call_sid)
+        record_event("error", "summarizer_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        summary_failed = True
         note = ("MESSAGE EXTRACTION FAILED — read the full transcript in the journal "
                 f"(CallSid {call_sid}).")
+    # The structured columns come from the note as the summarizer wrote it; the
+    # review banner below is ours, and belongs on the pad, not in the record.
+    fields = {"caller_name": None, "callback": None, "email": None, "need": None}
+    if not summary_failed:
+        fields = parse_message_fields(note)
+    no_info = not summary_failed and (
+        note.lstrip().lower().startswith(NO_MESSAGE_PREFIX)
+        or not any((fields["caller_name"], fields["callback"], fields["need"]))
+    )
+    message_id = _store_write(
+        "add_message", call_sid, profile_key,
+        call_sid, profile_key, fields["caller_name"], fields["callback"],
+        fields["email"], fields["need"], note,
+        review_flag=bool(summary_failed or overpromise_terms),
+    )
+    result = {"ok": False, "message_id": message_id, "no_info": no_info}
+
+    pad_note = note
     if overpromise_terms:
-        note = (
+        pad_note = (
             "⚠ REVIEW: the agent may have overpromised on this call "
             f"(said: {', '.join(sorted(set(overpromise_terms)))}) — read the transcript.\n"
             + note
         )
     entry = format_message_entry(
         when=when, business_name=profile["business_name"], caller_id=caller_id,
-        note=note, call_sid=call_sid, turns=caller_turns,
+        note=pad_note, call_sid=call_sid, turns=caller_turns,
     )
     try:
         async with _pad_lock:
@@ -1297,39 +1480,56 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         # cannot do must reach the owner some other way, and until it does the
         # line reports itself sick (H-1).
         log.exception("message pad WRITE FAILED (%s) -> %s", call_sid, MESSAGES_FILE)
-        record_event("error", "pad_write_failed", f"{type(e).__name__}: {e}", call_sid)
+        record_event("error", "pad_write_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
         _note_delivery(call_sid, ok=False, error=f"pad write: {type(e).__name__}")
         await _escalate_undelivered(http, call_sid=call_sid, profile=profile,
-                                    note=note, entry=entry)
-        return
+                                    profile_key=profile_key, note=pad_note, entry=entry)
+        return result
     _note_delivery(call_sid, ok=True, error="")
+    result["ok"] = True
     log.info("message pad: entry written for CallSid=%s -> %s", call_sid, MESSAGES_FILE)
 
-    if NTFY_URL:
-        try:
-            async with http.post(
-                f"{NTFY_URL}/{NTFY_TOPIC}", data=note.encode(),
-                headers={"Title": f"Phone message - {profile['business_name']} line"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"ntfy returned HTTP {resp.status}")
-            NTFY_FAILURES = 0
-            log.info("message pad: ntfy push sent (%s)", call_sid)
-        except Exception as e:
-            # The pad entry survives, but the owner learns about messages FROM
-            # the push. A dead push channel means messages piling up in a file
-            # nobody is watching — degrade /health until one succeeds (H-2).
-            NTFY_FAILURES += 1
-            log.error("ntfy push FAILED (%s), %d in a row — the pad entry is saved but "
-                      "the owner has not been told: %s: %s",
-                      call_sid, NTFY_FAILURES, type(e).__name__, e)
-            record_event("error", "ntfy_push_failed",
-                         f"{NTFY_FAILURES} consecutive: {type(e).__name__}: {e}", call_sid)
+    if not NTFY_URL:
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "off")
+        return result
+    try:
+        async with http.post(
+            f"{NTFY_URL}/{NTFY_TOPIC}", data=pad_note.encode(),
+            headers={"Title": f"Phone message - {profile['business_name']} line"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"ntfy returned HTTP {resp.status}")
+        NTFY_FAILURES = 0
+        log.info("message pad: ntfy push sent (%s)", call_sid)
+        _store_write("log_notify", call_sid, profile_key,
+                     profile_key, "ntfy", True, call_sid=call_sid)
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "sent")
+    except Exception as e:
+        # The pad entry survives, but the owner learns about messages FROM
+        # the push. A dead push channel means messages piling up in a file
+        # nobody is watching — degrade /health until one succeeds (H-2).
+        NTFY_FAILURES += 1
+        log.error("ntfy push FAILED (%s), %d in a row — the pad entry is saved but "
+                  "the owner has not been told: %s: %s",
+                  call_sid, NTFY_FAILURES, type(e).__name__, e)
+        record_event("error", "ntfy_push_failed",
+                     f"{NTFY_FAILURES} consecutive: {type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        _store_write("log_notify", call_sid, profile_key,
+                     profile_key, "ntfy", False,
+                     error=f"{type(e).__name__}: {e}"[:200], call_sid=call_sid)
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "failed")
+    return result
 
 
 async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
-                                profile: dict, note: str, entry: str) -> None:
+                                profile: dict, profile_key: str, note: str,
+                                entry: str) -> None:
     """Last resort when the message pad could not be written: push the raw note
     to the owner at urgent priority and keep a copy beside the pad.
 
@@ -1345,12 +1545,15 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
                   fallback_path)
     except Exception as e:
         log.exception("fallback message file FAILED too (%s) -> %s", call_sid, fallback_path)
-        record_event("error", "fallback_write_failed", f"{type(e).__name__}: {e}", call_sid)
+        record_event("error", "fallback_write_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
 
     if not NTFY_URL:
         record_event("error", "undelivered_no_push_channel",
                      "message pad unwritable and no ntfy configured — the message "
-                     "exists only in the fallback file", call_sid)
+                     "exists only in the fallback file", call_sid, profile_key)
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "off")
         return
     try:
         async with http.post(
@@ -1362,15 +1565,26 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
             if resp.status != 200:
                 raise RuntimeError(f"ntfy returned HTTP {resp.status}")
         log.error("message pad UNWRITABLE — urgent push sent instead (%s)", call_sid)
+        _store_write("log_notify", call_sid, profile_key,
+                     profile_key, "ntfy_urgent", True, call_sid=call_sid)
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "escalated")
     except Exception as e:
         log.exception("urgent push FAILED (%s) — the message reached NOTHING but the "
                       "fallback file", call_sid)
-        record_event("error", "urgent_push_failed", f"{type(e).__name__}: {e}", call_sid)
+        record_event("error", "urgent_push_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        _store_write("log_notify", call_sid, profile_key,
+                     profile_key, "ntfy_urgent", False,
+                     error=f"{type(e).__name__}: {e}"[:200], call_sid=call_sid)
+        _store_write("set_notify_status", call_sid, profile_key,
+                     call_sid, "failed")
 
 
 async def deliver_after_call(*, call_sid: str, caller_id: str, profile: dict,
-                             history: list, model: str, brain: Brain,
-                             overpromise_terms: list | None = None) -> None:
+                             profile_key: str, history: list, model: str,
+                             brain: Brain,
+                             overpromise_terms: list | None = None) -> dict:
     """Post-call delivery on a HTTP session of its own.
 
     The relay handler's session dies the moment that handler is cancelled, so a
@@ -1379,9 +1593,9 @@ async def deliver_after_call(*, call_sid: str, caller_id: str, profile: dict,
     mid-call still writes the caller's message down.
     """
     async with aiohttp.ClientSession() as http:
-        await deliver_call_message(
+        return await deliver_call_message(
             http, call_sid=call_sid, caller_id=caller_id, profile=profile,
-            history=history, model=model, brain=brain,
+            profile_key=profile_key, history=history, model=model, brain=brain,
             overpromise_terms=overpromise_terms,
         )
 
@@ -1538,11 +1752,17 @@ async def stream_reply(
     *,
     turn_state: dict,
     my_turn: int,
+    metrics: dict | None = None,
 ) -> tuple[str, set]:
     """Stream one model reply to Twilio as ConversationRelay text tokens.
 
     Returns (spoken_text, markers_found). Raises on model failure. Control
     markers are scrubbed from the stream — the caller never hears them.
+
+    `metrics`, when given, is filled with `ttft_ms`: the milliseconds between
+    sending the request and the first content token. On a phone call that
+    number IS the experience — it is the silence the caller sits through
+    before the agent starts talking — so it is measured per turn and kept.
 
     `turn_state["n"]` is the caller's current turn number and `my_turn` is the
     one this reply belongs to. asyncio's cancel() only lands at the next await,
@@ -1565,6 +1785,7 @@ async def stream_reply(
             spoken.append(text)
             await ws.send_json({"type": "text", "token": text, "last": False})
 
+    sent_at = time.monotonic()
     async with http.post(
         url, json=body, headers=headers,
         timeout=aiohttp.ClientTimeout(total=MODEL_TIMEOUT_SECONDS),
@@ -1585,6 +1806,8 @@ async def stream_reply(
                 break
             token = json.loads(data)["choices"][0]["delta"].get("content") or ""
             if token:
+                if metrics is not None and "ttft_ms" not in metrics:
+                    metrics["ttft_ms"] = int((time.monotonic() - sent_at) * 1000)
                 await say(scrubber.feed(token))
     await say(scrubber.flush())
     if turn_state["n"] == my_turn:
@@ -1633,9 +1856,63 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
     history: list = []
     call_sid = "?"
     caller_id = "unknown"
+    to_number = ""
     overpromise_terms: list = []
     turn_state = {"n": 0}
     reply_task: asyncio.Task | None = None
+    # What the call row still needs when the socket closes: whether a control
+    # decision was acted on, and why. The store row is opened at `setup` and
+    # finalised in the finally: below — one row per call, always closed.
+    call_row = {"open": False, "decision": "", "reason": ""}
+
+    def open_call_row() -> None:
+        """One `calls` row, written the moment we know who is on the line.
+
+        Also called from the first turn: a relay that ever sends words before
+        `setup` must not cost us the whole record, and a turn with no call row
+        is a turn the store is right to refuse.
+        """
+        store = STORE
+        if call_row["open"] or store is None:
+            return
+        try:
+            store.start_call(call_sid, profile_key, caller_id, to_number,
+                             brain.key, model,
+                             is_test=callstore.is_test_call(call_sid, caller_id))
+            call_row["open"] = True
+        except Exception as e:
+            record_event("error", "store_write_failed",
+                         f"start_call: {type(e).__name__}: {e}", call_sid, profile_key)
+
+    def store_turn(n: int, role: str, text: str, ttft_ms=None) -> None:
+        """Everything said on the call goes here — this store, not the journal,
+        is where a transcript lives now (audit H-7)."""
+        open_call_row()
+        if not call_row["open"]:
+            return
+        _store_write("add_turn", call_sid, profile_key,
+                     call_sid, n, role, text, ttft_ms=ttft_ms)
+
+    def close_call_row(delivery: dict | None) -> None:
+        """Finalise the row, whatever happened. The outcome is decided HERE,
+        where the call actually ended, from what the bridge did and what the
+        delivery came back with."""
+        if not call_row["open"]:
+            return
+        caller_turns = sum(1 for m in history if m["role"] == "user")
+        if call_row["decision"] == "transfer":
+            outcome = "transferred"
+        elif caller_turns == 0:
+            outcome = "caller_hung_up"          # the socket closed with nothing said
+        elif delivery is None or not delivery.get("ok"):
+            outcome = "agent_error"             # words were spoken, delivery failed
+        elif delivery.get("no_info"):
+            outcome = "no_info_given"           # a note, but nothing to act on
+        else:
+            outcome = "message_taken"
+        _store_write("end_call", call_sid, profile_key,
+                     call_sid, outcome, call_row["reason"], caller_turns,
+                     sorted(set(overpromise_terms)))
 
     async def speak(text: str) -> None:
         await ws.send_json({"type": "text", "token": text, "last": True})
@@ -1664,6 +1941,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             await ws.close()
                             break
                         caller_id = event.get("from") or "unknown"
+                        to_number = event.get("to") or ""
                         # Real caller ID from the phone network — lets the agent
                         # confirm the callback number instead of transcribing it.
                         system_prompt = (
@@ -1672,27 +1950,39 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                         )
                         log.info("relay session started CallSid=%s from=%s profile=%s",
                                  call_sid, caller_id, profile_key)
+                        open_call_row()
 
                     elif etype == "prompt":
                         text = (event.get("voicePrompt") or "").strip()
                         if not text:
                             continue
-                        log.info("caller (%s): %s", call_sid, text)
                         if reply_task and not reply_task.done():
                             reply_task.cancel()
                         resolved = resolve_alias_mishearing(text, gates)
-                        if resolved != text:
-                            log.info("alias rewrite (%s): %r -> %r", call_sid, text, resolved)
                         history.append({"role": "user", "content": resolved})
                         del history[:-MAX_HISTORY_TURNS * 2]
                         turn_state["n"] += 1
+                        # The journal gets the shape of the turn, never its
+                        # words: journald has no retention window and no way
+                        # to delete one caller (audit H-7). The words go to
+                        # the call store, which has both. What is stored is
+                        # what the caller SAID: the alias rewrite above is a
+                        # repair for the model, not a correction of them.
+                        log.info("caller turn %d (%s): %d characters",
+                                 turn_state["n"], call_sid, len(text))
+                        if resolved != text:
+                            log.info("alias rewrite applied on turn %d (%s)",
+                                     turn_state["n"], call_sid)
+                        store_turn(turn_state["n"], "caller", text)
 
                         async def respond(hist_snapshot: list,
                                           my_turn: int = turn_state["n"]) -> None:
+                            metrics: dict = {}
                             try:
                                 reply, found = await stream_reply(
                                     ws, hist_snapshot, http, system_prompt, model, brain,
                                     turn_state=turn_state, my_turn=my_turn,
+                                    metrics=metrics,
                                 )
                                 if turn_state["n"] != my_turn:
                                     # the caller spoke again while this task was
@@ -1702,7 +1992,14 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                              "moved on (%s)", my_turn, call_sid)
                                     return
                                 history.append({"role": "assistant", "content": reply})
-                                log.info("atlas (%s): %s", call_sid, reply)
+                                # Counts here too: the agent's words quote the
+                                # caller's back often enough that logging them
+                                # would put the caller in the journal anyway.
+                                log.info("agent turn %d (%s): %d characters, "
+                                         "first token in %s ms", my_turn, call_sid,
+                                         len(reply), metrics.get("ttft_ms", "?"))
+                                store_turn(my_turn, "agent", reply,
+                                           ttft_ms=metrics.get("ttft_ms"))
                                 overpromises = detect_overpromise(reply)
                                 if overpromises:
                                     overpromise_terms.extend(overpromises)
@@ -1712,8 +2009,9 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                     )
                                 if loose_marker_spoken(reply):
                                     log.warning(
-                                        "whitespace-variant control marker SPOKEN aloud (%s): %r",
-                                        call_sid, reply[-120:],
+                                        "whitespace-variant control marker SPOKEN aloud "
+                                        "on turn %d (%s) — the reply is in the call store",
+                                        my_turn, call_sid,
                                     )
                                 caller_texts = [m["content"] for m in hist_snapshot
                                                 if m["role"] == "user"]
@@ -1722,10 +2020,13 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                 )
                                 if decision is None and found:
                                     log.warning(
-                                        "marker %s BLOCKED reason=%s (%s) — last caller: %r",
-                                        "/".join(sorted(found)), reason, call_sid,
-                                        caller_texts[-1] if caller_texts else "",
+                                        "marker %s BLOCKED reason=%s (%s) on turn %d — "
+                                        "the caller's last turn was %d characters",
+                                        "/".join(sorted(found)), reason, call_sid, my_turn,
+                                        len(caller_texts[-1]) if caller_texts else 0,
                                     )
+                                    call_row["reason"] = (call_row["reason"]
+                                                          or f"blocked:{reason}")
                                     if reason == "no-caller-request" and "transfer" in found:
                                         # the model already SAID "connecting you" —
                                         # recover the false promise out loud, naming
@@ -1752,6 +2053,8 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                     log.info("atlas %s the call (%s)",
                                              "is transferring" if decision == "transfer" else "ended",
                                              call_sid)
+                                    call_row["decision"] = decision
+                                    call_row["reason"] = decision
                                     await ws.send_json({
                                         "type": "end",
                                         "handoffData": json.dumps({"reason": decision}),
@@ -1780,7 +2083,8 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                         digit = str(event.get("digit") or event.get("digits") or "").strip()
                         if not digit:
                             record_event("warning", "dtmf_without_digit",
-                                         "keypress event carried no digit", call_sid)
+                                         "keypress event carried no digit", call_sid,
+                                         profile_key)
                         else:
                             # NEVER log the digits themselves: a card number or
                             # a PIN arrives one dtmf event per keypress, and
@@ -1797,58 +2101,82 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             history.append({"role": "user", "content": f"[keypress: {digit}]"})
                             del history[:-MAX_HISTORY_TURNS * 2]
                             turn_state["n"] += 1
+                            # The digits themselves belong in the store, where
+                            # retention and delete_caller can reach them — a
+                            # card number in journald can never be taken back.
+                            store_turn(turn_state["n"], "keypress", f"[keypress: {digit}]")
 
                     elif etype == "error":
-                        log.error("Twilio relay error (%s): %s", call_sid, event.get("description"))
+                        # Twilio's own words, not the caller's — but scrubbed
+                        # like everything a peer sends, so it cannot forge a
+                        # journal line.
+                        record_event("error", "twilio_relay_error",
+                                     str(event.get("description") or "(no description)"),
+                                     call_sid, profile_key)
 
                     else:
                         # A renamed or brand-new Twilio event must never be
                         # ignored in silence — that hides a missing feature.
                         log.warning("unhandled relay event %r CallSid=%s", etype, call_sid)
                         record_event("warning", "unhandled_relay_event",
-                                     f"event type {etype!r}", call_sid)
+                                     f"event type {etype!r}", call_sid, profile_key)
                 except Exception as e:
                     # One bad frame must never cost the caller their message:
                     # this used to propagate out of the loop, past the delivery
                     # block below, and the message was gone (C-4).
                     log.exception("relay event failed CallSid=%s", call_sid)
                     record_event("error", "relay_event_failed",
-                                 f"{type(e).__name__}: {e}", call_sid)
+                                 f"{type(e).__name__}: {e}", call_sid, profile_key)
                     continue
 
         finally:
             if reply_task and not reply_task.done():
                 reply_task.cancel()
             log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
-            if any(m["role"] == "user" for m in history):
-                try:
-                    # shield + its own session: a shutdown (or any cancel of
-                    # this handler) must not take the delivery with it.
-                    # CancelledError is a BaseException, so it would otherwise
-                    # walk straight past the handler below with the caller's
-                    # message lost and nothing recorded.
-                    await asyncio.shield(deliver_after_call(
-                        call_sid=call_sid, caller_id=caller_id,
-                        profile=profile, history=history, model=model, brain=brain,
-                        overpromise_terms=overpromise_terms,
-                    ))
-                except Exception as e:
-                    log.exception(
-                        "message delivery FAILED (%s) — transcript remains in the journal",
-                        call_sid,
-                    )
-                    record_event("error", "delivery_failed",
-                                 f"{type(e).__name__}: {e}", call_sid)
-                    _note_delivery(call_sid, ok=False, error=f"{type(e).__name__}: {e}"[:120])
-                except BaseException as e:
-                    # Cancelled (shutdown) — the shielded delivery is still
-                    # running and will finish if the loop lives long enough.
-                    # Say so and let the cancellation continue.
-                    record_event("error", "delivery_interrupted",
-                                 f"{type(e).__name__}: the relay was cancelled while "
-                                 "delivering; the attempt continues under shield",
-                                 call_sid)
-                    raise
+            delivery: dict | None = None
+            try:
+                if any(m["role"] == "user" for m in history):
+                    try:
+                        # shield + its own session: a shutdown (or any cancel of
+                        # this handler) must not take the delivery with it.
+                        # CancelledError is a BaseException, so it would otherwise
+                        # walk straight past the handler below with the caller's
+                        # message lost and nothing recorded.
+                        delivery = await asyncio.shield(deliver_after_call(
+                            call_sid=call_sid, caller_id=caller_id,
+                            profile=profile, profile_key=profile_key, history=history,
+                            model=model, brain=brain,
+                            overpromise_terms=overpromise_terms,
+                        ))
+                    except Exception as e:
+                        log.exception(
+                            "message delivery FAILED (%s) — the transcript is in the "
+                            "call store", call_sid,
+                        )
+                        record_event("error", "delivery_failed",
+                                     f"{type(e).__name__}: {e}", call_sid, profile_key)
+                        _note_delivery(call_sid, ok=False,
+                                       error=f"{type(e).__name__}: {e}"[:120])
+                    except BaseException as e:
+                        # Cancelled (shutdown) — the shielded delivery is still
+                        # running and will finish if the loop lives long enough.
+                        # Say so and let the cancellation continue.
+                        record_event("error", "delivery_interrupted",
+                                     f"{type(e).__name__}: the relay was cancelled while "
+                                     "delivering; the attempt continues under shield",
+                                     call_sid, profile_key)
+                        # The row is about to be closed with what is known
+                        # right now, which is not the delivery's answer — say
+                        # so in the row itself rather than leaving an
+                        # agent_error nobody can explain later.
+                        call_row["reason"] = ("delivery interrupted by shutdown; "
+                                              "the shielded attempt continued")
+                        raise
+            finally:
+                # Every call gets its row closed — including the ones that end
+                # by cancellation. end_call is a local SQLite write, so it
+                # completes even while the cancellation is unwinding.
+                close_call_row(delivery)
     return ws
 
 

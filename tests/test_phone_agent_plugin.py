@@ -140,6 +140,10 @@ def test_service_config_validation_is_fail_closed(tmp_path):
         PUBLIC_BASE="https://example.test/phone", WS_TOKEN="w",
         OLLAMA_URL="http://127.0.0.1:1/v1", MODEL="m",
         BUSINESS_CONFIG=str(bad),
+        # The boot opens a real call store before it reads the business
+        # config; without this the subprocess would create one in the
+        # developer's ~/.local/share/atlas-phone.
+        PHONE_DATA_DIR=str(tmp_path / "phone-data"),
     )
     service = PLUGINS_DIR / "phone_agent" / "service.py"
     check = subprocess.run(
@@ -177,6 +181,9 @@ def _import_service(tmp_path, monkeypatch, extra_env=None, cfg_extra=""):
         OLLAMA_URL="http://127.0.0.1:1/v1", MODEL="m", BUSINESS_CONFIG=str(cfg),
         **(extra_env or {}),
     )
+    # Every import opens a real call store. It goes under tmp_path, never in
+    # the developer's ~/.local/share/atlas-phone — unless a test names its own.
+    stub.setdefault("PHONE_DATA_DIR", str(tmp_path / "phone-data"))
     for k, v in stub.items():
         monkeypatch.setenv(k, v)
     spec = importlib.util.spec_from_file_location(

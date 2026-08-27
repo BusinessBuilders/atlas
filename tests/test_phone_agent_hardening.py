@@ -283,7 +283,7 @@ async def test_a_stale_reply_never_enters_the_history(tmp_path, monkeypatch):
         svc = line.svc
 
         async def racing(ws, history, http, system_prompt, model, brain, *,
-                         turn_state, my_turn):
+                         turn_state, my_turn, metrics=None):
             # the caller spoke again while this task was past its last await
             turn_state["n"] += 1
             return "STALE REPLY", set()
@@ -302,7 +302,7 @@ async def test_a_current_reply_does_enter_the_history(tmp_path, monkeypatch):
         svc = line.svc
 
         async def calm(ws, history, http, system_prompt, model, brain, *,
-                       turn_state, my_turn):
+                       turn_state, my_turn, metrics=None):
             return "FRESH REPLY", set()
 
         monkeypatch.setattr(svc, "stream_reply", calm)
@@ -976,7 +976,7 @@ async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
         gate = asyncio.Event()
 
         async def slow(ws, history, http, system_prompt, model, brain, *,
-                       turn_state, my_turn):
+                       turn_state, my_turn, metrics=None):
             try:
                 await gate.wait()
             except asyncio.CancelledError:
