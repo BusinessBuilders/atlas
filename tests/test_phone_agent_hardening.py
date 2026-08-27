@@ -187,7 +187,7 @@ async def _drain_until_last(ws, timeout: float = 5.0) -> list[dict]:
 
 
 async def run_call(line, frames, *, token=None, call_sid=CALL_SID, profile="acme",
-                   settle: float = 0.2):
+                   settle: float = 0.2, drain: bool = True):
     """Drive one real websocket call through the bridge. Returns everything the
     bridge spoke back."""
     token = line.svc.WS_TOKEN if token is None else token
@@ -197,7 +197,7 @@ async def run_call(line, frames, *, token=None, call_sid=CALL_SID, profile="acme
         async with session.ws_connect(url) as ws:
             for frame in frames:
                 await ws.send_str(frame if isinstance(frame, str) else json.dumps(frame))
-                if isinstance(frame, dict) and frame.get("type") == "prompt":
+                if drain and isinstance(frame, dict) and frame.get("type") == "prompt":
                     spoken += await _drain_until_last(ws)
             # let the reply task finish its bookkeeping before the hangup
             await asyncio.sleep(settle)
@@ -228,3 +228,77 @@ async def test_malformed_frame_does_not_destroy_the_message(tmp_path, monkeypatc
         assert line.ntfy.pushes and line.brain.note in line.ntfy.pushes[0]["body"]
         kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
         assert "relay_event_failed" in kinds                  # loud, not swallowed
+
+
+# ---------------------------------- M-2: a stale turn must not speak, and --
+#                                          must not corrupt the history
+
+class RecordingWs:
+    """Stands in for Twilio's socket: records what would have been spoken."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, data: dict) -> None:
+        self.sent.append(data)
+
+
+async def test_stream_reply_from_a_stale_turn_speaks_nothing(tmp_path, monkeypatch):
+    """cancel() only lands at the next await, so a reply task can outlive its
+    turn. Two replies interleaving into Twilio's TTS is a garbled call."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+        brain = svc.BRAINS[svc.ACTIVE_BRAIN]
+        history = [{"role": "user", "content": "hello"}]
+
+        async with aiohttp.ClientSession() as http:
+            fresh_ws = RecordingWs()
+            spoken, _ = await svc.stream_reply(
+                fresh_ws, history, http, "system", "test-model", brain,
+                turn_state={"n": 1}, my_turn=1,
+            )
+            assert spoken == line.brain.reply
+            assert fresh_ws.sent and fresh_ws.sent[-1]["last"] is True
+
+            stale_ws = RecordingWs()
+            spoken, _ = await svc.stream_reply(
+                stale_ws, history, http, "system", "test-model", brain,
+                turn_state={"n": 2}, my_turn=1,
+            )
+        assert spoken == ""
+        assert stale_ws.sent == []
+
+
+async def test_a_stale_reply_never_enters_the_history(tmp_path, monkeypatch):
+    """The corrupted order was [user1, user2, assistant1] — a turn order the
+    model then reasons over, and a summary the owner reads."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+
+        async def racing(ws, history, http, system_prompt, model, brain, *,
+                         turn_state, my_turn):
+            # the caller spoke again while this task was past its last await
+            turn_state["n"] += 1
+            return "STALE REPLY", set()
+
+        monkeypatch.setattr(svc, "stream_reply", racing)
+        await run_call(line, [setup_frame(), prompt_frame("hello")], drain=False)
+
+        transcript = line.brain.summarizer_transcript
+        assert "hello" in transcript
+        assert "STALE REPLY" not in transcript
+
+
+async def test_a_current_reply_does_enter_the_history(tmp_path, monkeypatch):
+    """The control for the test above: without a race, the reply is kept."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+
+        async def calm(ws, history, http, system_prompt, model, brain, *,
+                       turn_state, my_turn):
+            return "FRESH REPLY", set()
+
+        monkeypatch.setattr(svc, "stream_reply", calm)
+        await run_call(line, [setup_frame(), prompt_frame("hello")], drain=False)
+
+        assert "Receptionist: FRESH REPLY" in line.brain.summarizer_transcript

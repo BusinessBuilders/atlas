@@ -1234,11 +1234,20 @@ async def stream_reply(
     system_prompt: str,
     model: str,
     brain: Brain,
+    *,
+    turn_state: dict,
+    my_turn: int,
 ) -> tuple[str, set]:
     """Stream one model reply to Twilio as ConversationRelay text tokens.
 
     Returns (spoken_text, markers_found). Raises on model failure. Control
     markers are scrubbed from the stream — the caller never hears them.
+
+    `turn_state["n"]` is the caller's current turn number and `my_turn` is the
+    one this reply belongs to. asyncio's cancel() only lands at the next await,
+    so a task whose turn has moved on can still be mid-stream — and two replies
+    interleaving into Twilio's text-to-speech is a garbled call. Every send is
+    gated on the turn still being current (M-2).
     """
     url, headers, body = brain_request_args(brain, {
         "model": model,
@@ -1249,6 +1258,8 @@ async def stream_reply(
     spoken: list[str] = []
 
     async def say(text: str) -> None:
+        if turn_state["n"] != my_turn:
+            return
         if text:
             spoken.append(text)
             await ws.send_json({"type": "text", "token": text, "last": False})
@@ -1270,7 +1281,8 @@ async def stream_reply(
             if token:
                 await say(scrubber.feed(token))
     await say(scrubber.flush())
-    await ws.send_json({"type": "text", "token": "", "last": True})
+    if turn_state["n"] == my_turn:
+        await ws.send_json({"type": "text", "token": "", "last": True})
     return "".join(spoken).strip(), scrubber.found
 
 
@@ -1350,8 +1362,16 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                           my_turn: int = turn_state["n"]) -> None:
                             try:
                                 reply, found = await stream_reply(
-                                    ws, hist_snapshot, http, system_prompt, model, brain
+                                    ws, hist_snapshot, http, system_prompt, model, brain,
+                                    turn_state=turn_state, my_turn=my_turn,
                                 )
+                                if turn_state["n"] != my_turn:
+                                    # the caller spoke again while this task was
+                                    # past its last await — appending now would
+                                    # order the history [user1, user2, assistant1]
+                                    log.info("reply from turn %d discarded, the caller "
+                                             "moved on (%s)", my_turn, call_sid)
+                                    return
                                 history.append({"role": "assistant", "content": reply})
                                 log.info("atlas (%s): %s", call_sid, reply)
                                 overpromises = detect_overpromise(reply)
