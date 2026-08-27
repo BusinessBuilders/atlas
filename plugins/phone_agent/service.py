@@ -157,19 +157,40 @@ log = logging.getLogger("atlas-phone")
 RECENT_EVENTS: collections.deque = collections.deque(maxlen=200)
 
 
+MAX_EVENT_DETAIL_CHARS = 300
+MAX_CALL_SID_CHARS = 64
+# Every control character becomes a space: a newline in attacker-supplied text
+# would otherwise write a line of its own into the journal, which reads exactly
+# like a log entry the bridge never made.
+_CONTROL_TO_SPACE = {c: " " for c in list(range(0x20)) + [0x7f]}
+
+
+def _scrub(text, limit: int) -> str:
+    """Attacker-supplied text, made safe to log and to keep: control characters
+    out, whitespace collapsed, hard length cap."""
+    return " ".join(str(text).translate(_CONTROL_TO_SPACE).split())[:limit]
+
+
 def record_event(level: str, kind: str, detail: str, call_sid: str | None = None) -> None:
     """Record one operational event AND log it at the matching level.
 
     Both, always: the log line is what wakes an operator tonight, the ring is
     what the dashboard shows tomorrow. A failure that only appends here would
     be exactly the silent failure this pass exists to remove.
+
+    `detail` and `call_sid` can be attacker-supplied — a rejected websocket's
+    `?call=` is whatever the peer put in the URL — so both are scrubbed and
+    capped before they are stored or logged. Unbounded text here would forge
+    journal lines and park kilobytes per entry in the ring.
     """
+    safe_detail = _scrub(detail, MAX_EVENT_DETAIL_CHARS)
+    safe_call_sid = None if call_sid is None else _scrub(call_sid, MAX_CALL_SID_CHARS)
     RECENT_EVENTS.append({
         "ts": time.time(), "level": level, "kind": kind,
-        "detail": str(detail)[:300], "call_sid": call_sid,
+        "detail": safe_detail, "call_sid": safe_call_sid,
     })
     emit = log.error if level == "error" else log.warning
-    emit("%s: %s (CallSid=%s)", kind, str(detail)[:300], call_sid or "-")
+    emit("%s: %s (CallSid=%s)", kind, safe_detail, safe_call_sid or "-")
 
 # ---------------------------------------------------------------- config ---
 
@@ -187,7 +208,19 @@ PUBLIC_BASE = _require("PUBLIC_BASE").rstrip("/")
 WS_TOKEN = _require("WS_TOKEN")
 # Per-call websocket tokens (H-8). With WS_SECRET set, every call gets its own
 # short-lived, single-use token and the shared WS_TOKEN stops being accepted.
-WS_SECRET = os.getenv("WS_SECRET", "").encode()
+MIN_WS_SECRET_CHARS = 16
+_ws_secret = os.getenv("WS_SECRET", "").strip()
+if _ws_secret and len(_ws_secret) < MIN_WS_SECRET_CHARS:
+    # Unstripped, WS_SECRET=" " signed every per-call token with one byte —
+    # worse than the static token it replaces, and it looked like a fix.
+    log.error(
+        "WS_SECRET is %d characters — per-call websocket tokens need at least %d. "
+        "Set a long random value (openssl rand -hex 32) or remove it entirely to "
+        "stay on the legacy static token. Refusing to start.",
+        len(_ws_secret), MIN_WS_SECRET_CHARS,
+    )
+    sys.exit(1)
+WS_SECRET = _ws_secret.encode()
 if not WS_SECRET:
     log.warning(
         "WS_SECRET is not set — the relay still accepts the shared static WS_TOKEN, "
@@ -199,6 +232,17 @@ if not WS_SECRET:
 # Tokens already spent, with the expiry that lets them be pruned. Twilio opens
 # exactly one websocket per TwiML, so a second use is a replay.
 _CONSUMED_WS_TOKENS: dict[str, int] = {}
+
+
+def _same_call(a: str, b: str) -> bool:
+    """Constant-time equality for call identifiers. Both sides are supplied by
+    the peer, and compare_digest raises TypeError on non-ASCII str — a stranger
+    must never be able to turn that into an exception, so it is simply
+    'not equal'."""
+    try:
+        return hmac.compare_digest(str(a), str(b))
+    except TypeError:
+        return False
 
 
 def _consume_ws_token(token: str, now: float) -> bool:
@@ -1323,6 +1367,24 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
                       "fallback file", call_sid)
         record_event("error", "urgent_push_failed", f"{type(e).__name__}: {e}", call_sid)
 
+
+async def deliver_after_call(*, call_sid: str, caller_id: str, profile: dict,
+                             history: list, model: str, brain: Brain,
+                             overpromise_terms: list | None = None) -> None:
+    """Post-call delivery on a HTTP session of its own.
+
+    The relay handler's session dies the moment that handler is cancelled, so a
+    delivery borrowing it would have its connection pulled mid-request even
+    when the coroutine itself is shielded. Owning the session means a shutdown
+    mid-call still writes the caller's message down.
+    """
+    async with aiohttp.ClientSession() as http:
+        await deliver_call_message(
+            http, call_sid=call_sid, caller_id=caller_id, profile=profile,
+            history=history, model=model, brain=brain,
+            overpromise_terms=overpromise_terms,
+        )
+
 # ------------------------------------------------- twilio signature check --
 
 def _signature_for(url: str, form: dict) -> str:
@@ -1589,7 +1651,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
 
                     if etype == "setup":
                         call_sid = event.get("callSid", "?")
-                        if query_call and call_sid != query_call:
+                        if query_call and not _same_call(call_sid, query_call):
                             record_event(
                                 "error", "ws_setup_callsid_mismatch",
                                 f"setup names a different call than the token ({query_call})",
@@ -1720,9 +1782,21 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             record_event("warning", "dtmf_without_digit",
                                          "keypress event carried no digit", call_sid)
                         else:
-                            log.info("caller keypress (%s): %s", call_sid, digit)
+                            # NEVER log the digits themselves: a card number or
+                            # a PIN arrives one dtmf event per keypress, and
+                            # journald has no retention window and no way to
+                            # delete one call. CallSid and a count only.
+                            log.info("caller keypress (%s): %d digit(s)",
+                                     call_sid, len(digit))
+                            # A keypress is a caller turn, so it needs the same
+                            # turn accounting as speech — otherwise an in-flight
+                            # reply lands after it and re-creates the ordering
+                            # bug M-2 closed.
+                            if reply_task and not reply_task.done():
+                                reply_task.cancel()
                             history.append({"role": "user", "content": f"[keypress: {digit}]"})
                             del history[:-MAX_HISTORY_TURNS * 2]
+                            turn_state["n"] += 1
 
                     elif etype == "error":
                         log.error("Twilio relay error (%s): %s", call_sid, event.get("description"))
@@ -1748,11 +1822,16 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
             log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
             if any(m["role"] == "user" for m in history):
                 try:
-                    await deliver_call_message(
-                        http, call_sid=call_sid, caller_id=caller_id,
+                    # shield + its own session: a shutdown (or any cancel of
+                    # this handler) must not take the delivery with it.
+                    # CancelledError is a BaseException, so it would otherwise
+                    # walk straight past the handler below with the caller's
+                    # message lost and nothing recorded.
+                    await asyncio.shield(deliver_after_call(
+                        call_sid=call_sid, caller_id=caller_id,
                         profile=profile, history=history, model=model, brain=brain,
                         overpromise_terms=overpromise_terms,
-                    )
+                    ))
                 except Exception as e:
                     log.exception(
                         "message delivery FAILED (%s) — transcript remains in the journal",
@@ -1761,6 +1840,15 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                     record_event("error", "delivery_failed",
                                  f"{type(e).__name__}: {e}", call_sid)
                     _note_delivery(call_sid, ok=False, error=f"{type(e).__name__}: {e}"[:120])
+                except BaseException as e:
+                    # Cancelled (shutdown) — the shielded delivery is still
+                    # running and will finish if the loop lives long enough.
+                    # Say so and let the cancellation continue.
+                    record_event("error", "delivery_interrupted",
+                                 f"{type(e).__name__}: the relay was cancelled while "
+                                 "delivering; the attempt continues under shield",
+                                 call_sid)
+                    raise
     return ws
 
 

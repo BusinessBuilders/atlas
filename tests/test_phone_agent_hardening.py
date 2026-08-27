@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import aiohttp
 import pytest
@@ -48,6 +49,7 @@ class FakeBrain:
         self.note = "Sam\n+15550001234\nneeds a widget fixed"
         self.chat_status = 200
         self.models_status = 200
+        self.summary_delay = 0.0      # hold the summarizer open, to test the shield
         self.stream_bodies: list[dict] = []
         self.summary_bodies: list[dict] = []
         self.base_url = ""
@@ -85,6 +87,8 @@ class FakeBrain:
             await resp.write(b"data: [DONE]\n\n")
             return resp
         self.summary_bodies.append(body)
+        if self.summary_delay:
+            await asyncio.sleep(self.summary_delay)
         return web.json_response({"choices": [{"message": {"content": self.note}}]})
 
     @property
@@ -450,7 +454,7 @@ async def test_health_snapshot_carries_the_recent_events(tmp_path, monkeypatch):
 
 # ------------------------------- H-8: the websocket token is per-call now --
 
-WS_SECRET = "test-secret"
+WS_SECRET = "test-secret-0123456789"
 
 
 def _twilio_post_kwargs(line, path: str, form: dict) -> dict:
@@ -858,3 +862,221 @@ async def test_a_failed_summary_still_writes_a_pad_entry_that_says_so(tmp_path, 
         assert CALL_SID in pad
         kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
         assert "summarizer_failed" in kinds
+
+
+# =========================================================================
+# Review round 2 — six required fixes
+# =========================================================================
+
+# ---- 1. a nested table must not turn a dashboard save into a bare 500 ----
+
+async def _drive_admin_save(svc, tmp_path, form: dict) -> str:
+    import importlib.util
+
+    from test_phone_agent_plugin import PLUGINS_DIR
+
+    spec = importlib.util.spec_from_file_location(
+        "phone_agent_admin_round2", PLUGINS_DIR / "phone_agent" / "admin.py")
+    admin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admin)
+
+    async def snapshot():
+        return {"bridge": "ok", "model_backend": "ok", "model": "m",
+                "profiles": sorted(svc.PROFILES), "numbers": 1, "ntfy": "off"}, True
+
+    app = admin.build_admin_app(
+        token="sesame", health_snapshot=snapshot,
+        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_brains=lambda: ({}, ""),
+        get_prompts=lambda: svc.SYSTEM_PROMPTS,
+        apply_config_text=svc.apply_config_text,
+        emit_business_toml=svc.emit_business_toml,
+        messages_file=str(tmp_path / "messages.md"),
+        known_keys=svc._PROFILE_KNOWN_KEYS,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
+            async with session.post(f"http://127.0.0.1:{port}/save", data=form) as resp:
+                assert resp.status == 200, f"the dashboard answered HTTP {resp.status}"
+                return await resp.text()
+    finally:
+        await runner.cleanup()
+
+
+async def test_a_nested_table_is_explained_not_a_500(tmp_path, monkeypatch):
+    """The emitter refuses a nested table rather than mangling it (M-6). The
+    owner must read that sentence on the page, not an aiohttp error screen."""
+    svc = _import_service(tmp_path, monkeypatch,
+                          cfg_extra='\n[profiles.acme.hours]\nmon = "9-5"\n')
+    text = await _drive_admin_save(svc, tmp_path, {"numbers_text": "+15550001111 = acme"})
+
+    assert "Not applied" in text
+    assert "nested table" in text
+    assert "profiles.acme.hours" in text
+    assert svc.NUMBERS == {"+15550001111": "acme"}       # nothing changed
+
+
+# ---- 2. keypad digits are PII: never in the journal --------------------
+
+async def test_keypad_digits_never_reach_the_journal(tmp_path, monkeypatch, caplog):
+    """Card numbers and PINs arrive one dtmf event per digit, and journald has
+    no retention window and no deletion path."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        with caplog.at_level(logging.INFO, logger="atlas-phone"):
+            await run_call(line, [setup_frame(), {"type": "dtmf", "digits": "4111"}])
+
+        assert "keypress" in caplog.text                  # the event is still visible
+        assert "4111" not in caplog.text                  # the digits are not
+        assert "[keypress: 4111]" in line.brain.summarizer_transcript
+
+
+# ---- 3. attacker-supplied identifiers cannot forge journal lines --------
+
+def test_record_event_scrubs_attacker_supplied_text(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    svc.RECENT_EVENTS.clear()
+    svc.record_event("warning", "probe", "line one\nline two\x00\x7f end",
+                     "CA\nforged\x00" + "x" * 5000)
+
+    stored = svc.RECENT_EVENTS[-1]
+    assert len(stored["call_sid"]) <= 64
+    assert all(0x20 <= ord(c) != 0x7f for c in stored["call_sid"])
+    assert all(0x20 <= ord(c) != 0x7f for c in stored["detail"])
+    assert len(stored["detail"]) <= 300
+
+
+async def test_a_forged_call_id_cannot_forge_a_journal_line(tmp_path, monkeypatch, caplog):
+    """?call= is whatever the peer sent — it was stored and logged raw, so a
+    newline in it wrote a line of its own into the journal."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        nasty = "CA\nFORGED an entry that never happened\n" + "z" * 5000
+        url = (f"{line.base}/voice/relay?token=nope&call={quote(nasty)}&profile=acme")
+        with caplog.at_level(logging.ERROR, logger="atlas-phone"):
+            assert await _connect_expecting_status(line, url) == 401
+
+        event = [e for e in line.svc.RECENT_EVENTS if e["kind"] == "ws_auth_rejected"][-1]
+        assert len(event["call_sid"]) <= 64
+        assert all(0x20 <= ord(c) != 0x7f for c in event["call_sid"])
+        assert [ln for ln in caplog.text.splitlines() if ln.startswith("FORGED")] == []
+
+
+# ---- 4. a keypress is a caller turn, with the turn accounting to match --
+
+async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
+    """Appending the keypress without bumping the turn re-created the very
+    ordering bug M-2 closed: [caller, keypress, stale assistant]."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+        gate = asyncio.Event()
+
+        async def slow(ws, history, http, system_prompt, model, brain, *,
+                       turn_state, my_turn):
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass          # a task already past its final await ignores it
+            return "STALE REPLY", set()
+
+        monkeypatch.setattr(svc, "stream_reply", slow)
+        url = f"{line.base}/voice/relay?token={svc.WS_TOKEN}&call={CALL_SID}&profile=acme"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+                await ws.send_str(json.dumps(setup_frame()))
+                await ws.send_str(json.dumps(prompt_frame("hello")))
+                await asyncio.sleep(0.15)                 # the reply is in flight
+                await ws.send_str(json.dumps({"type": "dtmf", "digit": "5"}))
+                await asyncio.sleep(0.15)                 # the keypress takes its turn
+                gate.set()
+                await asyncio.sleep(0.15)
+                await ws.close()
+        await asyncio.sleep(0.2)
+
+        transcript = line.brain.summarizer_transcript
+        assert "Caller: hello" in transcript
+        assert "Caller: [keypress: 5]" in transcript
+        assert "STALE REPLY" not in transcript
+
+
+# ---- 5. a shutdown mid-call must not swallow the caller's message -------
+
+async def test_a_cancelled_relay_still_attempts_delivery(tmp_path, monkeypatch):
+    """CancelledError is a BaseException: it walked straight past the except
+    around the delivery, so a restart mid-call lost the message silently."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+        handlers: list = []
+
+        async def traced(request):
+            handlers.append(asyncio.current_task())
+            return await svc.voice_relay(request)
+
+        app = web.Application()
+        app.router.add_get("/voice/relay", traced)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        port = runner.addresses[0][1]
+        url = (f"http://127.0.0.1:{port}/voice/relay"
+               f"?token={svc.WS_TOKEN}&call={CALL_SID}&profile=acme")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url) as ws:
+                    await ws.send_str(json.dumps(setup_frame()))
+                    await ws.send_str(json.dumps(prompt_frame("please call me back")))
+                    await _drain_until_last(ws)
+                    await asyncio.sleep(0.15)
+                    # hold the summarizer open so the delivery is genuinely
+                    # in flight when the second cancel arrives
+                    line.brain.summary_delay = 0.6
+                    handlers[0].cancel()                  # unwinds the message loop
+                    await asyncio.sleep(0.15)             # delivery now awaiting the brain
+                    handlers[0].cancel()                  # lands on the shielded await
+                    await asyncio.sleep(1.2)              # the shielded delivery finishes
+        finally:
+            await runner.cleanup()
+
+        kinds = [e["kind"] for e in svc.RECENT_EVENTS]
+        assert "delivery_interrupted" in kinds
+        assert line.pad.exists(), "the shielded delivery did not survive the cancel"
+        assert line.brain.note in line.pad.read_text(encoding="utf-8")
+
+
+# ---- 6. a one-byte WS_SECRET is not a secret ---------------------------
+
+def test_a_short_ws_secret_refuses_to_boot(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.ERROR, logger="atlas-phone"):
+        with pytest.raises(SystemExit):
+            _import_service(tmp_path, monkeypatch, extra_env={"WS_SECRET": "short"})
+    assert "at least 16" in caplog.text
+
+
+def test_a_whitespace_ws_secret_is_no_secret_at_all(tmp_path, monkeypatch, caplog):
+    """' ' used to enable per-call tokens signed with a one-byte key. Stripped,
+    it is simply unset — the legacy path, with the warning that says so."""
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        svc = _import_service(tmp_path, monkeypatch, extra_env={"WS_SECRET": "   "})
+    assert svc.WS_SECRET == b""
+    assert "WS_SECRET is not set" in caplog.text
+
+
+# ---- ruling (d): constant-time CallSid comparison ----------------------
+
+async def test_a_non_ascii_call_sid_is_refused_not_crashed(tmp_path, monkeypatch):
+    """compare_digest refuses non-ASCII str input; a caller-supplied identifier
+    must never turn that into an exception."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False,
+                          extra_env={"WS_SECRET": WS_SECRET}) as line:
+        token = wstoken_module().mint(WS_SECRET.encode(), CALL_SID, time.time())
+        url = f"{line.base}/voice/relay?token={token}&call={CALL_SID}&profile=acme"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url) as ws:
+                await ws.send_str(json.dumps(setup_frame(call_sid="CAéè")))
+                msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+        assert msg.type is aiohttp.WSMsgType.CLOSE
+        assert msg.data == 4401

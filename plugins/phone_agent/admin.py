@@ -282,9 +282,15 @@ def build_admin_app(
                 )
 
         if not errors:
-            errors = apply_config_text(
-                emit_business_toml(numbers, profiles, brains, active_brain)
-            )
+            try:
+                config_text = emit_business_toml(numbers, profiles, brains, active_brain)
+            except ValueError as e:
+                # the emitter refuses what it cannot write faithfully (a nested
+                # table someone hand-added). The owner reads the reason here —
+                # it must never escape as a bare HTTP 500.
+                errors = [str(e)]
+            else:
+                errors = apply_config_text(config_text)
         if errors:
             listing = "\n".join("• " + e for e in errors)
             # re-render the index with the error banner on top
