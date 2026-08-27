@@ -191,6 +191,37 @@ async def test_an_inbound_text_becomes_a_message_on_the_pad(tmp_path, monkeypatc
         assert "Text" in line.ntfy.pushes[0]["headers"]["Title"]
 
 
+async def test_a_blocked_number_cannot_reach_the_owner_by_text(tmp_path, monkeypatch):
+    """The block list is how an owner stops a nuisance. A number whose CALL is
+    refused must not be able to put a message on the pad and a push on their
+    phone by texting instead."""
+    nuisance = "+15085550123"
+    async with phone_line(tmp_path, monkeypatch,
+                          cfg_extra=f'block_list = ["{nuisance}"]\n') as line:
+        status, body = await _post(
+            line, "/sms/incoming",
+            **_twilio_post_kwargs(line, "/sms/incoming", _sms_form(caller=nuisance)))
+
+        assert status == 200 and body.strip() == "<Response></Response>"
+        assert line.svc.STORE.list_messages(["acme"], include_test=True) == []
+        assert not line.pad.exists()
+        assert line.ntfy.pushes == []
+        # …but it is still on the record: "did that number get through?"
+        assert line.svc.STORE.get_call(MESSAGE_SID)["outcome"] == "blocked"
+        assert "blocked" in kinds(line.svc)
+
+
+async def test_a_number_not_on_the_list_still_gets_through(tmp_path, monkeypatch):
+    """The control: the block list must not quietly swallow everyone."""
+    async with phone_line(tmp_path, monkeypatch,
+                          cfg_extra='block_list = ["+15085550123"]\n') as line:
+        await _post(line, "/sms/incoming",
+                    **_twilio_post_kwargs(line, "/sms/incoming", _sms_form()))
+
+        assert len(line.svc.STORE.list_messages(["acme"])) == 1
+        assert len(line.ntfy.pushes) == 1
+
+
 async def test_the_same_text_delivered_twice_is_kept_once(tmp_path, monkeypatch):
     """Twilio retries a webhook that timed out, and the push can take ten
     seconds. One slow push must not become two messages the owner answers."""

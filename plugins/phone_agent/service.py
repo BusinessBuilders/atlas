@@ -3338,6 +3338,24 @@ async def sms_incoming(request: web.Request) -> web.Response:
                      "a text arrived with no MessageSid — filed under a local id",
                      message_sid, profile_key)
 
+    brain = call_brain(profile, profile_key)
+    if from_number and from_number.strip() in {
+            str(n).strip() for n in profile_setting(profile, "block_list")}:
+        # The block list is how an owner stops a nuisance reaching them. A call
+        # from this number is refused, so a TEXT from it must not walk straight
+        # onto the pad and their phone. The row and the event are still written
+        # — "did that number get through last night?" has to be answerable.
+        record_event("warning", "blocked",
+                     f"text from {mask_number(from_number)} refused by the block list",
+                     message_sid, profile_key)
+        _store_write("start_call", message_sid, profile_key,
+                     message_sid, profile_key, from_number, texted, brain.key,
+                     str(profile.get("model", "")).strip() or brain.model,
+                     is_test=callstore.is_test_call(message_sid, from_number))
+        _store_write("end_call", message_sid, profile_key,
+                     message_sid, "blocked", "block_list", 0, [])
+        return web.Response(text=EMPTY_TWIML, content_type="text/xml")
+
     store = STORE
     if store is not None:
         # Twilio retries a webhook that timed out, and the push below can take
@@ -3357,7 +3375,6 @@ async def sms_incoming(request: web.Request) -> web.Response:
     body = _scrub(form.get("Body", ""), MAX_SMS_BODY_CHARS)
     log.info("inbound text MessageSid=%s from=%s to=%s profile=%s (%d characters)",
              message_sid, mask_number(from_number), texted, profile_key, len(body))
-    brain = call_brain(profile, profile_key)
     # A synthetic call row, so a text is a first-class thing in the store: the
     # message rows reference it, retention reaches it, and delete_caller finds
     # it by number exactly as it finds a call. `decision_reason = "sms"` is what
