@@ -1182,6 +1182,8 @@ async def _admin_page(tmp_path, svc, patch=None) -> str:
         token="sesame", health_snapshot=snapshot,
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
         get_brains=lambda: ({}, ""),
+        get_branding=lambda: svc.BRANDING,
+        get_owners=lambda: svc.OWNERS,
         get_prompts=lambda: svc.SYSTEM_PROMPTS,
         apply_config_text=svc.apply_config_text,
         emit_business_toml=svc.emit_business_toml,

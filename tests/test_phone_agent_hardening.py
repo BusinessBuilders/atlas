@@ -701,10 +701,14 @@ def test_the_emitter_keeps_non_string_settings(tmp_path, monkeypatch):
 
 
 def test_the_emitter_refuses_a_nested_table_instead_of_mangling_it(tmp_path, monkeypatch):
+    """`hours` is a table the schema knows and writes inline; a table it does
+    NOT know cannot be written faithfully, so the save is refused rather than
+    the setting mangled."""
     svc = _import_service(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="nested table"):
-        svc.emit_business_toml({"+15550001111": "acme"},
-                               {"acme": _profile(hours={"mon": "9-5"})})
+        svc.emit_business_toml(
+            {"+15550001111": "acme"},
+            {"acme": _profile(departments={"sales": "+15550002222"})})
 
 
 # -------------------------------------------- M-10: forwarding to ourselves --
@@ -779,6 +783,8 @@ async def test_duplicate_numbers_in_the_dashboard_are_refused(tmp_path, monkeypa
         token="sesame", health_snapshot=snapshot,
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
         get_brains=lambda: ({}, ""),
+        get_branding=lambda: svc.BRANDING,
+        get_owners=lambda: svc.OWNERS,
         get_prompts=lambda: svc.SYSTEM_PROMPTS,
         apply_config_text=svc.apply_config_text,
         emit_business_toml=svc.emit_business_toml,
@@ -889,6 +895,8 @@ async def _drive_admin_save(svc, tmp_path, form: dict) -> str:
         token="sesame", health_snapshot=snapshot,
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
         get_brains=lambda: ({}, ""),
+        get_branding=lambda: svc.BRANDING,
+        get_owners=lambda: svc.OWNERS,
         get_prompts=lambda: svc.SYSTEM_PROMPTS,
         apply_config_text=svc.apply_config_text,
         emit_business_toml=svc.emit_business_toml,
@@ -911,15 +919,17 @@ async def _drive_admin_save(svc, tmp_path, form: dict) -> str:
 
 
 async def test_a_nested_table_is_explained_not_a_500(tmp_path, monkeypatch):
-    """The emitter refuses a nested table rather than mangling it (M-6). The
-    owner must read that sentence on the page, not an aiohttp error screen."""
-    svc = _import_service(tmp_path, monkeypatch,
-                          cfg_extra='\n[profiles.acme.hours]\nmon = "9-5"\n')
+    """The emitter refuses a table it does not know rather than mangling it
+    (M-6). The owner must read that sentence on the page, not an aiohttp error
+    screen. (`hours` is a table the schema DOES know and writes inline.)"""
+    svc = _import_service(
+        tmp_path, monkeypatch,
+        cfg_extra='\n[profiles.acme.departments]\nsales = "+15550002222"\n')
     text = await _drive_admin_save(svc, tmp_path, {"numbers_text": "+15550001111 = acme"})
 
     assert "Not applied" in text
     assert "nested table" in text
-    assert "profiles.acme.hours" in text
+    assert "profiles.acme.departments" in text
     assert svc.NUMBERS == {"+15550001111": "acme"}       # nothing changed
 
 

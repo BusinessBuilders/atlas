@@ -57,7 +57,11 @@ the journal at ERROR.
 
 1. `pip install aiohttp` into the Atlas venv (already present for core).
 2. Copy `businesses.example.toml` → `~/.config/atlas-phone/businesses.toml`
-   and fill in your real business(es).
+   and fill in your real business(es). Every setting is commented there with
+   its default. Check it any time with
+   `python3 plugins/phone_agent/service.py --check` — it validates the config
+   and every environment variable the config names, then exits without opening
+   the call store or a socket, so it is safe to run beside the live bridge.
 3. Create `~/.config/atlas-phone/env` (chmod 600) with:
    `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE`, `BRIDGE_PORT`,
    `PUBLIC_BASE`, `WS_TOKEN` (long random), `OLLAMA_URL`, `MODEL`,
@@ -188,6 +192,45 @@ a bad switch shows up immediately instead of at the next call.
 **Privacy follows the brain**: on a local brain, caller text never leaves the
 machine; point `active_brain` at a hosted API and every caller turn is sent to
 that vendor. Example config: `businesses.example.toml`.
+
+## What a business profile can set
+
+Beyond the four required keys (`business_name`, `services`, `owner_name`,
+`greeting`), a profile can carry:
+
+* **Opening hours** — `timezone` (IANA), `hours` (a day table; a day left out
+  is closed, `"18:00-02:00"` is an overnight shift), `holidays` (dates or
+  `"2026-12-24..2026-12-26"` ranges), `after_hours` (`message` | `transfer` |
+  `same`) and an `after_hours_greeting`. No `hours` table = open all the time.
+  `timezone` is required as soon as hours or holidays exist; without them the
+  host's zone is used and the boot log says so.
+* **What the caller is told** — `ai_disclosure` and `recording_notice`, both
+  on by default, composed into the greeting by one function the dashboard
+  preview also calls. When the greeting ends in a question the notices are
+  spoken *before* it, so the caller does not talk over them. Neither can be
+  switched off without `ack_disclosure_waived = true` in the same profile.
+* **How the call sounds** — `language`, `tts_provider`, `voice`,
+  `transcription_provider`, `hints`, `ignore_backchannel`; these become the
+  `<ConversationRelay>` attributes. `language = "multi"` is accepted only with
+  Deepgram + ElevenLabs.
+* **Per-business plumbing** — `brain`, `messages_file`, `ntfy_url`/`ntfy_topic`,
+  `max_call_seconds`, `caller_turn_budget_per_hour`, `block_list`,
+  `retention_days`.
+
+Every one of them is validated fail-closed at boot, on `--check`, and on every
+dashboard save, with a sentence an owner can act on. Settings the bridge does
+not read are kept in the file untouched and named in a boot warning — a typo
+does nothing, but it never does nothing silently.
+
+## Who may sign in, and whose name is on it
+
+`[owners.<name>]` gives one dashboard login: `token_env` NAMES the environment
+variable holding their token (never the token itself) and `profiles` lists the
+businesses they may see, or `["*"]` for all of them. With no `[owners.*]` at
+all the legacy `ADMIN_TOKEN` is the single login and sees everything, so
+nothing breaks on an upgrade. `[branding]` puts a reseller's `vendor_name`,
+`product_name`, `logo_path`, `support_email`, `colors` and `fonts` over the
+dashboard; left out, it is plainly branded with its built-in palette.
 
 ## Owner dashboard
 

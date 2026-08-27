@@ -150,9 +150,9 @@ def _render_calls(store, profile_keys, calls) -> str:
 
 
 def build_admin_app(
-    *, token: str, health_snapshot, get_state, get_brains, get_prompts,
-    apply_config_text, emit_business_toml, messages_file: str, known_keys: tuple,
-    store,
+    *, token: str, health_snapshot, get_state, get_brains, get_branding,
+    get_owners, get_prompts, apply_config_text, emit_business_toml,
+    messages_file: str, known_keys: tuple, store,
 ) -> web.Application:
 
     def authed(request: web.Request) -> bool:
@@ -350,7 +350,12 @@ def build_admin_app(
 
         if not errors:
             try:
-                config_text = emit_business_toml(numbers, profiles, brains, active_brain)
+                # branding and the owner logins ride along untouched: a save
+                # that dropped [owners.*] would lock every owner out of the
+                # dashboard they are standing in.
+                config_text = emit_business_toml(numbers, profiles, brains,
+                                                 active_brain, get_branding(),
+                                                 get_owners())
             except ValueError as e:
                 # the emitter refuses what it cannot write faithfully (a nested
                 # table someone hand-added). The owner reads the reason here —

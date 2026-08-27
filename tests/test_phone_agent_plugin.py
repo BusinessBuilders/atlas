@@ -173,7 +173,9 @@ def _import_service(tmp_path, monkeypatch, extra_env=None, cfg_extra=""):
         "facts = \"Email: office@acme.test\\nHours: 9-5\"\n" + cfg_extra,
         encoding="utf-8",
     )
-    for k in ("NTFY_URL", "NTFY_TOPIC", "MESSAGES_FILE"):
+    # ADMIN_TOKEN too: it is the legacy dashboard login, and one left in the
+    # developer's environment would give every test an implicit owner.
+    for k in ("NTFY_URL", "NTFY_TOPIC", "MESSAGES_FILE", "ADMIN_TOKEN"):
         monkeypatch.delenv(k, raising=False)
     stub = dict(
         TWILIO_ACCOUNT_SID="ACtest", TWILIO_AUTH_TOKEN="t", BRIDGE_PORT="1",
@@ -699,6 +701,8 @@ def test_admin_app_auth_and_save(tmp_path, monkeypatch):
         token="sesame", health_snapshot=snapshot,
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
         get_brains=lambda: ({}, ""),
+        get_branding=lambda: svc.BRANDING,
+        get_owners=lambda: svc.OWNERS,
         get_prompts=lambda: svc.SYSTEM_PROMPTS,
         apply_config_text=svc.apply_config_text,
         emit_business_toml=svc.emit_business_toml,

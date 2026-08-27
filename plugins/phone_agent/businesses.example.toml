@@ -1,6 +1,13 @@
 # EXAMPLE business config for the Atlas phone agent — copy to
 # ~/.config/atlas-phone/businesses.toml and replace every value with your own.
 # The service refuses to start until the real file exists and validates.
+#
+# Check a config before restarting anything:   service.py --check
+# It prints what it found, or the one sentence explaining what is wrong.
+#
+# Everything below that is commented out is OPTIONAL, and the comment says what
+# the agent does when you leave it out. Nothing here is a secret: tokens and API
+# keys live in ~/.config/atlas-phone/env and this file only NAMES them.
 
 # active_brain = "local_qwen"     # optional; names the [brains.*] section that
 #                                 # answers calls. REQUIRED as soon as any
@@ -15,15 +22,58 @@
 # numbers get a spoken configuration error and an ERROR journal line.
 "+15085551234" = "acme_plumbing"
 
+
 [profiles.acme_plumbing]
+# ---- who the agent answers for (all four are required) ------------------
 business_name = "Acme Plumbing"
 services = "emergency plumbing, drain cleaning, and water heater work"
 owner_name = "Jo"
 greeting = "Hi, you've reached Acme Plumbing. How can I help you today?"
+
+# ---- what the caller is told before anything else -----------------------
+# Both notices are ON by default and are composed INTO the greeting: when the
+# greeting ends in a question, they are spoken just before it, so the caller
+# hears "…Acme Plumbing. I'm the AI assistant for Acme Plumbing. This call may
+# be recorded and transcribed. How can I help you today?" — and then answers.
+# ai_disclosure = true            # default true
+# ai_disclosure_text = "I'm the AI assistant for {business_name}."
+#                                 # {business_name} and {assistant_name} are
+#                                 # the only placeholders; anything else is
+#                                 # refused rather than spoken wrong.
+# recording_notice = true         # default true — transcripts ARE stored
+# recording_notice_text = "This call may be recorded and transcribed."
+# ack_disclosure_waived = false   # neither notice can be switched off unless
+#                                 # this is true. Callers in many places have a
+#                                 # right to both; setting this says on the
+#                                 # record that you decided otherwise.
+
+# ---- when the business is open ------------------------------------------
+timezone = "America/New_York"     # IANA name. REQUIRED once hours or holidays
+                                  # are set; without them the host machine's
+                                  # zone is used and the boot log says so.
+hours = { mon = "09:00-17:00", tue = "09:00-17:00", wed = "09:00-17:00", thu = "09:00-17:00", fri = "09:00-17:00" }
+                                  # A day left out is closed all day. No hours
+                                  # table at all = open around the clock.
+                                  # "18:00-02:00" is an overnight shift and
+                                  # belongs to the day it starts on.
+holidays = ["2026-11-26", "2026-12-24..2026-12-26"]
+                                  # single dates or inclusive ranges; a holiday
+                                  # closes the whole local day.
+after_hours = "message"           # message | transfer | same (default message)
+                                  # message = take a message, never transfer
+                                  # transfer = forward to forward_to
+                                  # same     = behave exactly as in hours
+after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now, but I can take a message and Jo will call you back."
+                                  # optional; used instead of `greeting` while
+                                  # the business is closed. The notices above
+                                  # are composed into it the same way.
+
+# ---- optional: who the agent is, and how it can hand a call over --------
 # assistant_name = "Atlas"        # optional; what the agent calls itself
 # forward_to = "+15085550100"     # optional; enables live call transfer to
 #                                 # this number ("connect me to a person").
 #                                 # Omit it and the agent takes messages only.
+#                                 # It may not be one of YOUR numbers above.
 # transfer_phrases = '''          # optional; a caller must SAY one of these
 # operator                        # before any transfer happens ({owner} =
 # speak to {owner}                # the owner's first name). Empty -> the
@@ -33,19 +83,85 @@ greeting = "Hi, you've reached Acme Plumbing. How can I help you today?"
 # goodbye                         # hang up. Empty -> the standard set.
 # that's all
 # '''
+# assistant_aliases = '''         # optional; words the transcriber confuses
+# Alice                           # with the assistant's name. Empty -> the
+# '''                             # standard set for the name Atlas.
 # facts = '''                     # optional; the ONLY specifics the agent may
 # Email: office@acmeplumbing.com  # state as fact (hours, contact, service
 # Hours: Mon-Fri 8am-5pm          # area, pricing posture). Omit it and the
 # '''                             # agent takes a message instead.
-# model = "qwen2.5:7b-instruct"   # optional per-profile override; must be a
-#                                 # NON-thinking model (phone latency)
+# extra_instructions = '''        # optional; appended to this business's
+# Ask which town the caller is in.# prompt. It can never override the safety
+# '''                             # rules.
 
+# ---- how the call sounds (Twilio ConversationRelay) ---------------------
+# language = "en-US"              # default "en-US". "multi" (automatic
+#                                 # detection) needs Deepgram + ElevenLabs.
+# tts_provider = "Google"         # Google | Amazon | ElevenLabs (default
+#                                 # Google — Twilio's own, no extra account).
+# voice = ""                      # provider voice id; empty = their default
+# transcription_provider = "Google"   # Google | Deepgram (default Google)
+# hints = ["Acme Plumbing"]       # words the transcriber should expect —
+#                                 # business name, staff names, product names.
+#                                 # No commas inside a hint.
+# ignore_backchannel = true       # default true: "mm-hmm" while the agent is
+#                                 # speaking does not interrupt it.
+
+# ---- per-business plumbing ----------------------------------------------
+# brain = ""                      # optional [brains.*] override for this
+#                                 # business; empty = the active_brain above.
+# model = "qwen2.5:7b-instruct"   # optional model override; must be a
+#                                 # NON-thinking model (phone latency).
+# messages_file = "~/atlas-phone-messages-acme_plumbing.md"
+#                                 # optional; empty = the MESSAGES_FILE env var
+# ntfy_url = ""                   # optional pair; empty = the NTFY_URL and
+# ntfy_topic = ""                 # NTFY_TOPIC env vars. Set both or neither.
+# max_call_seconds = 600          # default 600: the agent wraps up and ends
+#                                 # the call after this long.
+# caller_turn_budget_per_hour = 60    # default 60, per caller ID
+# block_list = []                 # E.164 numbers that get one short line and
+#                                 # a hangup, e.g. ["+15550009999"]
+# retention_days = 90             # default 90: transcripts and summaries are
+#                                 # purged after this many days (the call and
+#                                 # message records themselves stay).
+
+
+# ---- who may sign in to the dashboard -----------------------------------
+# Each owner's sign-in token lives in ~/.config/atlas-phone/env under the NAME
+# given here — never in this file. An owner sees only the businesses listed;
+# ["*"] means every business on this line. With no [owners.*] at all, the
+# legacy ADMIN_TOKEN env var is the single login and it sees everything.
+#
+# [owners.jo]
+# token_env = "PHONE_OWNER_JO_TOKEN"
+# profiles = ["acme_plumbing"]
+#
+# [owners.support]
+# token_env = "PHONE_OWNER_SUPPORT_TOKEN"
+# profiles = ["*"]
+
+
+# ---- whose product the dashboard says it is ------------------------------
+# Optional. Left out, the dashboard is plainly branded ("Atlas", "Phone
+# Agent") with its built-in palette. Fill it in to put your own agency's name,
+# logo and colours over it.
+#
+# [branding]
+# vendor_name = "Acme Digital"
+# product_name = "Front Desk"
+# logo_path = "/srv/acme-digital/logo.png"     # optional; a path on THIS box
+# support_email = "help@acmedigital.example"   # shown on the sign-in page
+# colors = { brand = "#e85d1a", ink = "#0a0a0a" }
+# fonts = { body = "Inter", display = "Inter" }
+
+
+# ---- the model that answers ---------------------------------------------
 # Brains — named model backends the owner switches between on the dashboard.
-# Uncomment these together with `active_brain` above. A switch applies the
-# moment the dashboard save validates; calls already in progress finish on the
-# brain they started with. Validation is fail-closed: a brain naming an env var
-# that is unset, or an extra_body that is not a JSON object, is rejected and
-# nothing changes.
+# Uncomment these together with `active_brain` at the top of the file. A switch
+# applies the moment the dashboard save validates; calls already in progress
+# finish on the brain they started with. Validation is fail-closed: a brain
+# naming an env var that is unset, an extra_body that is not a JSON object, or
+# a setting this bridge does not read, is rejected and nothing changes.
 #
 # [brains.local_qwen]
 # label = "Local qwen (private, free)"     # optional; shown on the dashboard

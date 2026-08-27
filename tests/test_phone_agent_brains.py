@@ -39,9 +39,11 @@ def svc(tmp_path, monkeypatch):
 
 def test_brains_parse_and_active(svc, monkeypatch, tmp_path):
     monkeypatch.setenv("TEST_BRAIN_KEY", "k")
-    numbers, profiles, brains, active = svc.load_business_config(_write(tmp_path, BRAINS_TOML))
-    assert active == "cloud" and set(brains) == {"local", "cloud"}
-    assert brains["cloud"].extra_body == {"thinking": {"type": "disabled"}}
+    config = svc.load_business_config(_write(tmp_path, BRAINS_TOML))
+    assert config.active_brain == "cloud"
+    assert set(config.brains) == {"local", "cloud"}
+    assert config.brains["cloud"].extra_body == {"thinking": {"type": "disabled"}}
+    assert config.brains["local"].base_url == "http://127.0.0.1:11434/v1"
 
 
 def test_active_brain_must_exist(svc, monkeypatch, tmp_path):
@@ -65,7 +67,7 @@ def test_extra_body_must_be_object(svc, monkeypatch, tmp_path):
 
 def test_request_args_never_override_call_keys(svc, monkeypatch, tmp_path):
     monkeypatch.setenv("TEST_BRAIN_KEY", "k")
-    *_, brains, active = svc.load_business_config(_write(tmp_path, BRAINS_TOML))
+    brains = svc.load_business_config(_write(tmp_path, BRAINS_TOML)).brains
     brains["cloud"].extra_body = {"model": "evil", "stream": False, "thinking": {"type": "disabled"}}
     url, headers, body = svc.brain_request_args(brains["cloud"], {"model": "big-model", "messages": [], "stream": True})
     assert url.endswith("/chat/completions") and headers["Authorization"] == "Bearer k"
@@ -73,11 +75,19 @@ def test_request_args_never_override_call_keys(svc, monkeypatch, tmp_path):
 
 
 def test_emit_round_trips_brains(svc, monkeypatch, tmp_path):
+    """Every brain survives a dashboard save — including the ones that are not
+    the active one. Dropping `local` on the way through would strand the owner
+    on the cloud brain with no way back."""
     monkeypatch.setenv("TEST_BRAIN_KEY", "k")
-    numbers, profiles, brains, active = svc.load_business_config(_write(tmp_path, BRAINS_TOML))
-    text = svc.emit_business_toml(numbers, profiles, brains, active)
-    n2, p2, b2, a2 = svc.load_business_config(_write(tmp_path, text, name="rt.toml"))
-    assert a2 == active and b2["cloud"].api_key_env == "TEST_BRAIN_KEY" and b2["cloud"].extra_body == brains["cloud"].extra_body
+    config = svc.load_business_config(_write(tmp_path, BRAINS_TOML))
+    text = svc.emit_business_toml(config.numbers, config.profiles, config.brains,
+                                  config.active_brain, config.branding, config.owners)
+    again = svc.load_business_config(_write(tmp_path, text, name="rt.toml"))
+    assert again.active_brain == config.active_brain
+    assert set(again.brains) == {"local", "cloud"}
+    assert again.brains["cloud"].api_key_env == "TEST_BRAIN_KEY"
+    assert again.brains["cloud"].extra_body == config.brains["cloud"].extra_body
+    assert again.brains["local"] == config.brains["local"]
 
 
 def _write(tmp_path, text, name="b.toml"):

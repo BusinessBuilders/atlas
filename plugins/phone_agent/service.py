@@ -134,12 +134,13 @@ import logging
 import os
 import re
 import stat
+import string
 import sys
 import time
 import tomllib
 from base64 import b64encode
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
@@ -154,10 +155,18 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import callstore  # noqa: E402  (needs the sys.path line above)
+import hours  # noqa: E402  (needs the sys.path line above)
 import wstoken  # noqa: E402  (needs the sys.path line above)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("atlas-phone")
+
+
+def _now() -> datetime:
+    """The current moment, always timezone-aware (M-9). One function so a test
+    can hold the clock still, and so nothing in this file ever compares a naive
+    timestamp with an aware one."""
+    return datetime.now(timezone.utc)
 
 # The call store, opened at boot further down. It is declared here because
 # record_event() writes to it and is defined before the config section runs —
@@ -332,40 +341,56 @@ PHONE_DATA_DIR = os.environ.get("PHONE_DATA_DIR", "").strip() or os.path.expandu
     "~/.local/share/atlas-phone"
 )
 PHONE_DB_PATH = os.path.join(PHONE_DATA_DIR, "calls.db")
-try:
-    # 0700 on the directory and 0600 on the database, EVERY boot — not only
-    # the boot that created them. This file holds what strangers said out loud
-    # to a business; makedirs' mode is masked by the umask, sqlite creates its
-    # file with the umask too, and a directory made by hand (or by an earlier
-    # release) is whatever it was. Tighten it and say so.
-    dir_existed = os.path.isdir(PHONE_DATA_DIR)
-    db_existed = os.path.exists(PHONE_DB_PATH)
-    os.makedirs(PHONE_DATA_DIR, mode=0o700, exist_ok=True)
-    dir_mode = stat.S_IMODE(os.stat(PHONE_DATA_DIR).st_mode)
-    if dir_mode != 0o700:
-        os.chmod(PHONE_DATA_DIR, 0o700)
-        if dir_existed and dir_mode & 0o077:
-            # Not ours to begin with, and readable by others — that is a
-            # finding, not routine tightening of a directory we just made.
-            log.warning("call store directory %s was mode %o — tightened to 0700; it "
-                        "holds call transcripts and nobody else on this box needs to "
-                        "read them", PHONE_DATA_DIR, dir_mode)
-    STORE = callstore.CallStore(PHONE_DB_PATH)
-    db_mode = stat.S_IMODE(os.stat(PHONE_DB_PATH).st_mode)
-    if db_mode != 0o600:
-        os.chmod(PHONE_DB_PATH, 0o600)
-        if db_existed and db_mode & 0o077:
-            log.warning("call store %s was mode %o — tightened to 0600; it holds what "
-                        "callers said out loud", PHONE_DB_PATH, db_mode)
-except Exception as exc:
-    log.error(
-        "cannot open the call store in %s (%s: %s) — every call, message and "
-        "transcript would go unrecorded. Set PHONE_DATA_DIR to a writable "
-        "directory or fix the permissions on that one. Refusing to start.",
-        PHONE_DATA_DIR, type(exc).__name__, exc,
-    )
-    sys.exit(1)
-log.info("call store: %s", PHONE_DB_PATH)
+# `service.py --check` validates the config and exits. It must touch NOTHING:
+# no data directory, no database, no listening socket — an owner (or a deploy
+# script) has to be able to check a config on a machine where the real bridge
+# is running, without disturbing it.
+CHECK_ONLY = "--check" in sys.argv[1:]
+
+
+def _open_call_store() -> "callstore.CallStore":
+    """Open (creating if needed) the call store, or refuse to start."""
+    try:
+        # 0700 on the directory and 0600 on the database, EVERY boot — not only
+        # the boot that created them. This file holds what strangers said out loud
+        # to a business; makedirs' mode is masked by the umask, sqlite creates its
+        # file with the umask too, and a directory made by hand (or by an earlier
+        # release) is whatever it was. Tighten it and say so.
+        dir_existed = os.path.isdir(PHONE_DATA_DIR)
+        db_existed = os.path.exists(PHONE_DB_PATH)
+        os.makedirs(PHONE_DATA_DIR, mode=0o700, exist_ok=True)
+        dir_mode = stat.S_IMODE(os.stat(PHONE_DATA_DIR).st_mode)
+        if dir_mode != 0o700:
+            os.chmod(PHONE_DATA_DIR, 0o700)
+            if dir_existed and dir_mode & 0o077:
+                # Not ours to begin with, and readable by others — that is a
+                # finding, not routine tightening of a directory we just made.
+                log.warning("call store directory %s was mode %o — tightened to 0700; it "
+                            "holds call transcripts and nobody else on this box needs to "
+                            "read them", PHONE_DATA_DIR, dir_mode)
+        store = callstore.CallStore(PHONE_DB_PATH)
+        db_mode = stat.S_IMODE(os.stat(PHONE_DB_PATH).st_mode)
+        if db_mode != 0o600:
+            os.chmod(PHONE_DB_PATH, 0o600)
+            if db_existed and db_mode & 0o077:
+                log.warning("call store %s was mode %o — tightened to 0600; it holds what "
+                            "callers said out loud", PHONE_DB_PATH, db_mode)
+    except Exception as exc:
+        log.error(
+            "cannot open the call store in %s (%s: %s) — every call, message and "
+            "transcript would go unrecorded. Set PHONE_DATA_DIR to a writable "
+            "directory or fix the permissions on that one. Refusing to start.",
+            PHONE_DATA_DIR, type(exc).__name__, exc,
+        )
+        sys.exit(1)
+    log.info("call store: %s", PHONE_DB_PATH)
+    return store
+
+
+if CHECK_ONLY:
+    log.info("--check: validating %s only — no call store, no sockets", BUSINESS_CONFIG)
+else:
+    STORE = _open_call_store()
 
 
 def _store_write(what: str, call_sid, profile_key, /, *args, **kwargs):
@@ -792,6 +817,268 @@ def decide_call_action(
 
 _PROFILE_REQUIRED_KEYS = ("business_name", "services", "owner_name", "greeting")
 _E164_RE = re.compile(r"^\+[0-9]{7,15}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Every optional business setting, with the value the agent uses when the
+# profile does not mention it. This table IS the schema: businesses.toml is a
+# product surface now, and an owner who sets none of these still gets a line
+# that discloses it is an AI, says calls are kept, never runs past ten minutes
+# and forgets transcripts after ninety days.
+#
+# Nothing here names a real business, a vendor account or one owner's
+# preference: the values a customer pays for live in their config file.
+PROFILE_DEFAULTS: dict = {
+    # when the business is open (see hours.py). No hours = open all the time,
+    # exactly as every profile behaved before hours existed.
+    "timezone": "",
+    "hours": {},
+    "holidays": [],
+    "after_hours": "message",          # message | transfer | same
+    "after_hours_greeting": "",
+    # what the caller must be told (see §3.7). Both default ON; neither can be
+    # switched off without ack_disclosure_waived.
+    "ai_disclosure": True,
+    "ai_disclosure_text": "I'm the AI assistant for {business_name}.",
+    "recording_notice": True,
+    "recording_notice_text": "This call may be recorded and transcribed.",
+    "ack_disclosure_waived": False,
+    # how Twilio's ConversationRelay hears and speaks. The provider defaults
+    # are Twilio's own, so a profile that says nothing sounds exactly as it
+    # did before these settings existed and needs no extra vendor account.
+    "language": "en-US",
+    "tts_provider": "Google",
+    "voice": "",
+    "transcription_provider": "Google",
+    "hints": [],
+    "ignore_backchannel": True,
+    # per-business plumbing
+    "brain": "",                       # "" = the config's active_brain
+    "messages_file": "",               # "" = the MESSAGES_FILE env default
+    "ntfy_url": "",                    # "" = the NTFY_URL/NTFY_TOPIC env pair
+    "ntfy_topic": "",
+    "max_call_seconds": 600,
+    "caller_turn_budget_per_hour": 60,
+    "block_list": [],
+    "retention_days": 90,
+}
+
+_AFTER_HOURS_MODES = ("message", "transfer", "same")
+_TTS_PROVIDERS = ("Google", "Amazon", "ElevenLabs")
+_TRANSCRIPTION_PROVIDERS = ("Google", "Deepgram")
+# The only names the notice texts may use. Anything else would raise KeyError
+# with a caller already on the line, so it is refused at validation time.
+_NOTICE_FIELDS = ("business_name", "assistant_name")
+_MULTI_LANGUAGE = "multi"
+# Whole-number settings: (key, smallest sane value, largest sane value).
+_PROFILE_NUMBER_LIMITS = (
+    ("max_call_seconds", 30, 14400),
+    ("caller_turn_budget_per_hour", 1, 10000),
+    ("retention_days", 1, 3650),
+)
+_MISSING = object()
+
+
+def profile_setting(profile, name: str):
+    """One business setting, or the product default when the profile is silent.
+
+    Lists and tables are copied on the way out — a shared default would let one
+    business's block list turn up on every other business.
+    """
+    if name not in PROFILE_DEFAULTS:
+        raise KeyError(
+            f"{name!r} is not a business setting this agent knows — "
+            f"known settings: {', '.join(sorted(PROFILE_DEFAULTS))}"
+        )
+    value = profile.get(name, _MISSING)
+    if value is _MISSING:
+        default = PROFILE_DEFAULTS[name]
+        if isinstance(default, dict):
+            return dict(default)
+        if isinstance(default, list):
+            return list(default)
+        return default
+    return value
+
+
+def _check_placeholders(text: str, where: str) -> None:
+    """Refuse a notice text whose {placeholders} nobody can fill in."""
+    try:
+        fields = [name for _, name, _, _ in string.Formatter().parse(text)
+                  if name is not None]
+    except ValueError as e:
+        raise ValueError(
+            f"{where} has unbalanced {{ }} braces ({e}). Write {{{{ for a literal brace."
+        )
+    for name in fields:
+        root = name.split(".")[0].split("[")[0]
+        if root not in _NOTICE_FIELDS:
+            allowed = ", ".join("{" + p + "}" for p in _NOTICE_FIELDS)
+            raise ValueError(
+                f"{where} uses {{{name}}}, which this agent cannot fill in. "
+                f"The only placeholders are {allowed}."
+            )
+
+
+def _validate_profile_settings(key: str, profile: dict) -> None:
+    """Every setting in PROFILE_DEFAULTS, checked for the profile named `key`.
+
+    Fail-closed and identical at boot and on a dashboard save: this decides
+    what a stranger hears when they dial a real business, so a value nobody
+    can act on must stop the save rather than surprise someone at 2am.
+    """
+    def where(name: str) -> str:
+        return f"profile {key!r} {name}"
+
+    for name in ("timezone", "after_hours", "after_hours_greeting",
+                 "ai_disclosure_text", "recording_notice_text", "language",
+                 "tts_provider", "voice", "transcription_provider", "brain",
+                 "messages_file", "ntfy_url", "ntfy_topic"):
+        value = profile_setting(profile, name)
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{where(name)} must be text in quotes, not a "
+                f"{type(value).__name__}"
+            )
+
+    for name in ("ai_disclosure", "recording_notice", "ack_disclosure_waived",
+                 "ignore_backchannel"):
+        value = profile_setting(profile, name)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"{where(name)} must be true or false without quotes, not {value!r}"
+            )
+
+    for name, smallest, largest in _PROFILE_NUMBER_LIMITS:
+        value = profile_setting(profile, name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"{where(name)} must be a whole number without quotes, not {value!r}"
+            )
+        if not smallest <= value <= largest:
+            raise ValueError(
+                f"{where(name)} is {value}, outside the sensible range "
+                f"{smallest}-{largest}"
+            )
+
+    # --- opening hours, holidays, timezone -------------------------------
+    schedule = profile_setting(profile, "hours")
+    holidays = profile_setting(profile, "holidays")
+    try:
+        hours.parse_hours_table(schedule)
+        hours.parse_holidays(holidays)
+        hours.profile_zone(profile)
+    except ValueError as e:
+        raise ValueError(f"profile {key!r}: {e}")
+    if not str(profile_setting(profile, "timezone")).strip():
+        log.warning(
+            "profile %s has no timezone; using host zone %s. Set "
+            'timezone = "America/New_York" (or wherever the business is) so '
+            "opening hours and message timestamps mean what the business means.",
+            key, datetime.now().astimezone().tzname() or "unknown",
+        )
+
+    mode = profile_setting(profile, "after_hours")
+    if mode not in _AFTER_HOURS_MODES:
+        raise ValueError(
+            f"{where('after_hours')} = {mode!r} must be one of "
+            f"{', '.join(_AFTER_HOURS_MODES)}"
+        )
+    if mode == "transfer" and not str(profile.get("forward_to", "")).strip():
+        raise ValueError(
+            f'{where("after_hours")} = "transfer" but the profile has no '
+            "forward_to, so there is nowhere to send an out-of-hours caller"
+        )
+
+    # --- what the caller is told ------------------------------------------
+    waived = profile_setting(profile, "ack_disclosure_waived")
+    for flag, text_name, human in (
+            ("ai_disclosure", "ai_disclosure_text", "the AI disclosure"),
+            ("recording_notice", "recording_notice_text", "the recording notice")):
+        switched_on = profile_setting(profile, flag)
+        if not switched_on and not waived:
+            raise ValueError(
+                f"profile {key!r} switches off {human} ({flag} = false). Callers "
+                "in many places have a right to be told they are speaking to a "
+                "machine and that the call is kept. If this line genuinely does "
+                "not need it, add ack_disclosure_waived = true to the same "
+                "profile to say so on the record."
+            )
+        text = str(profile_setting(profile, text_name))
+        if switched_on and not text.strip():
+            raise ValueError(
+                f"{where(text_name)} is empty while {flag} is on — the caller "
+                "would hear nothing where the notice should be"
+            )
+        _check_placeholders(text, where(text_name))
+
+    # --- how the call sounds ----------------------------------------------
+    tts = profile_setting(profile, "tts_provider")
+    if tts not in _TTS_PROVIDERS:
+        raise ValueError(
+            f"{where('tts_provider')} = {tts!r} must be one of "
+            f"{', '.join(_TTS_PROVIDERS)}"
+        )
+    transcription = profile_setting(profile, "transcription_provider")
+    if transcription not in _TRANSCRIPTION_PROVIDERS:
+        raise ValueError(
+            f"{where('transcription_provider')} = {transcription!r} must be one "
+            f"of {', '.join(_TRANSCRIPTION_PROVIDERS)}"
+        )
+    language = str(profile_setting(profile, "language")).strip()
+    if not language:
+        raise ValueError(
+            f'{where("language")} is empty — use a tag like "en-US", or "multi" '
+            "for automatic detection"
+        )
+    if language == _MULTI_LANGUAGE and (transcription != "Deepgram"
+                                        or tts != "ElevenLabs"):
+        raise ValueError(
+            f'{where("language")} = "multi" (automatic language detection) works '
+            'only with transcription_provider = "Deepgram" and '
+            'tts_provider = "ElevenLabs". Set both, or name a single language '
+            'like "en-US".'
+        )
+
+    hint_list = profile_setting(profile, "hints")
+    if isinstance(hint_list, str) or not isinstance(hint_list, (list, tuple)):
+        raise ValueError(
+            f'{where("hints")} must be a list of words, like ["Acme Plumbing"]'
+        )
+    for hint in hint_list:
+        if not isinstance(hint, str) or not hint.strip():
+            raise ValueError(
+                f"{where('hints')} must be a list of words in quotes; {hint!r} is not"
+            )
+        if "," in hint:
+            raise ValueError(
+                f"{where('hints')} entry {hint!r} contains a comma. Twilio takes "
+                "the hints as one comma-separated list, so a comma inside one "
+                "quietly splits it in two — take it out."
+            )
+
+    blocked = profile_setting(profile, "block_list")
+    if isinstance(blocked, str) or not isinstance(blocked, (list, tuple)):
+        raise ValueError(
+            f'{where("block_list")} must be a list of numbers, like ["+15085551234"]'
+        )
+    for number in blocked:
+        if not isinstance(number, str) or not _E164_RE.match(number.strip()):
+            raise ValueError(
+                f"{where('block_list')} entry {number!r} is not an E.164 number "
+                "like +15085551234"
+            )
+
+    ntfy_url = str(profile_setting(profile, "ntfy_url")).strip()
+    ntfy_topic = str(profile_setting(profile, "ntfy_topic")).strip()
+    if bool(ntfy_url) != bool(ntfy_topic):
+        raise ValueError(
+            f"profile {key!r} needs ntfy_url AND ntfy_topic together (or neither) "
+            "— one without the other pushes messages nowhere"
+        )
+    if ntfy_url and not ntfy_url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"{where('ntfy_url')} {ntfy_url!r} must start with http:// or https://"
+        )
 
 
 def parse_business_config(data: dict) -> tuple[dict, dict]:
@@ -832,6 +1119,19 @@ def parse_business_config(data: dict) -> tuple[dict, dict]:
                 parse_phrase_lines(str(profile.get(field_name, "")))
             except ValueError as e:
                 raise ValueError(f"profile {key!r} {field_name}: {e}")
+        _validate_profile_settings(str(key), profile)
+        # Settings nobody reads are KEPT — a dashboard save must never eat a
+        # note somebody hand-wrote into their config. But a misspelt setting
+        # that quietly does nothing (`hurs` instead of `hours` means "open at
+        # 3am") must not be silent either.
+        unread = [name for name in profile if name not in _PROFILE_KNOWN_KEYS]
+        if unread:
+            log.warning(
+                "profile %s has settings this bridge does not read: %s. They stay "
+                "in businesses.toml exactly as written, but nothing acts on them "
+                "— check the spelling against businesses.example.toml.",
+                key, ", ".join(sorted(str(name) for name in unread)),
+            )
     check_forward_loop(numbers, profiles)
     return numbers, profiles
 
@@ -854,10 +1154,226 @@ def check_forward_loop(numbers: dict, profiles: dict) -> None:
             )
 
 
-def load_business_config(path: str) -> tuple[dict, dict, dict, str]:
-    """Read and validate businesses.toml. Returns
-    (numbers, profiles, brains, active_brain) and raises ValueError with a
-    human sentence on any problem. The boot path below turns that into a loud
+# ------------------------------------------------- branding and owners -----
+# The dashboard is a product someone else's customers log in to. Who may sign
+# in, and whose name is over the door, are CONFIG — this file ships neutral.
+
+_BRANDING_KNOWN_KEYS = ("vendor_name", "product_name", "logo_path",
+                        "support_email", "colors", "fonts")
+_OWNER_KNOWN_KEYS = ("token_env", "profiles")
+# The pre-owners dashboard login: one shared token in the env, full access.
+# It keeps working so nothing breaks on cutover.
+LEGACY_OWNER_KEY = "_admin"
+LEGACY_OWNER_TOKEN_ENV = "ADMIN_TOKEN"
+ALL_PROFILES = "*"
+
+
+@dataclass
+class Branding:
+    """Whose product the dashboard says it is. The defaults here are
+    deliberately plain: a reseller's name, logo and palette are settings in
+    their businesses.toml, never values compiled into this file."""
+    vendor_name: str = "Atlas"
+    product_name: str = "Phone Agent"
+    logo_path: str = ""
+    support_email: str = ""
+    colors: dict = field(default_factory=dict)
+    fonts: dict = field(default_factory=dict)
+
+
+@dataclass
+class Owner:
+    """One dashboard login. `token_env` NAMES the env var holding the token —
+    the token itself never touches this config. `profiles` is what they can
+    see: a list of profile keys, or ["*"] for every business on the line."""
+    key: str
+    token_env: str
+    profiles: list
+
+
+def parse_branding_config(data: dict) -> Branding:
+    """Validate [branding]. Absent = the neutral defaults above."""
+    raw = data.get("branding")
+    if raw is None:
+        return Branding()
+    if not isinstance(raw, dict):
+        raise ValueError("[branding] must be a table of settings")
+    unknown = [name for name in raw if name not in _BRANDING_KNOWN_KEYS]
+    if unknown:
+        raise ValueError(
+            f"[branding] has settings this dashboard does not understand: "
+            f"{', '.join(sorted(str(u) for u in unknown))}. It reads "
+            f"{', '.join(_BRANDING_KNOWN_KEYS)}."
+        )
+    fields: dict = {}
+    for name in ("vendor_name", "product_name", "logo_path", "support_email"):
+        if name not in raw:
+            continue
+        value = raw[name]
+        if not isinstance(value, str):
+            raise ValueError(
+                f"[branding] {name} must be text in quotes, not a "
+                f"{type(value).__name__}"
+            )
+        value = value.strip()
+        if not value and name in ("vendor_name", "product_name"):
+            raise ValueError(
+                f"[branding] {name} is empty — give it a name, or delete the "
+                "line to use the default"
+            )
+        fields[name] = value
+    for name in ("colors", "fonts"):
+        table = raw.get(name, {})
+        if not isinstance(table, dict):
+            raise ValueError(
+                f'[branding] {name} must be a table like {{ brand = "#e85d1a" }}'
+            )
+        for token, value in table.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f'[branding] {name}.{token} must be text like "#e85d1a", '
+                    f"not {value!r}"
+                )
+        fields[name] = {str(k): str(v).strip() for k, v in table.items()}
+    email = fields.get("support_email", "")
+    if email and ("@" not in email.strip("@") or " " in email):
+        raise ValueError(
+            f"[branding] support_email {email!r} is not an email address — "
+            "owners are shown it on the sign-in page when they are locked out"
+        )
+    logo = fields.get("logo_path", "")
+    if logo and not os.path.exists(os.path.expanduser(logo)):
+        # Not fatal: a config copied between machines is a normal thing. But a
+        # dashboard silently missing its logo is exactly the kind of small
+        # broken detail a customer notices first.
+        log.warning(
+            "[branding] logo_path %s is not a file on this machine — the "
+            "dashboard will show the product name instead", logo,
+        )
+    return Branding(**fields)
+
+
+def parse_owners_config(data: dict, profiles: dict) -> dict:
+    """Validate [owners.*] into {key: Owner}. The legacy ADMIN_TOKEN, when the
+    env sets it, appears as the implicit owner `_admin` with every profile —
+    so a line that has never heard of owners keeps its dashboard."""
+    raw = data.get("owners")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("[owners] must contain [owners.<name>] sections")
+    parsed: dict = {}
+    for name, owner in raw.items():
+        name = str(name)
+        if name == LEGACY_OWNER_KEY:
+            raise ValueError(
+                f"owner name {LEGACY_OWNER_KEY!r} is reserved for the legacy "
+                f"{LEGACY_OWNER_TOKEN_ENV} login — call this owner something else"
+            )
+        if not re.match(r"^[A-Za-z0-9_-]+$", name):
+            raise ValueError(
+                f"owner name {name!r} must be letters/digits/underscores only"
+            )
+        if not isinstance(owner, dict):
+            raise ValueError(f"[owners.{name}] must be a table of settings")
+        unknown = [k for k in owner if k not in _OWNER_KNOWN_KEYS]
+        if unknown:
+            raise ValueError(
+                f"[owners.{name}] has settings this bridge does not understand: "
+                f"{', '.join(sorted(str(u) for u in unknown))}. It reads "
+                f"{', '.join(_OWNER_KNOWN_KEYS)}."
+            )
+        token_env = str(owner.get("token_env", "")).strip()
+        if not token_env:
+            raise ValueError(
+                f'[owners.{name}] needs token_env = "SOME_ENV_VAR_NAME". The '
+                "sign-in token lives in the phone env file; this config only "
+                "names the variable."
+            )
+        if not _ENV_NAME_RE.match(token_env):
+            raise ValueError(
+                f"[owners.{name}] token_env {token_env!r} is not a valid "
+                "environment variable NAME — it must name the variable, never "
+                "hold the token itself"
+            )
+        if not os.environ.get(token_env, "").strip():
+            raise ValueError(
+                f"[owners.{name}] needs the env var {token_env} set (and "
+                "non-empty) in the phone env file — without it nobody can sign "
+                f"in as {name}"
+            )
+        granted = owner.get("profiles")
+        if isinstance(granted, str) or not isinstance(granted, (list, tuple)) \
+                or not granted:
+            raise ValueError(
+                f'[owners.{name}] needs profiles = ["{ALL_PROFILES}"] for every '
+                'business, or a list of profile names like ["acme_plumbing"]'
+            )
+        allowed = []
+        for item in granted:
+            entry = str(item).strip()
+            if entry != ALL_PROFILES and entry not in profiles:
+                raise ValueError(
+                    f"[owners.{name}] is given profile {entry!r}, which no "
+                    "[profiles.*] section defines"
+                )
+            allowed.append(entry)
+        parsed[name] = Owner(key=name, token_env=token_env, profiles=allowed)
+    legacy = os.environ.get(LEGACY_OWNER_TOKEN_ENV, "").strip()
+    if legacy:
+        parsed[LEGACY_OWNER_KEY] = Owner(key=LEGACY_OWNER_KEY,
+                                         token_env=LEGACY_OWNER_TOKEN_ENV,
+                                         profiles=[ALL_PROFILES])
+    return parsed
+
+
+_TOP_LEVEL_KNOWN_KEYS = ("numbers", "profiles", "brains", "active_brain",
+                         "branding", "owners")
+
+
+@dataclass
+class Config:
+    """One whole businesses.toml, validated."""
+    numbers: dict
+    profiles: dict
+    brains: dict
+    active_brain: str
+    branding: Branding
+    owners: dict
+
+
+def parse_config(data: dict) -> Config:
+    """Validate a parsed businesses.toml end to end. Raises ValueError with a
+    human sentence on any problem. The single validation path shared by the
+    fail-closed boot, `--check`, and every dashboard save."""
+    unknown = [name for name in data if name not in _TOP_LEVEL_KNOWN_KEYS]
+    if unknown:
+        # A mistyped section header used to be ignored here and then dropped by
+        # the next dashboard save — an owner who could not sign in and no
+        # reason anywhere.
+        raise ValueError(
+            f"businesses.toml has top-level settings this bridge does not "
+            f"understand: {', '.join(sorted(str(u) for u in unknown))}. It reads "
+            f"{', '.join(_TOP_LEVEL_KNOWN_KEYS)}."
+        )
+    numbers, profiles = parse_business_config(data)
+    brains, active = parse_brains_config(data)
+    branding = parse_branding_config(data)
+    owners = parse_owners_config(data, profiles)
+    for key, profile in profiles.items():
+        chosen = str(profile_setting(profile, "brain")).strip()
+        if chosen and chosen not in brains:
+            raise ValueError(
+                f"profile {key!r} brain = {chosen!r} does not match any defined "
+                f"brain ({', '.join(sorted(brains))})"
+            )
+    return Config(numbers=numbers, profiles=profiles, brains=brains,
+                  active_brain=active, branding=branding, owners=owners)
+
+
+def load_business_config(path: str) -> Config:
+    """Read and validate businesses.toml into a Config, raising ValueError with
+    a human sentence on any problem. The boot path below turns that into a loud
     exit: a phone agent with a half-valid business config must not answer
     calls."""
     try:
@@ -867,9 +1383,7 @@ def load_business_config(path: str) -> tuple[dict, dict, dict, str]:
         raise ValueError("does not exist")
     except tomllib.TOMLDecodeError as e:
         raise ValueError(f"is not valid TOML: {e}")
-    numbers, profiles = parse_business_config(data)
-    brains, active = parse_brains_config(data)
-    return numbers, profiles, brains, active
+    return parse_config(data)
 
 
 # --------------------------------------------------------------- brains ----
@@ -927,6 +1441,16 @@ def parse_brains_config(data: dict) -> tuple[dict[str, Brain], str]:
             )
         if not isinstance(brain, dict):
             raise ValueError(f"[brains.{name}] must be a table of settings")
+        unknown = [k for k in brain if k not in _BRAIN_KNOWN_KEYS]
+        if unknown:
+            # A setting the bridge does not read is a setting that does
+            # nothing: `temperture = 0.2` looked applied and never was.
+            raise ValueError(
+                f"[brains.{name}] has settings this bridge does not understand: "
+                f"{', '.join(sorted(str(u) for u in unknown))}. A brain reads "
+                f"{', '.join(_BRAIN_KNOWN_KEYS)} — anything a model backend "
+                "needs beyond those goes in extra_body."
+            )
         missing = [k for k in _BRAIN_REQUIRED_KEYS if not str(brain.get(k, "")).strip()]
         if missing:
             raise ValueError(f"brain {name!r} is missing required keys {missing}")
@@ -984,7 +1508,18 @@ _PROFILE_KNOWN_KEYS = (
     "business_name", "services", "owner_name", "greeting", "assistant_name",
     "forward_to", "model", "facts", "extra_instructions",
     "transfer_phrases", "end_phrases", "assistant_aliases",
+    # everything in PROFILE_DEFAULTS, in the order an owner meets it
+    "timezone", "hours", "holidays", "after_hours", "after_hours_greeting",
+    "ai_disclosure", "ai_disclosure_text", "recording_notice",
+    "recording_notice_text", "ack_disclosure_waived",
+    "language", "tts_provider", "voice", "transcription_provider", "hints",
+    "ignore_backchannel",
+    "brain", "messages_file", "ntfy_url", "ntfy_topic", "max_call_seconds",
+    "caller_turn_budget_per_hour", "block_list", "retention_days",
 )
+# Known settings whose value is a table. TOML puts a table AFTER every plain
+# key in its section, so these are written inline — one line, in place.
+_PROFILE_INLINE_TABLE_KEYS = ("hours",)
 
 
 def _toml_str(value: str) -> str:
@@ -1022,13 +1557,38 @@ def _toml_value(value, where: str) -> str:
     raise ValueError(f"{where} is a {type(value).__name__}, which this config cannot hold")
 
 
+def _toml_inline_table(value, where: str) -> str:
+    """A known table setting (hours, branding colours) on one line."""
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{where} must be a table like {{ mon = \"09:00-17:00\" }}, not a "
+            f"{type(value).__name__}"
+        )
+    parts = []
+    for name, item in value.items():
+        if not re.match(r"^[A-Za-z0-9_-]+$", str(name)):
+            raise ValueError(
+                f"{where} has an entry named {name!r} that TOML cannot write "
+                "plainly — use letters, digits, underscores or hyphens"
+            )
+        parts.append(f"{name} = {_toml_value(item, f'{where}.{name}')}")
+    return "{ " + ", ".join(parts) + " }" if parts else "{}"
+
+
 def emit_business_toml(numbers: dict, profiles: dict,
                        brains: dict[str, Brain] | None = None,
-                       active_brain: str = "") -> str:
+                       active_brain: str = "",
+                       branding: "Branding | None" = None,
+                       owners: dict | None = None) -> str:
     """Serialize the config back to TOML (round-trips through tomllib).
-    Used by the dashboard; hand edits with unknown keys survive a save.
-    Brains round-trip too — a dashboard save must never drop them. The
-    implicit env-default brain (no [brains] in the file) is NOT emitted."""
+    Used by the dashboard; hand edits with unknown keys survive a save, and so
+    do types — a hand-written number comes back a number.
+
+    Brains, branding and owner logins round-trip too: a dashboard save that
+    dropped [owners.*] would lock every owner out of their own dashboard. The
+    implicit env-default brain (no [brains] in the file) is NOT emitted, and
+    neither is the implicit `_admin` owner — both come from the environment.
+    """
     lines = []
     emit_brains = dict(brains or {})
     if list(emit_brains) == ["default"] and not emit_brains["default"].api_key_env \
@@ -1041,24 +1601,54 @@ def emit_business_toml(numbers: dict, profiles: dict,
     lines.append("[numbers]")
     for number, key in numbers.items():
         lines.append(f"{_toml_str(number)} = {_toml_str(key)}")
+    if branding is not None and branding != Branding():
+        lines += ["", "[branding]"]
+        for field_name in ("vendor_name", "product_name", "logo_path",
+                           "support_email"):
+            value = str(getattr(branding, field_name)).strip()
+            if value:
+                lines.append(f"{field_name} = {_toml_str(value)}")
+        for field_name in ("colors", "fonts"):
+            table = getattr(branding, field_name)
+            if table:
+                lines.append(f"{field_name} = "
+                             f"{_toml_inline_table(table, 'branding.' + field_name)}")
+    for name, owner in (owners or {}).items():
+        if name == LEGACY_OWNER_KEY:
+            continue          # the legacy login comes from ADMIN_TOKEN, not here
+        lines += ["", f"[owners.{name}]"]
+        lines.append(f"token_env = {_toml_str(owner.token_env)}")
+        lines.append(f"profiles = "
+                     f"{_toml_value(list(owner.profiles), f'owners.{name}.profiles')}")
     for name, brain in emit_brains.items():
         lines += ["", f"[brains.{name}]"]
-        for field in _BRAIN_KNOWN_KEYS:
-            if field == "extra_body":
+        for field_name in _BRAIN_KNOWN_KEYS:
+            if field_name == "extra_body":
                 value = json.dumps(brain.extra_body) if brain.extra_body else ""
             else:
-                value = str(getattr(brain, field)).strip()
+                value = str(getattr(brain, field_name)).strip()
             if value:
-                lines.append(f"{field} = {_toml_str(value)}")
+                lines.append(f"{field_name} = {_toml_str(value)}")
     for key, profile in profiles.items():
         lines += ["", f"[profiles.{key}]"]
-        for field in _PROFILE_KNOWN_KEYS:
-            value = str(profile.get(field, "")).strip()
-            if value:
-                lines.append(f"{field} = {_toml_str(value)}")
-        for field, value in profile.items():
-            if field not in _PROFILE_KNOWN_KEYS:
-                lines.append(f"{field} = {_toml_value(value, f'profiles.{key}.{field}')}")
+        for field_name in _PROFILE_KNOWN_KEYS:
+            if field_name not in profile:
+                continue
+            value = profile[field_name]
+            where = f"profiles.{key}.{field_name}"
+            if isinstance(value, str):
+                if value.strip():
+                    lines.append(f"{field_name} = {_toml_str(value.strip())}")
+            elif field_name in _PROFILE_INLINE_TABLE_KEYS:
+                lines.append(f"{field_name} = {_toml_inline_table(value, where)}")
+            else:
+                # false, 0 and [] are answers, not absences: writing them out is
+                # what keeps a switched-off setting switched off after a save.
+                lines.append(f"{field_name} = {_toml_value(value, where)}")
+        for field_name, value in profile.items():
+            if field_name not in _PROFILE_KNOWN_KEYS:
+                lines.append(f"{field_name} = "
+                             f"{_toml_value(value, f'profiles.{key}.{field_name}')}")
     return "\n".join(lines) + "\n"
 
 
@@ -1123,11 +1713,110 @@ def build_system_prompt(profile: dict) -> str:
     return prompt
 
 
+# ----------------------------------------------- what the caller hears first --
+
+_SENTENCE_ENDINGS = ".!?…"
+
+
+def _as_sentence(text: str) -> str:
+    """One spoken sentence, ending in punctuation. Text-to-speech runs two
+    sentences together without it."""
+    text = str(text).strip()
+    if text and text[-1] not in _SENTENCE_ENDINGS:
+        text += "."
+    return text
+
+
+def _split_off_final_sentence(text: str) -> tuple[str, str]:
+    """(everything before the last sentence, the last sentence)."""
+    parts = re.split(r"(?<=[.!?…])\s+", text.strip())
+    if len(parts) < 2:
+        return "", text.strip()
+    return " ".join(parts[:-1]), parts[-1]
+
+
+def opening_line(profile: dict, state) -> str:
+    """Exactly what the caller hears first: the greeting with the AI
+    disclosure and the recording notice composed into it.
+
+    When the greeting ends in a question ("...How can I help?"), the notices go
+    BEFORE that question — a caller starts answering the moment they hear it,
+    and would talk straight over a disclosure tacked on the end. Otherwise they
+    are appended.
+
+    One function, so the dashboard's preview is the caller's experience.
+    """
+    greeting = str(profile.get("greeting", "")).strip()
+    if state is not None and not state.open:
+        after_hours = str(profile_setting(profile, "after_hours_greeting")).strip()
+        if after_hours:
+            greeting = after_hours
+    filled = {
+        "business_name": str(profile.get("business_name", "")).strip(),
+        "assistant_name": str(profile.get("assistant_name", "")).strip() or "Atlas",
+    }
+    notices = []
+    for flag, text_name in (("ai_disclosure", "ai_disclosure_text"),
+                            ("recording_notice", "recording_notice_text")):
+        if not profile_setting(profile, flag):
+            continue
+        raw = str(profile_setting(profile, text_name)).strip()
+        if not raw:
+            continue
+        try:
+            notices.append(_as_sentence(raw.format(**filled)))
+        except (KeyError, IndexError, ValueError) as e:
+            # Config validation refuses these, so reaching here means something
+            # bypassed it — say so rather than speak a broken sentence.
+            raise ValueError(f"{text_name} cannot be filled in ({e})")
+    greeting = _as_sentence(greeting)
+    if not notices:
+        return greeting
+    before, last = _split_off_final_sentence(greeting)
+    if last.endswith("?"):
+        pieces = ([before] if before else []) + notices + [last]
+    else:
+        pieces = [greeting] + notices
+    return " ".join(piece for piece in pieces if piece)
+
+
+def relay_attributes(profile: dict) -> dict:
+    """The <ConversationRelay> attributes for one business.
+
+    `voice` and `hints` appear only when the profile sets them: Twilio reads an
+    empty attribute as a value, not as "use your default", and rejects the
+    document. dtmfDetection is always on (a caller pressing keys must not be
+    silence), and the welcome greeting is never interruptible — the disclosure
+    has to be heard.
+    """
+    attributes = {
+        "language": str(profile_setting(profile, "language")).strip(),
+        "ttsProvider": str(profile_setting(profile, "tts_provider")).strip(),
+    }
+    voice = str(profile_setting(profile, "voice")).strip()
+    if voice:
+        attributes["voice"] = voice
+    attributes["transcriptionProvider"] = str(
+        profile_setting(profile, "transcription_provider")).strip()
+    hint_words = [str(hint).strip() for hint in profile_setting(profile, "hints")
+                  if str(hint).strip()]
+    if hint_words:
+        attributes["hints"] = ",".join(hint_words)
+    attributes["ignoreBackchannel"] = \
+        "true" if profile_setting(profile, "ignore_backchannel") else "false"
+    attributes["dtmfDetection"] = "true"
+    attributes["welcomeGreetingInterruptible"] = "none"
+    return attributes
+
+
 try:
-    NUMBERS, PROFILES, BRAINS, ACTIVE_BRAIN = load_business_config(BUSINESS_CONFIG)
+    CONFIG = load_business_config(BUSINESS_CONFIG)
 except ValueError as e:
     log.error("business config %s: %s — refusing to start", BUSINESS_CONFIG, e)
     sys.exit(1)
+NUMBERS, PROFILES = CONFIG.numbers, CONFIG.profiles
+BRAINS, ACTIVE_BRAIN = CONFIG.brains, CONFIG.active_brain
+BRANDING, OWNERS = CONFIG.branding, CONFIG.owners
 
 # Per-profile system prompts + compiled call gates, built once at boot so a
 # template or phrase mistake fails startup, not a live call.
@@ -1149,14 +1838,15 @@ def apply_config_text(text: str) -> list[str]:
     swap the live state. Returns [] on success, else human-readable errors —
     and on any error neither the file nor the live config changes (calls in
     progress keep the profile they started with either way)."""
-    global NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES, BRAINS, ACTIVE_BRAIN
+    global CONFIG, NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES, BRAINS, ACTIVE_BRAIN
+    global BRANDING, OWNERS
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         return [f"not valid TOML: {e}"]
     try:
-        numbers, profiles = parse_business_config(data)
-        brains, active = parse_brains_config(data)
+        config = parse_config(data)
+        profiles = config.profiles
         prompts = {k: build_system_prompt(p) for k, p in profiles.items()}
     except (ValueError, KeyError) as e:
         return [str(e)]
@@ -1175,11 +1865,14 @@ def apply_config_text(text: str) -> list[str]:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, BUSINESS_CONFIG)
-    NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES = numbers, profiles, prompts, gates
-    BRAINS, ACTIVE_BRAIN = brains, active
+    CONFIG = config
+    NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES = config.numbers, profiles, prompts, gates
+    BRAINS, ACTIVE_BRAIN = config.brains, config.active_brain
+    BRANDING, OWNERS = config.branding, config.owners
     log.info("config hot-applied from dashboard: %d profile(s), %d number(s), "
-             "active brain %s (model %s)",
-             len(profiles), len(numbers), active, brains[active].model)
+             "active brain %s (model %s), %d dashboard login(s)",
+             len(profiles), len(config.numbers), config.active_brain,
+             config.brains[config.active_brain].model, len(config.owners))
     return []
 
 # ----------------------------------------------------- end-call scrubbing --
@@ -1731,6 +2424,24 @@ def twilio_signature_valid(path_and_query: str, form: dict, signature: str) -> b
 
 # ------------------------------------------------------------- handlers ----
 
+def open_state_for(profile: dict, profile_key: str, call_sid: str):
+    """Whether this business is open right now.
+
+    The config is validated at boot and on every save, so this cannot normally
+    fail. If it somehow does, the caller is still answered — with the error in
+    the journal, in the event ring and on the dashboard. A line that hangs up
+    on customers because a timezone database moved is not an improvement.
+    """
+    try:
+        return hours.open_state(profile, _now())
+    except Exception as e:
+        log.exception("profile %s: could not work out whether the business is "
+                      "open — answering as if it were", profile_key)
+        record_event("error", "hours_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        return hours.OpenState(open=True, reason="always", next_open=None)
+
+
 def _config_error_twiml() -> web.Response:
     """Spoken, loud dead-end for calls the config cannot place."""
     twiml = (
@@ -1775,11 +2486,17 @@ async def voice_incoming(request: web.Request) -> web.Response:
     # forward the call (<Dial>) or hang up based on the session's handoffData.
     action_url = f"{PUBLIC_BASE}/voice/action?profile={profile_key}"
     attr = {chr(34): "&quot;"}
+    state = open_state_for(profile, profile_key, call_sid)
+    greeting = opening_line(profile, state)
+    relay_attrs = "".join(
+        f' {name}="{xml_escape(value, attr)}"'
+        for name, value in relay_attributes(profile).items()
+    )
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         f'<Response><Connect action="{xml_escape(action_url, attr)}">'
         f'<ConversationRelay url="{xml_escape(ws_url, attr)}" '
-        f'welcomeGreeting="{xml_escape(str(profile["greeting"]), attr)}" />'
+        f'welcomeGreeting="{xml_escape(greeting, attr)}"{relay_attrs} />'
         "</Connect></Response>"
     )
     return web.Response(text=twiml, content_type="text/xml")
@@ -2369,6 +3086,8 @@ async def _serve() -> None:
             health_snapshot=health_snapshot,
             get_state=lambda: (NUMBERS, PROFILES),
             get_brains=lambda: (BRAINS, ACTIVE_BRAIN),
+            get_branding=lambda: BRANDING,
+            get_owners=lambda: OWNERS,
             get_prompts=lambda: SYSTEM_PROMPTS,
             apply_config_text=apply_config_text,
             emit_business_toml=emit_business_toml,
@@ -2386,7 +3105,44 @@ async def _serve() -> None:
     await asyncio.Event().wait()
 
 
+USAGE = (
+    "usage: service.py [--check]\n"
+    "  (no flags)  run the phone bridge\n"
+    "  --check     validate the business config and the environment it names, "
+    "then exit\n"
+)
+
+
+def config_check_summary() -> str:
+    """What `--check` prints when everything is in order. Getting this far
+    means the whole config validated and every env var it names is set — the
+    module refused to load otherwise, with the reason on stderr."""
+    logins = ", ".join(sorted(OWNERS)) or "none"
+    return (
+        f"{BUSINESS_CONFIG} is valid.\n"
+        f"  businesses: {', '.join(sorted(PROFILES))}\n"
+        f"  numbers:    {len(NUMBERS)}\n"
+        f"  brain:      {ACTIVE_BRAIN} ({BRAINS[ACTIVE_BRAIN].model} at "
+        f"{BRAINS[ACTIVE_BRAIN].base_url})\n"
+        f"  logins:     {logins}\n"
+        "Every environment variable this config names is set."
+    )
+
+
 def main() -> None:
+    argv = sys.argv[1:]
+    if "--help" in argv or "-h" in argv:
+        print(USAGE, end="")
+        sys.exit(0)
+    unknown = [arg for arg in argv if arg != "--check"]
+    if unknown:
+        # A mistyped --check must never quietly start a second bridge.
+        print(f"service.py: unknown option {unknown[0]!r}\n{USAGE}",
+              end="", file=sys.stderr)
+        sys.exit(2)
+    if CHECK_ONLY:
+        print(config_check_summary())
+        sys.exit(0)
     asyncio.run(_serve())
 
 
