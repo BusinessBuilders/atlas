@@ -624,3 +624,78 @@ async def test_the_note_is_capped_and_marked_caller_derived(tmp_path, monkeypatc
         assert "x" * line.svc.MAX_NOTE_CHARS in pad
         assert "x" * (line.svc.MAX_NOTE_CHARS + 1) not in pad
         assert len(line.ntfy.pushes[-1]["body"]) < 5000
+
+
+# ---------------------- M-6: a save must be recoverable, and must not eat --
+#                                       hand-written non-string settings
+
+def _profile(**extra) -> dict:
+    base = {"business_name": "Acme Co", "services": "widget repair",
+            "owner_name": "Jo", "greeting": "hi"}
+    base.update(extra)
+    return base
+
+
+def test_every_save_leaves_a_restorable_backup(tmp_path, monkeypatch):
+    """A customer's whole configuration used to be one stray click and one
+    save away from gone, with no recovery path."""
+    svc = _import_service(tmp_path, monkeypatch)
+    config = Path(svc.BUSINESS_CONFIG)
+    original = config.read_text(encoding="utf-8")
+
+    first = svc.emit_business_toml({"+15550001111": "acme"},
+                                   {"acme": _profile(greeting="first")})
+    assert svc.apply_config_text(first) == []
+    second = svc.emit_business_toml({"+15550001111": "acme"},
+                                    {"acme": _profile(greeting="second")})
+    assert svc.apply_config_text(second) == []
+
+    backups = sorted(config.parent.glob(config.name + ".bak-*"),
+                     key=lambda p: p.stat().st_mtime)
+    assert len(backups) == 2
+    assert backups[0].read_text(encoding="utf-8") == original
+    assert backups[1].read_text(encoding="utf-8") == first
+    assert config.read_text(encoding="utf-8") == second
+
+
+def test_backups_are_pruned_to_the_newest_hundred(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    config = Path(svc.BUSINESS_CONFIG)
+    import os
+    for i in range(120):
+        stale = config.parent / f"{config.name}.bak-2020-01-01T00-00-{i:03d}"
+        stale.write_text(f"old {i}", encoding="utf-8")
+        os.utime(stale, (1_000_000 + i, 1_000_000 + i))
+
+    fresh = svc.backup_config(str(config))
+
+    backups = list(config.parent.glob(config.name + ".bak-*"))
+    assert len(backups) == 100
+    assert Path(fresh) in backups                      # the new one survived
+    assert not (config.parent / f"{config.name}.bak-2020-01-01T00-00-000").exists()
+
+
+def test_the_emitter_keeps_non_string_settings(tmp_path, monkeypatch):
+    """str()-ing every unknown key turned a hand-added integer or boolean into
+    a quoted string on the next save — silent type corruption."""
+    import tomllib
+
+    svc = _import_service(tmp_path, monkeypatch)
+    text = svc.emit_business_toml(
+        {"+15550001111": "acme"},
+        {"acme": _profile(max_call_seconds=600, record_calls=False,
+                          minutes_per_credit=1.5, departments=["sales", "support"])},
+    )
+    _, profiles = svc.parse_business_config(tomllib.loads(text))
+    kept = profiles["acme"]
+    assert kept["max_call_seconds"] == 600 and not isinstance(kept["max_call_seconds"], bool)
+    assert kept["record_calls"] is False
+    assert kept["minutes_per_credit"] == 1.5
+    assert kept["departments"] == ["sales", "support"]
+
+
+def test_the_emitter_refuses_a_nested_table_instead_of_mangling_it(tmp_path, monkeypatch):
+    svc = _import_service(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="nested table"):
+        svc.emit_business_toml({"+15550001111": "acme"},
+                               {"acme": _profile(hours={"mon": "9-5"})})

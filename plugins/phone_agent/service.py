@@ -817,6 +817,34 @@ def _toml_str(value: str) -> str:
     ) + '"'
 
 
+def _toml_value(value, where: str) -> str:
+    """One config value as TOML, KEEPING its type.
+
+    Every unknown key used to be run through str(), so a hand-added integer,
+    boolean or list came back from the next dashboard save as a quoted string —
+    silent corruption of someone's config (M-6). Anything this cannot write
+    faithfully raises instead of being mangled.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"{where} is {value!r}, which TOML cannot represent")
+        return repr(value)
+    if isinstance(value, str):
+        return _toml_str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v, where) for v in value) + "]"
+    if isinstance(value, dict):
+        raise ValueError(
+            f"{where} is a nested table the dashboard does not understand — refusing "
+            "to save rather than mangle it. Edit businesses.toml by hand, or remove it."
+        )
+    raise ValueError(f"{where} is a {type(value).__name__}, which this config cannot hold")
+
+
 def emit_business_toml(numbers: dict, profiles: dict,
                        brains: dict[str, Brain] | None = None,
                        active_brain: str = "") -> str:
@@ -853,8 +881,39 @@ def emit_business_toml(numbers: dict, profiles: dict,
                 lines.append(f"{field} = {_toml_str(value)}")
         for field, value in profile.items():
             if field not in _PROFILE_KNOWN_KEYS:
-                lines.append(f"{field} = {_toml_str(str(value))}")
+                lines.append(f"{field} = {_toml_value(value, f'profiles.{key}.{field}')}")
     return "\n".join(lines) + "\n"
+
+
+CONFIG_BACKUPS_KEPT = 100
+
+
+def backup_config(path: str) -> str:
+    """Copy the config aside before it is overwritten; returns the backup path
+    (or '' when there is nothing to copy yet).
+
+    A dashboard save replaces the whole file, so a customer's configuration was
+    one stray click away from gone with no way back (M-6). The newest
+    CONFIG_BACKUPS_KEPT copies are kept, the rest pruned oldest-first.
+    """
+    if not os.path.exists(path):
+        return ""
+    stamp = datetime.now().astimezone().replace(microsecond=0).isoformat().replace(":", "-")
+    dest = f"{path}.bak-{stamp}"
+    attempt = 1
+    while os.path.exists(dest):          # two saves inside the same second
+        attempt += 1
+        dest = f"{path}.bak-{stamp}-{attempt}"
+    with open(path, "rb") as src, open(dest, "wb") as out:
+        out.write(src.read())
+    directory = os.path.dirname(os.path.abspath(path))
+    prefix = os.path.basename(path) + ".bak-"
+    kept = [os.path.join(directory, name) for name in os.listdir(directory)
+            if name.startswith(prefix)]
+    kept.sort(key=lambda p: (os.path.getmtime(p), p))
+    for stale in kept[:-CONFIG_BACKUPS_KEPT]:
+        os.remove(stale)
+    return dest
 
 
 def build_system_prompt(profile: dict) -> str:
@@ -928,6 +987,13 @@ def apply_config_text(text: str) -> list[str]:
         gates = {k: build_call_gates(p) for k, p in profiles.items()}
     except ValueError as e:
         return [str(e)]
+    try:
+        backup_config(BUSINESS_CONFIG)
+    except Exception as e:
+        # The save is what the owner asked for; refusing it could lock them out
+        # of fixing a broken config. But an un-backed-up save must be visible.
+        log.exception("could not back up %s before saving — saving anyway", BUSINESS_CONFIG)
+        record_event("error", "config_backup_failed", f"{type(e).__name__}: {e}")
     tmp = BUSINESS_CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
