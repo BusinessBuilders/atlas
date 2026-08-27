@@ -2487,11 +2487,19 @@ async def voice_incoming(request: web.Request) -> web.Response:
     action_url = f"{PUBLIC_BASE}/voice/action?profile={profile_key}"
     attr = {chr(34): "&quot;"}
     state = open_state_for(profile, profile_key, call_sid)
-    greeting = opening_line(profile, state)
-    relay_attrs = "".join(
-        f' {name}="{xml_escape(value, attr)}"'
-        for name, value in relay_attributes(profile).items()
-    )
+    try:
+        greeting = opening_line(profile, state)
+        relay_attrs = "".join(
+            f' {name}="{xml_escape(value, attr)}"'
+            for name, value in relay_attributes(profile).items()
+        )
+    except Exception as e:
+        # Validation refuses everything that could land here, so this means the
+        # config was changed underneath us. Speaking the greeting WITHOUT its
+        # disclosure would be the quiet failure: better a spoken config error.
+        record_event("error", "greeting_failed", f"{type(e).__name__}: {e}",
+                     call_sid, profile_key)
+        return _config_error_twiml()
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         f'<Response><Connect action="{xml_escape(action_url, attr)}">'

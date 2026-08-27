@@ -664,6 +664,18 @@ def test_the_twiml_carries_the_relay_attributes_and_the_opening_line(svc):
     assert "recorded and transcribed" in xml
 
 
+def test_a_greeting_that_cannot_be_composed_never_drops_the_disclosure(svc):
+    """If a notice text somehow reaches a live call unfillable, the caller
+    hears the configuration error — not a greeting with the AI disclosure
+    quietly missing from it."""
+    svc.PROFILES["acme"]["ai_disclosure_text"] = "I work for {mystery}."
+    xml = _incoming_twiml(svc, {"To": "+15550001111", "From": "+15550002222",
+                                "CallSid": "CA3"})
+    assert "isn&#39;t set up correctly" in xml or "isn't set up correctly" in xml
+    assert "ConversationRelay" not in xml
+    assert [e["kind"] for e in svc.RECENT_EVENTS] == ["greeting_failed"]
+
+
 def test_the_twiml_greeting_follows_the_hours(svc, monkeypatch):
     """A caller who dials on a closed Sunday hears the after-hours greeting."""
     import datetime as dt
