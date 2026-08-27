@@ -50,6 +50,11 @@ class FakeBrain:
         self.chat_status = 200
         self.models_status = 200
         self.summary_delay = 0.0      # hold the summarizer open, to test the shield
+        # Token usage the backend reports in its final streaming chunk, the way
+        # an OpenAI-compatible server answers stream_options.include_usage.
+        self.usage: dict | None = None
+        # Backends that have never heard of stream_options answer HTTP 400.
+        self.reject_stream_options = False
         self.stream_bodies: list[dict] = []
         self.summary_bodies: list[dict] = []
         self.base_url = ""
@@ -78,12 +83,22 @@ class FakeBrain:
             # pasted whole into the journal
             return web.Response(status=self.chat_status,
                                 text="<html>upstream provider error page " + "x" * 500 + "</html>")
+        if self.reject_stream_options and "stream_options" in body:
+            return web.json_response(
+                {"error": {"message": "unknown parameter: stream_options"}},
+                status=400)
         if body.get("stream"):
             self.stream_bodies.append(body)
             resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await resp.prepare(request)
             for chunk in _sse(self.reply):
                 await resp.write(chunk)
+            if self.usage is not None and body.get("stream_options"):
+                # The usage chunk carries no choices at all — the shape that
+                # used to raise IndexError in the token parser.
+                await resp.write(
+                    b"data: " + json.dumps({"choices": [], "usage": self.usage}).encode()
+                    + b"\n\n")
             await resp.write(b"data: [DONE]\n\n")
             return resp
         self.summary_bodies.append(body)
@@ -316,11 +331,13 @@ async def test_a_current_reply_does_enter_the_history(tmp_path, monkeypatch):
 
 async def test_a_keypress_is_at_least_seen(tmp_path, monkeypatch):
     """There are no menus yet, but a caller whose speech will not transcribe
-    presses keys. Those events used to vanish with nothing in the log."""
+    presses keys. Those events used to vanish with nothing in the log.
+
+    (Task 5b masks the digits themselves — see the runtime suite.)"""
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
         await run_call(line, [setup_frame(), {"type": "dtmf", "digit": "5"}])
 
-        assert "[keypress: 5]" in line.brain.summarizer_transcript
+        assert "[keypress: ••5]" in line.brain.summarizer_transcript
         assert line.pad.exists()          # a keypress-only call still delivers
 
 
@@ -944,7 +961,9 @@ async def test_keypad_digits_never_reach_the_journal(tmp_path, monkeypatch, capl
 
         assert "keypress" in caplog.text                  # the event is still visible
         assert "4111" not in caplog.text                  # the digits are not
-        assert "[keypress: 4111]" in line.brain.summarizer_transcript
+        # …and since Task 5b they do not reach the summarizer either.
+        assert "[keypress: ••11]" in line.brain.summarizer_transcript
+        assert "4111" not in line.brain.summarizer_transcript
 
 
 # ---- 3. attacker-supplied identifiers cannot forge journal lines --------
@@ -993,7 +1012,9 @@ async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
                 await gate.wait()
             except asyncio.CancelledError:
                 pass          # a task already past its final await ignores it
-            return "STALE REPLY", set()
+            # Named per turn: since Task 5b the keypress gets a reply of its
+            # own, so "no stale reply" has to mean turn 1's reply specifically.
+            return f"REPLY TO TURN {my_turn}", set()
 
         monkeypatch.setattr(svc, "stream_reply", slow)
         url = f"{line.base}/voice/relay?token={svc.WS_TOKEN}&call={CALL_SID}&profile=acme"
@@ -1011,8 +1032,9 @@ async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
 
         transcript = line.brain.summarizer_transcript
         assert "Caller: hello" in transcript
-        assert "Caller: [keypress: 5]" in transcript
-        assert "STALE REPLY" not in transcript
+        assert "Caller: [keypress: ••5]" in transcript
+        assert "REPLY TO TURN 1" not in transcript        # the stale one
+        assert "REPLY TO TURN 2" in transcript            # the keypress's own
 
 
 # ---- 5. a shutdown mid-call must not swallow the caller's message -------

@@ -133,13 +133,14 @@ import json
 import logging
 import os
 import re
+import signal
 import stat
 import string
 import sys
 import time
 import tomllib
 from base64 import b64encode
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
@@ -167,6 +168,14 @@ def _now() -> datetime:
     can hold the clock still, and so nothing in this file ever compares a naive
     timestamp with an aware one."""
     return datetime.now(timezone.utc)
+
+
+def _monotonic() -> float:
+    """Seconds on a clock that only ever moves forward — for measuring how long
+    a call has been running. One function, for the same reason as _now(): a
+    watchdog test must be able to hold this still or push it forward without
+    waiting ten real minutes."""
+    return time.monotonic()
 
 # The call store, opened at boot further down. It is declared here because
 # record_event() writes to it and is defined before the config section runs —
@@ -198,6 +207,46 @@ def _scrub(text, limit: int) -> str:
     """Attacker-supplied text, made safe to log and to keep: control characters
     out, whitespace collapsed, hard length cap."""
     return " ".join(str(text).translate(_CONTROL_TO_SPACE).split())[:limit]
+
+
+MASK_CHAR = "•"
+MASKED_NUMBER_TAIL = 4
+MASKED_DIGITS_TAIL = 2
+
+
+def mask_number(number) -> str:
+    """A caller's number with only its last four digits left.
+
+    journald has no retention window and no way to delete one caller, so the
+    number a stranger dialled from must not land there in full — the last four
+    digits are enough for an operator to match a journal line to a call row,
+    and the store still holds the whole number where retention and
+    delete_caller can reach it.
+    """
+    text = str(number or "").strip()
+    if not text:
+        return "unknown"
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return _scrub(text, MAX_CALL_SID_CHARS)      # "unknown", "anonymous", …
+    if len(digits) <= MASKED_NUMBER_TAIL:
+        return MASK_CHAR * len(digits)
+    return MASK_CHAR * (len(digits) - MASKED_NUMBER_TAIL) + digits[-MASKED_NUMBER_TAIL:]
+
+
+def mask_digits(digits) -> str:
+    """Keypad digits with all but the last two hidden.
+
+    A caller who cannot be understood by speech recognition types instead, and
+    what they type is as often a card number or a PIN as it is an extension.
+    The two leading dots say "there were digits here" and deliberately do NOT
+    say how many; the last two are kept so the owner reading a transcript can
+    still tell two different keypresses apart.
+    """
+    text = str(digits or "").strip()
+    if not text:
+        return MASK_CHAR * 2
+    return MASK_CHAR * 2 + text[-MASKED_DIGITS_TAIL:]
 
 
 def _ring_append(level: str, kind: str, detail: str, call_sid: str | None) -> int:
@@ -369,12 +418,19 @@ def _open_call_store() -> "callstore.CallStore":
                             "holds call transcripts and nobody else on this box needs to "
                             "read them", PHONE_DATA_DIR, dir_mode)
         store = callstore.CallStore(PHONE_DB_PATH)
-        db_mode = stat.S_IMODE(os.stat(PHONE_DB_PATH).st_mode)
-        if db_mode != 0o600:
-            os.chmod(PHONE_DB_PATH, 0o600)
-            if db_existed and db_mode & 0o077:
-                log.warning("call store %s was mode %o — tightened to 0600; it holds what "
-                            "callers said out loud", PHONE_DB_PATH, db_mode)
+        # The write-ahead log and its shared-memory index hold the same words as
+        # the database itself — a transcript is readable out of calls.db-wal
+        # long before SQLite checkpoints it back. SQLite creates both with the
+        # umask, so they are tightened here every boot, exactly like the .db.
+        for path in (PHONE_DB_PATH, PHONE_DB_PATH + "-wal", PHONE_DB_PATH + "-shm"):
+            if not os.path.exists(path):
+                continue
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            if mode != 0o600:
+                os.chmod(path, 0o600)
+                if db_existed and mode & 0o077:
+                    log.warning("call store %s was mode %o — tightened to 0600; it "
+                                "holds what callers said out loud", path, mode)
     except Exception as exc:
         log.error(
             "cannot open the call store in %s (%s: %s) — every call, message and "
@@ -441,6 +497,22 @@ CORRECTIVE_NO_TRANSFER = (
     "I'm sorry — I can't connect calls on this line, but I can take a message "
     "and {owner_name} will call you back."
 )
+# Spoken when the call has run past the profile's max_call_seconds. Short on
+# purpose: speech_seconds() clips anything over eight seconds, and a caller
+# being wrapped up should hear the whole sentence.
+WATCHDOG_WRAP_UP = "I need to wrap up now — {owner_name} will follow up with you."
+# How often the watchdog compares the clock with the limit.
+WATCHDOG_TICK_SECONDS = 5.0
+# Spoken when this caller ID has used up its turns for the hour. The delivery
+# still runs in the relay's finally:, so the promise in the second sentence is
+# one the bridge actually keeps.
+RATE_LIMIT_REFUSAL = (
+    "I'm sorry, this number has reached its limit for now. "
+    "{owner_name} will get your message."
+)
+# Spoken to a number on the profile's block_list. One line, then the call ends
+# — there is no relay session and nothing is summarized.
+BLOCKED_CALLER_LINE = "I'm sorry, we can't take calls from this number. Goodbye."
 
 # The entire phone persona. Self-contained on purpose: the resident Atlas
 # persona must never reach an unverified caller (see module docstring).
@@ -492,6 +564,11 @@ PHONE_PERSONA_TEMPLATE = (
     "\n"
     "KNOWN FACTS — the only specifics you may state:\n"
     "{facts}\n"
+    "\n"
+    "KEYPAD: this line has no touch-tone menu. When a caller presses keys you see a "
+    "turn like \"[keypress: {keypress_example}]\" — the digits are hidden from you on "
+    "purpose. Say that you heard a keypress, that there is no menu on this line, and "
+    "ask them to tell you what they need.\n"
     "\n"
     "ENDING THE CALL: only the CALLER decides the call is over. When they say goodbye, tell "
     "you to hang up, or confirm there is nothing else they need, reply with ONE short goodbye "
@@ -899,6 +976,22 @@ def profile_setting(profile, name: str):
         if isinstance(default, list):
             return list(default)
         return default
+    return value
+
+
+def profile_number(profile, name: str) -> int:
+    """One whole-number business setting — max_call_seconds and friends.
+
+    Config validation refuses anything that is not a plain integer, at boot and
+    on every save, so this is normally just a narrowing. It still checks: a
+    value that got here another way must stop the thing that asked for it
+    rather than be quietly treated as zero.
+    """
+    value = profile_setting(profile, name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"business setting {name} is {value!r}, which is not a whole number"
+        )
     return value
 
 
@@ -1509,6 +1602,56 @@ def brain_key(brain: Brain) -> str:
     return os.environ.get(brain.api_key_env, "").strip() if brain.api_key_env else ""
 
 
+# Asking for token usage on a streamed reply is an OpenAI-API option that not
+# every compatible backend implements. It is asked for by default, and dropped
+# ONLY for a brain that has answered "no" to its face — never quietly, and
+# never anywhere but here.
+STREAM_OPTIONS: dict = {"include_usage": True}
+BRAINS_WITHOUT_STREAM_OPTIONS: set[str] = set()
+_STREAM_OPTIONS_PROBED: set[str] = set()
+STREAM_OPTIONS_PROBE_TIMEOUT_SECONDS = 10
+
+
+async def probe_stream_options(http: aiohttp.ClientSession, brain: Brain) -> str:
+    """Ask this brain, once, whether it accepts `stream_options`.
+
+    Returns "" when it does — or when the answer was inconclusive, in which
+    case the question is asked again at the next health probe. A backend that
+    answers HTTP 400 naming the option is remembered, and its calls leave the
+    option out from then on.
+    """
+    if brain.key in _STREAM_OPTIONS_PROBED:
+        return ""
+    url, headers, body = brain_request_args(brain, {
+        "model": brain.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": True,
+        "stream_options": dict(STREAM_OPTIONS),
+        "max_tokens": 1,
+    })
+    async with http.post(
+        url, json=body, headers=headers,
+        timeout=aiohttp.ClientTimeout(total=STREAM_OPTIONS_PROBE_TIMEOUT_SECONDS),
+    ) as resp:
+        status = resp.status
+        detail = "" if status == 200 else " ".join((await resp.text())[:400].split())
+    if status == 200:
+        _STREAM_OPTIONS_PROBED.add(brain.key)
+        return ""
+    if status == 400 and "stream_options" in detail:
+        _STREAM_OPTIONS_PROBED.add(brain.key)
+        BRAINS_WITHOUT_STREAM_OPTIONS.add(brain.key)
+        log.warning(
+            "brain %s rejects stream_options: %s. Calls on this brain will no "
+            "longer ask for it, so their prompt/completion token counts stay "
+            "empty — every other brain still reports them.",
+            brain.key, detail[:200],
+        )
+        return (f"brain {brain.key} rejects stream_options — token counts are "
+                "not available on this brain")
+    return ""
+
+
 def brain_request_args(brain: Brain, body: dict) -> tuple[str, dict, dict]:
     """(url, headers, merged_body) for one chat-completions call on a brain.
     The brain's extra_body merges UNDER the call's own keys so a preset can
@@ -1702,7 +1845,13 @@ def backup_config(path: str) -> str:
     return dest
 
 
-def build_system_prompt(profile: dict) -> str:
+def build_system_prompt(profile: dict, *, transfer_offered: bool = True) -> str:
+    """The whole persona for one business.
+
+    `transfer_offered` is False for an after-hours call on a profile that takes
+    messages out of hours: the TRANSFERRING section is left out entirely, so the
+    model is never told an option the bridge would refuse anyway (§3.6).
+    """
     facts = str(profile.get("facts", "")).strip()
     if facts:
         facts = "\n".join(
@@ -1710,7 +1859,7 @@ def build_system_prompt(profile: dict) -> str:
             for line in facts.splitlines() if line.strip()
         )
     transfer_section = ""
-    if str(profile.get("forward_to", "")).strip():
+    if transfer_offered and str(profile.get("forward_to", "")).strip():
         transfer_section = TRANSFER_SECTION_TEMPLATE.format(
             owner_name=profile["owner_name"], tmarker=TRANSFER_MARKER,
         )
@@ -1721,6 +1870,7 @@ def build_system_prompt(profile: dict) -> str:
         owner_name=profile["owner_name"],
         facts=facts or NO_FACTS_LINE,
         marker=END_CALL_MARKER,
+        keypress_example=mask_digits("5"),
         transfer_section=transfer_section,
     )
     extra = str(profile.get("extra_instructions", "")).strip()
@@ -1834,6 +1984,134 @@ def relay_attributes(profile: dict) -> dict:
     attributes["dtmfDetection"] = "true"
     attributes["welcomeGreetingInterruptible"] = "none"
     return attributes
+
+
+# --------------------------------------------------- out of hours, at call time --
+
+AFTER_HOURS_MESSAGE = "message"
+
+
+def takes_messages_only(profile: dict, state) -> bool:
+    """True when this call reaches a closed business that takes messages.
+
+    Two things follow, and they have to agree: the persona loses its
+    TRANSFERRING section, and the gates lose transfer_available — so a caller
+    who asks for a person out of hours hears the message-taking line instead of
+    being put through to a phone nobody is next to (§3.6).
+    """
+    if state is None or state.open:
+        return False
+    return str(profile_setting(profile, "after_hours")) == AFTER_HOURS_MESSAGE
+
+
+# ------------------------------------------------- per-caller turn budget --
+# One caller ID, one wall-clock hour, one count. The buckets are keyed by
+# (business, caller) so a caller who wears out their welcome on one business's
+# line still gets a fresh start on another's — the budget is a business's
+# setting, not a global blocklist.
+CALLER_TURN_BUCKETS: dict[tuple[str, str], dict[int, int]] = {}
+RATE_LIMIT_WINDOW_SECONDS = 3600
+
+
+def note_caller_turn(profile_key: str, caller_id: str, budget: int,
+                     now: float) -> bool:
+    """Count one caller turn. True while the caller is inside their budget.
+
+    Buckets older than the current hour are dropped on every call — for every
+    caller, not only this one — so a line that answered a thousand strangers
+    yesterday is not still holding a thousand dictionary entries today.
+    """
+    hour = int(now // RATE_LIMIT_WINDOW_SECONDS)
+    for key in list(CALLER_TURN_BUCKETS):
+        buckets = CALLER_TURN_BUCKETS[key]
+        for stale in [h for h in buckets if h < hour]:
+            del buckets[stale]
+        if not buckets:
+            del CALLER_TURN_BUCKETS[key]
+    bucket = CALLER_TURN_BUCKETS.setdefault((str(profile_key), str(caller_id)), {})
+    bucket[hour] = bucket.get(hour, 0) + 1
+    return bucket[hour] <= int(budget)
+
+
+# ------------------------------------------------------------- opt-out ----
+# "Stop calling me" is a request a business has to honour, and the owner has to
+# know it was made. The bridge does not change what it says — it records the
+# fact against the call so the owner can act on it (§3.7).
+OPT_OUT_PHRASES = (
+    "stop calling me",
+    "take me off your list",
+    "do not call",
+    "don't call me",
+    # speech recognition drops the apostrophe often enough to matter
+    "dont call me",
+)
+
+
+def detect_opt_out(utterance: str) -> str:
+    """The opt-out phrase the caller used, or "" — matched on normalized text
+    so punctuation and capitals cannot hide it."""
+    norm = normalize_speech(utterance)
+    return next((p for p in OPT_OUT_PHRASES if normalize_speech(p) in norm), "")
+
+
+# ------------------------------------------------- per-business delivery ---
+
+
+@dataclass(frozen=True)
+class DeliveryTargets:
+    """Where one business's messages go: its own pad file and its own push
+    topic, each falling back to the line-wide environment default so a config
+    that never mentions them behaves exactly as it did before per-business
+    delivery existed."""
+    messages_file: str
+    ntfy_url: str
+    ntfy_topic: str
+
+
+def delivery_targets(profile: dict) -> DeliveryTargets:
+    pad = str(profile_setting(profile, "messages_file")).strip()
+    url = str(profile_setting(profile, "ntfy_url")).strip().rstrip("/")
+    topic = str(profile_setting(profile, "ntfy_topic")).strip()
+    if not (url and topic):
+        url, topic = NTFY_URL, NTFY_TOPIC
+    return DeliveryTargets(
+        messages_file=os.path.expanduser(pad) if pad else MESSAGES_FILE,
+        ntfy_url=url, ntfy_topic=topic,
+    )
+
+
+def profile_now(profile: dict, profile_key: str = "") -> datetime:
+    """The current moment in the BUSINESS's timezone.
+
+    A message pad stamped in the bridge's timezone tells an owner three
+    timezones away the wrong hour for every call they ever get. Config
+    validation refuses a timezone this machine cannot resolve, so the fallback
+    below means the config changed underneath us — it is recorded, never
+    silent.
+    """
+    try:
+        return _now().astimezone(hours.profile_zone(profile))
+    except Exception as e:
+        record_event("error", "timezone_failed",
+                     f"{type(e).__name__}: {e} — stamping in the bridge's own zone",
+                     None, profile_key or None)
+        return _now().astimezone()
+
+
+def call_brain(profile: dict, profile_key: str) -> Brain:
+    """The model backend this business's calls run on: its own `brain` when it
+    names one, else the config's active_brain. Resolved ONCE per call, so a
+    dashboard brain switch applies to the next call and never mid-sentence."""
+    chosen = str(profile_setting(profile, "brain")).strip()
+    if chosen and chosen not in BRAINS:
+        # Validation refuses this, so reaching here means the config changed
+        # underneath us. The call still gets answered — on the active brain,
+        # loudly, rather than not at all.
+        record_event("error", "brain_missing",
+                     f"profile names brain {chosen!r}, which no longer exists — "
+                     f"answering on {ACTIVE_BRAIN!r}", None, profile_key)
+        chosen = ""
+    return BRAINS[chosen or ACTIVE_BRAIN]
 
 
 try:
@@ -2218,7 +2496,10 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
     """
     global NTFY_FAILURES
     caller_turns = sum(1 for m in history if m["role"] == "user")
-    when = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
+    targets = delivery_targets(profile)
+    # Stamped in the BUSINESS's timezone, not the bridge's: the owner reading
+    # this pad is the person who has to recognise the hour.
+    when = profile_now(profile, profile_key).strftime("%Y-%m-%d %H:%M %Z").strip()
     summary_failed = False
     try:
         note = await summarize_call(http, history, profile, caller_id, model, brain)
@@ -2286,8 +2567,8 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
     push_body = f"From: {caller_id} — {profile['business_name']} line\n{pad_note}"
     try:
         async with _pad_lock:
-            new_pad = not os.path.exists(MESSAGES_FILE)
-            with open(MESSAGES_FILE, "a", encoding="utf-8") as f:
+            new_pad = not os.path.exists(targets.messages_file)
+            with open(targets.messages_file, "a", encoding="utf-8") as f:
                 if new_pad:
                     f.write("# Phone messages — Atlas phone agent\n")
                 f.write(entry)
@@ -2295,24 +2576,27 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         # The caller was told the owner would get back to them. A pad write we
         # cannot do must reach the owner some other way, and until it does the
         # line reports itself sick (H-1).
-        log.exception("message pad WRITE FAILED (%s) -> %s", call_sid, MESSAGES_FILE)
+        log.exception("message pad WRITE FAILED (%s) -> %s", call_sid,
+                      targets.messages_file)
         record_event("error", "pad_write_failed", f"{type(e).__name__}: {e}",
                      call_sid, profile_key)
         _note_delivery(call_sid, ok=False, error=f"pad write: {type(e).__name__}")
         await _escalate_undelivered(http, call_sid=call_sid, profile=profile,
-                                    profile_key=profile_key, note=push_body, entry=entry)
+                                    profile_key=profile_key, note=push_body,
+                                    entry=entry, targets=targets)
         return result
     _note_delivery(call_sid, ok=True, error="")
     result["ok"] = True
-    log.info("message pad: entry written for CallSid=%s -> %s", call_sid, MESSAGES_FILE)
+    log.info("message pad: entry written for CallSid=%s -> %s", call_sid,
+             targets.messages_file)
 
-    if not NTFY_URL:
+    if not targets.ntfy_url:
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "off")
         return result
     try:
         async with http.post(
-            f"{NTFY_URL}/{NTFY_TOPIC}", data=push_body.encode(),
+            f"{targets.ntfy_url}/{targets.ntfy_topic}", data=push_body.encode(),
             headers={"Title": f"Phone message - {profile['business_name']} line"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
@@ -2345,7 +2629,7 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
 
 async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
                                 profile: dict, profile_key: str, note: str,
-                                entry: str) -> None:
+                                entry: str, targets: DeliveryTargets) -> None:
     """Last resort when the message pad could not be written: push the raw note
     to the owner at urgent priority and keep a copy beside the pad.
 
@@ -2353,7 +2637,7 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
     the routine channel, and a success here must never clear the counter that
     says routine pushes are broken.
     """
-    fallback_path = MESSAGES_FILE + ".fallback"
+    fallback_path = targets.messages_file + ".fallback"
     try:
         with open(fallback_path, "a", encoding="utf-8") as f:
             f.write(entry)
@@ -2364,7 +2648,7 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
         record_event("error", "fallback_write_failed", f"{type(e).__name__}: {e}",
                      call_sid, profile_key)
 
-    if not NTFY_URL:
+    if not targets.ntfy_url:
         record_event("error", "undelivered_no_push_channel",
                      "message pad unwritable and no ntfy configured — the message "
                      "exists only in the fallback file", call_sid, profile_key)
@@ -2373,7 +2657,7 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
         return
     try:
         async with http.post(
-            f"{NTFY_URL}/{NTFY_TOPIC}", data=note.encode(),
+            f"{targets.ntfy_url}/{targets.ntfy_topic}", data=note.encode(),
             headers={"Title": f"UNDELIVERED phone message - {profile['business_name']} line",
                      "Priority": "urgent"},
             timeout=aiohttp.ClientTimeout(total=10),
@@ -2408,12 +2692,104 @@ async def deliver_after_call(*, call_sid: str, caller_id: str, profile: dict,
     when the coroutine itself is shielded. Owning the session means a shutdown
     mid-call still writes the caller's message down.
     """
-    async with aiohttp.ClientSession() as http:
-        return await deliver_call_message(
-            http, call_sid=call_sid, caller_id=caller_id, profile=profile,
-            profile_key=profile_key, history=history, model=model, brain=brain,
-            overpromise_terms=overpromise_terms,
-        )
+    try:
+        async with aiohttp.ClientSession() as http:
+            return await deliver_call_message(
+                http, call_sid=call_sid, caller_id=caller_id, profile=profile,
+                profile_key=profile_key, history=history, model=model, brain=brain,
+                overpromise_terms=overpromise_terms,
+            )
+    except Exception:
+        # By the time this raises, the relay handler that started it may already
+        # be gone — cancelled by a shutdown — and nobody is left awaiting the
+        # result. An exception with no waiter is a message that vanished with
+        # only "Task exception was never retrieved" to show for it.
+        log.exception("post-call delivery raised after the call ended (%s)", call_sid)
+        raise
+
+# ----------------------------------------------------- graceful shutdown --
+# systemd sends SIGTERM and starts counting. What must survive those seconds is
+# the caller's message: a relay session that was mid-call when the unit was
+# restarted used to lose its delivery with nothing in the journal but the
+# restart itself.
+
+IN_FLIGHT_DELIVERIES: set[asyncio.Task] = set()
+RELAY_HANDLERS: set[asyncio.Task] = set()
+_SERVERS: list = []
+SHUTDOWN_DELIVERY_GRACE_SECONDS = 10
+SHUTTING_DOWN = False
+
+
+def track_server(runner, site) -> None:
+    """Remember a listening server so shutdown() can stop it accepting."""
+    _SERVERS.append((runner, site))
+
+
+def start_delivery(coro) -> asyncio.Task:
+    """Run one post-call delivery as a task this process can wait for.
+
+    The relay handler still awaits it (under a shield), but the set is what
+    lets a shutdown find a delivery whose handler has already been cancelled.
+    """
+    task = asyncio.ensure_future(coro)
+    IN_FLIGHT_DELIVERIES.add(task)
+    task.add_done_callback(IN_FLIGHT_DELIVERIES.discard)
+    return task
+
+
+async def _drain(tasks, deadline: float, what: str) -> None:
+    """Wait for `tasks` until they finish or the deadline passes. A deadline
+    that passes is recorded — an abandoned delivery is a message that may not
+    have landed, and nobody should have to guess afterwards."""
+    pending = {t for t in tasks if not t.done()}
+    while pending:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            record_event(
+                "error", "shutdown_timeout",
+                f"{len(pending)} {what} still running after "
+                f"{SHUTDOWN_DELIVERY_GRACE_SECONDS}s — abandoned by the shutdown",
+            )
+            return
+        _done, pending = await asyncio.wait(pending, timeout=remaining)
+
+
+async def shutdown(reason: str = "signal") -> None:
+    """Stop the line cleanly: no new calls, in-flight messages delivered.
+
+    Order matters. The listening sockets close first so nothing new arrives;
+    the relay handlers are then cancelled, which runs each one's `finally:` and
+    starts its delivery; those deliveries get up to
+    SHUTDOWN_DELIVERY_GRACE_SECONDS to finish before the store is closed.
+    """
+    global SHUTTING_DOWN
+    if SHUTTING_DOWN:
+        return
+    SHUTTING_DOWN = True
+    log.info("shutting down (%s): %d relay session(s) open, %d delivery(ies) "
+             "in flight", reason, len(RELAY_HANDLERS), len(IN_FLIGHT_DELIVERIES))
+    for _runner, site in _SERVERS:
+        try:
+            await site.stop()
+        except Exception:
+            log.exception("could not stop a listening socket during shutdown")
+    deadline = _monotonic() + SHUTDOWN_DELIVERY_GRACE_SECONDS
+    for task in list(RELAY_HANDLERS):
+        task.cancel()
+    # The handlers first: each one's finally: is what STARTS the delivery, so
+    # waiting on the deliveries before that would find an empty set.
+    await _drain(list(RELAY_HANDLERS), deadline, "relay session(s)")
+    await _drain(list(IN_FLIGHT_DELIVERIES), deadline, "message deliver(y/ies)")
+    for runner, _site in _SERVERS:
+        try:
+            await runner.cleanup()
+        except Exception:
+            log.exception("could not clean up a server during shutdown")
+    _SERVERS.clear()
+    if STORE is not None:
+        STORE.close()
+    log.info("shutdown complete (%s)", reason)
+
 
 # ------------------------------------------------- twilio signature check --
 
@@ -2469,6 +2845,33 @@ def open_state_for(profile: dict, profile_key: str, call_sid: str):
         return hours.OpenState(open=True, reason="always", next_open=None)
 
 
+def _blocked_caller_twiml(profile: dict, profile_key: str, call_sid: str,
+                          caller_id: str, dialed: str) -> web.Response:
+    """One short spoken line and a hangup, for a number on the block list.
+
+    No relay session is opened, so no model runs and nothing is summarized —
+    but the call still gets a row and an event, because "did that number get
+    through last night?" has to be answerable.
+    """
+    record_event("warning", "blocked",
+                 f"call from {mask_number(caller_id)} refused by the block list",
+                 call_sid, profile_key)
+    brain = call_brain(profile, profile_key)
+    _store_write(
+        "start_call", call_sid, profile_key,
+        call_sid, profile_key, caller_id, dialed, brain.key,
+        str(profile.get("model", "")).strip() or brain.model,
+        is_test=callstore.is_test_call(call_sid, caller_id),
+    )
+    _store_write("end_call", call_sid, profile_key,
+                 call_sid, "blocked", "block_list", 0, [])
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Say>{xml_escape(BLOCKED_CALLER_LINE)}</Say><Hangup/></Response>"
+    )
+    return web.Response(text=twiml, content_type="text/xml")
+
+
 def _config_error_twiml() -> web.Response:
     """Spoken, loud dead-end for calls the config cannot place."""
     twiml = (
@@ -2498,9 +2901,17 @@ async def voice_incoming(request: web.Request) -> web.Response:
         return _config_error_twiml()
 
     profile = PROFILES[profile_key]
-    log.info("incoming call CallSid=%s from=%s to=%s profile=%s",
-             form.get("CallSid"), form.get("From"), dialed, profile_key)
+    caller_id = str(form.get("From", "") or "")
     call_sid = str(form.get("CallSid", ""))
+    # The caller's number is masked here and everywhere else in the journal:
+    # journald has no retention window and no way to delete one caller, and the
+    # last four digits are all an operator needs to find the call row.
+    log.info("incoming call CallSid=%s from=%s to=%s profile=%s",
+             call_sid, mask_number(caller_id), dialed, profile_key)
+    if caller_id and caller_id.strip() in {
+            str(n).strip() for n in profile_setting(profile, "block_list")}:
+        return _blocked_caller_twiml(profile, profile_key, call_sid, caller_id,
+                                     str(dialed))
     # The relay URL travels through nginx on the public VPS, whose access log
     # records the full request URI. A per-call token makes that log entry
     # worthless minutes later; the static one was a key to every call (H-8).
@@ -2618,11 +3029,17 @@ async def stream_reply(
     interleaving into Twilio's text-to-speech is a garbled call. Every send is
     gated on the turn still being current (M-2).
     """
-    url, headers, body = brain_request_args(brain, {
+    request: dict = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}] + history,
         "stream": True,
-    })
+    }
+    if brain.key not in BRAINS_WITHOUT_STREAM_OPTIONS:
+        # Ask the backend to close the stream with a usage chunk. What a call
+        # cost is a number the owner is billed for; a bridge that never asks
+        # for it can only ever guess (§3.4 prompt_tokens/completion_tokens).
+        request["stream_options"] = dict(STREAM_OPTIONS)
+    url, headers, body = brain_request_args(brain, request)
     scrubber = MarkerScrubber()
     spoken: list[str] = []
 
@@ -2652,7 +3069,15 @@ async def stream_reply(
             data = line[5:].strip()
             if data == "[DONE]":
                 break
-            token = json.loads(data)["choices"][0]["delta"].get("content") or ""
+            chunk = json.loads(data)
+            usage = chunk.get("usage")
+            if usage and metrics is not None:
+                # The usage chunk carries no choices at all, which is why the
+                # token line below cannot assume there is a choices[0].
+                metrics["prompt_tokens"] = usage.get("prompt_tokens")
+                metrics["completion_tokens"] = usage.get("completion_tokens")
+            choices = chunk.get("choices") or []
+            token = (choices[0].get("delta", {}).get("content") if choices else "") or ""
             if token:
                 if metrics is not None and "ttft_ms" not in metrics:
                     metrics["ttft_ms"] = int((time.monotonic() - sent_at) * 1000)
@@ -2664,6 +3089,10 @@ async def stream_reply(
 
 
 async def voice_relay(request: web.Request) -> web.WebSocketResponse:
+    if SHUTTING_DOWN:
+        # A session opened now would be cancelled seconds later mid-sentence.
+        # Twilio's fallback URL sends the caller to a human instead.
+        raise web.HTTPServiceUnavailable(text="bridge is shutting down")
     # Authorization happens BEFORE the websocket is accepted, so a rejected
     # peer gets a plain 401 on the upgrade request and never reaches the loop.
     token = request.query.get("token", "")
@@ -2690,16 +3119,33 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
         raise web.HTTPForbidden(text="unknown profile")
 
     profile = PROFILES[profile_key]
-    system_prompt = SYSTEM_PROMPTS[profile_key]
+    # Whether the business is open is decided once, here, for the whole call.
+    # Out of hours on a message-taking profile the persona loses its
+    # TRANSFERRING section and the gates lose transfer_available, so the two
+    # can never disagree about what this call is allowed to do (§3.6).
+    open_now = open_state_for(profile, profile_key, request.query.get("call", ""))
+    message_only = takes_messages_only(profile, open_now)
+    system_prompt = (build_system_prompt(profile, transfer_offered=False)
+                     if message_only else SYSTEM_PROMPTS[profile_key])
     gates = GATES[profile_key]
+    if message_only:
+        gates = replace(gates, transfer_available=False)
+        log.info("profile %s is closed (%s) and takes messages out of hours — "
+                 "transfer is off for this call", profile_key, open_now.reason)
     # The brain is captured ONCE per call: a dashboard brain switch applies to
     # the next call, never mid-conversation.
-    brain = BRAINS[ACTIVE_BRAIN]
+    brain = call_brain(profile, profile_key)
     model = str(profile.get("model", "")).strip() or brain.model
     spoken_error = SPOKEN_ERROR_TEMPLATE.format(owner_name=profile["owner_name"])
 
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+    handler = asyncio.current_task()
+    if handler is not None:
+        # Shutdown cancels these by hand: aiohttp will happily wait forever for
+        # a websocket that Twilio is holding open.
+        RELAY_HANDLERS.add(handler)
+        handler.add_done_callback(RELAY_HANDLERS.discard)
 
     history: list = []
     call_sid = "?"
@@ -2708,10 +3154,16 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
     overpromise_terms: list = []
     turn_state = {"n": 0}
     reply_task: asyncio.Task | None = None
+    # Tokens this call has cost, summed over its turns. None-if-never-seen: a
+    # brain that does not report usage must leave the columns empty rather than
+    # claim the call was free.
+    token_usage: dict = {"prompt": None, "completion": None}
     # What the call row still needs when the socket closes: whether a control
-    # decision was acted on, and why. The store row is opened at `setup` and
-    # finalised in the finally: below — one row per call, always closed.
-    call_row = {"open": False, "decision": "", "reason": ""}
+    # decision was acted on, and why, plus the two endings the bridge itself
+    # imposes. The store row is opened at `setup` and finalised in the finally:
+    # below — one row per call, always closed.
+    call_row = {"open": False, "decision": "", "reason": "",
+                "watchdog": False, "rate_limited": False}
 
     def open_call_row() -> None:
         """One `calls` row, written the moment we know who is on the line.
@@ -2750,6 +3202,13 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
         caller_turns = sum(1 for m in history if m["role"] == "user")
         if call_row["decision"] == "transfer":
             outcome = "transferred"
+        elif call_row["rate_limited"]:
+            outcome = "rate_limited"
+        elif call_row["watchdog"]:
+            # The bridge, not the caller, ended this one: what matters is
+            # whether the owner got something out of it.
+            outcome = ("message_taken" if delivery and delivery.get("message_id")
+                       else "caller_hung_up")
         elif caller_turns == 0:
             outcome = "caller_hung_up"          # the socket closed with nothing said
         elif delivery is None or not delivery.get("ok"):
@@ -2758,14 +3217,185 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
             outcome = "no_info_given"           # a note, but nothing to act on
         else:
             outcome = "message_taken"
+        if outcome == "message_taken" and message_only:
+            # Same message, but the owner reading the call log can tell which
+            # of them came in while the business was closed.
+            outcome = "after_hours_message"
         _store_write("end_call", call_sid, profile_key,
                      call_sid, outcome, call_row["reason"], caller_turns,
-                     sorted(set(overpromise_terms)))
+                     sorted(set(overpromise_terms)),
+                     prompt_tokens=token_usage["prompt"],
+                     completion_tokens=token_usage["completion"])
 
     async def speak(text: str) -> None:
         await ws.send_json({"type": "text", "token": text, "last": True})
 
+    async def speak_then_end(text: str, reason: str) -> None:
+        """Say one last line, let it play, then end the session. The wait is
+        what stops Twilio cutting the sentence off mid-word."""
+        if reply_task is not None and not reply_task.done():
+            reply_task.cancel()
+        turn_state["n"] += 1          # fence any reply still on its way out
+        await speak(text)
+        await asyncio.sleep(speech_seconds(text))
+        await ws.send_json({"type": "end", "handoffData": json.dumps({"reason": reason})})
+
+    async def wrap_up_overlong_call(limit: int) -> None:
+        """The watchdog's ending: a call that has run past the profile's
+        max_call_seconds is wrapped up out loud, not dropped."""
+        record_event("warning", "watchdog",
+                     f"call ran past {limit}s — wrapped up and ended",
+                     call_sid, profile_key)
+        call_row["watchdog"] = True
+        call_row["reason"] = call_row["reason"] or "watchdog"
+        try:
+            await speak_then_end(
+                WATCHDOG_WRAP_UP.format(owner_name=profile["owner_name"]), "end")
+        except Exception as e:
+            # The socket may already be gone. The row still records why.
+            record_event("error", "watchdog_end_failed", f"{type(e).__name__}: {e}",
+                         call_sid, profile_key)
+
+    async def watchdog(limit: int, started: float) -> None:
+        """Wait out the call's time limit, then wrap it up.
+
+        The clock is read through _monotonic() and re-read every
+        WATCHDOG_TICK_SECONDS rather than slept away in one go, so the limit is
+        checked against the clock as it actually is — which is also what lets a
+        test move that clock instead of waiting ten real minutes.
+        """
+        while True:
+            remaining = limit - (_monotonic() - started)
+            if remaining <= 0:
+                await wrap_up_overlong_call(limit)
+                return
+            await asyncio.sleep(min(remaining, WATCHDOG_TICK_SECONDS))
+
+    async def refuse_over_budget(budget: int) -> None:
+        """This caller has used up their turns for the hour: say so, end the
+        call, and leave the delivery in the finally: to run as usual — what
+        they already said still reaches the owner."""
+        record_event("warning", "rate_limited",
+                     f"{mask_number(caller_id)} passed {budget} turns in one hour "
+                     "on this line", call_sid, profile_key)
+        call_row["rate_limited"] = True
+        call_row["reason"] = call_row["reason"] or "rate_limited"
+        await speak_then_end(
+            RATE_LIMIT_REFUSAL.format(owner_name=profile["owner_name"]), "end")
+
+    def within_budget() -> bool:
+        """Count this caller turn against the profile's hourly budget."""
+        budget = profile_number(profile, "caller_turn_budget_per_hour")
+        return note_caller_turn(profile_key, caller_id, budget, time.time())
+
+    async def respond(hist_snapshot: list, my_turn: int,
+                      http: aiohttp.ClientSession) -> None:
+        """One model reply for one caller turn — spoken, recorded, and
+        judged against the caller-consent gates.
+
+        Defined once for the whole call: a keypress needs the same answer
+        machinery as speech, and `my_turn` is passed in rather than bound
+        as a default so the turn it belongs to is always the turn it was
+        started for.
+        """
+        metrics: dict = {}
+        try:
+            reply, found = await stream_reply(
+                ws, hist_snapshot, http, system_prompt, model, brain,
+                turn_state=turn_state, my_turn=my_turn,
+                metrics=metrics,
+            )
+            # Counted before the staleness check below: a discarded reply
+            # still cost what it cost.
+            for total, reported in (("prompt", "prompt_tokens"),
+                                    ("completion", "completion_tokens")):
+                counted = metrics.get(reported)
+                if counted is not None:
+                    token_usage[total] = (token_usage[total] or 0) + int(counted)
+            if turn_state["n"] != my_turn:
+                # the caller spoke again while this task was past its last
+                # await — appending now would order the history
+                # [user1, user2, assistant1]
+                log.info("reply from turn %d discarded, the caller moved on (%s)",
+                         my_turn, call_sid)
+                return
+            history.append({"role": "assistant", "content": reply})
+            # Counts here too: the agent's words quote the caller's back often
+            # enough that logging them would put the caller in the journal anyway.
+            log.info("agent turn %d (%s): %d characters, first token in %s ms",
+                     my_turn, call_sid, len(reply), metrics.get("ttft_ms", "?"))
+            store_turn(my_turn, "agent", reply, ttft_ms=metrics.get("ttft_ms"))
+            overpromises = detect_overpromise(reply)
+            if overpromises:
+                overpromise_terms.extend(overpromises)
+                log.warning(
+                    "OVERPROMISE language in reply (%s): %s — flagged for review",
+                    call_sid, ", ".join(overpromises),
+                )
+            if loose_marker_spoken(reply):
+                log.warning(
+                    "whitespace-variant control marker SPOKEN aloud on turn %d "
+                    "(%s) — the reply is in the call store", my_turn, call_sid,
+                )
+            caller_texts = [m["content"] for m in hist_snapshot if m["role"] == "user"]
+            decision, reason = decide_call_action(reply, found, caller_texts, gates)
+            if decision is None and found:
+                log.warning(
+                    "marker %s BLOCKED reason=%s (%s) on turn %d — "
+                    "the caller's last turn was %d characters",
+                    "/".join(sorted(found)), reason, call_sid, my_turn,
+                    len(caller_texts[-1]) if caller_texts else 0,
+                )
+                call_row["reason"] = (call_row["reason"]
+                                      or f"blocked:{reason}")
+                if reason == "no-caller-request" and "transfer" in found:
+                    # the model already SAID "connecting you" —
+                    # recover the false promise out loud, naming
+                    # this profile's ACTUAL phrase (BLIND-2)
+                    await speak(CORRECTIVE_TRANSFER.format(
+                        owner_name=profile["owner_name"],
+                        hint=gates.transfer_hint))
+                elif reason == "transfer-unavailable":
+                    # whether or not the caller asked, the model
+                    # promised a transfer this line can't do —
+                    # correct it out loud (BLIND-3)
+                    await speak(CORRECTIVE_NO_TRANSFER.format(
+                        owner_name=profile["owner_name"]))
+            elif decision:
+                # Let the last sentence play out, then act. A new
+                # caller prompt cancels this task — and if one
+                # slips in during the wait, the turn counter
+                # aborts the action (EDGE-15).
+                await asyncio.sleep(speech_seconds(reply))
+                if turn_state["n"] != my_turn:
+                    log.info("call moved on during speech-wait — "
+                             "%s aborted (%s)", decision, call_sid)
+                    return
+                log.info("atlas %s the call (%s)",
+                         "is transferring" if decision == "transfer" else "ended",
+                         call_sid)
+                call_row["decision"] = decision
+                call_row["reason"] = decision
+                await ws.send_json({
+                    "type": "end",
+                    "handoffData": json.dumps({"reason": decision}),
+                })
+        except asyncio.CancelledError:
+            log.info("reply interrupted by caller (%s)", call_sid)
+            raise
+        except Exception:
+            log.exception("model reply FAILED (%s) — speaking error line", call_sid)
+            try:
+                await ws.send_json({"type": "text", "token": spoken_error, "last": True})
+            except Exception:
+                log.exception("could not even deliver the spoken error (%s)", call_sid)
+
     async with aiohttp.ClientSession() as http:
+        # H-6: no call runs forever. A caller who walks away from an open line
+        # (or a robocaller that never hangs up) is billed by the minute until
+        # something ends it.
+        watchdog_task = asyncio.create_task(
+            watchdog(profile_number(profile, "max_call_seconds"), _monotonic()))
         try:
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -2797,7 +3427,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             + f"\n\nTHIS CALL: the caller-ID number the caller is dialing from is {caller_id}."
                         )
                         log.info("relay session started CallSid=%s from=%s profile=%s",
-                                 call_sid, caller_id, profile_key)
+                                 call_sid, mask_number(caller_id), profile_key)
                         open_call_row()
 
                     elif etype == "prompt":
@@ -2822,102 +3452,22 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             log.info("alias rewrite applied on turn %d (%s)",
                                      turn_state["n"], call_sid)
                         store_turn(turn_state["n"], "caller", text)
+                        opted_out = detect_opt_out(text)
+                        if opted_out:
+                            # A request the business has to honour, and the
+                            # bridge cannot: it is recorded against the call so
+                            # the owner sees it. Nothing else about the call
+                            # changes — the caller still gets their answer.
+                            record_event("warning", "opt_out",
+                                         f"caller asked to be taken off the list "
+                                         f"({opted_out!r})", call_sid, profile_key)
+                        if not within_budget():
+                            await refuse_over_budget(profile_number(
+                                profile, "caller_turn_budget_per_hour"))
+                            break
 
-                        async def respond(hist_snapshot: list,
-                                          my_turn: int = turn_state["n"]) -> None:
-                            metrics: dict = {}
-                            try:
-                                reply, found = await stream_reply(
-                                    ws, hist_snapshot, http, system_prompt, model, brain,
-                                    turn_state=turn_state, my_turn=my_turn,
-                                    metrics=metrics,
-                                )
-                                if turn_state["n"] != my_turn:
-                                    # the caller spoke again while this task was
-                                    # past its last await — appending now would
-                                    # order the history [user1, user2, assistant1]
-                                    log.info("reply from turn %d discarded, the caller "
-                                             "moved on (%s)", my_turn, call_sid)
-                                    return
-                                history.append({"role": "assistant", "content": reply})
-                                # Counts here too: the agent's words quote the
-                                # caller's back often enough that logging them
-                                # would put the caller in the journal anyway.
-                                log.info("agent turn %d (%s): %d characters, "
-                                         "first token in %s ms", my_turn, call_sid,
-                                         len(reply), metrics.get("ttft_ms", "?"))
-                                store_turn(my_turn, "agent", reply,
-                                           ttft_ms=metrics.get("ttft_ms"))
-                                overpromises = detect_overpromise(reply)
-                                if overpromises:
-                                    overpromise_terms.extend(overpromises)
-                                    log.warning(
-                                        "OVERPROMISE language in reply (%s): %s — flagged for review",
-                                        call_sid, ", ".join(overpromises),
-                                    )
-                                if loose_marker_spoken(reply):
-                                    log.warning(
-                                        "whitespace-variant control marker SPOKEN aloud "
-                                        "on turn %d (%s) — the reply is in the call store",
-                                        my_turn, call_sid,
-                                    )
-                                caller_texts = [m["content"] for m in hist_snapshot
-                                                if m["role"] == "user"]
-                                decision, reason = decide_call_action(
-                                    reply, found, caller_texts, gates
-                                )
-                                if decision is None and found:
-                                    log.warning(
-                                        "marker %s BLOCKED reason=%s (%s) on turn %d — "
-                                        "the caller's last turn was %d characters",
-                                        "/".join(sorted(found)), reason, call_sid, my_turn,
-                                        len(caller_texts[-1]) if caller_texts else 0,
-                                    )
-                                    call_row["reason"] = (call_row["reason"]
-                                                          or f"blocked:{reason}")
-                                    if reason == "no-caller-request" and "transfer" in found:
-                                        # the model already SAID "connecting you" —
-                                        # recover the false promise out loud, naming
-                                        # this profile's ACTUAL phrase (BLIND-2)
-                                        await speak(CORRECTIVE_TRANSFER.format(
-                                            owner_name=profile["owner_name"],
-                                            hint=gates.transfer_hint))
-                                    elif reason == "transfer-unavailable":
-                                        # whether or not the caller asked, the model
-                                        # promised a transfer this line can't do —
-                                        # correct it out loud (BLIND-3)
-                                        await speak(CORRECTIVE_NO_TRANSFER.format(
-                                            owner_name=profile["owner_name"]))
-                                elif decision:
-                                    # Let the last sentence play out, then act. A new
-                                    # caller prompt cancels this task — and if one
-                                    # slips in during the wait, the turn counter
-                                    # aborts the action (EDGE-15).
-                                    await asyncio.sleep(speech_seconds(reply))
-                                    if turn_state["n"] != my_turn:
-                                        log.info("call moved on during speech-wait — "
-                                                 "%s aborted (%s)", decision, call_sid)
-                                        return
-                                    log.info("atlas %s the call (%s)",
-                                             "is transferring" if decision == "transfer" else "ended",
-                                             call_sid)
-                                    call_row["decision"] = decision
-                                    call_row["reason"] = decision
-                                    await ws.send_json({
-                                        "type": "end",
-                                        "handoffData": json.dumps({"reason": decision}),
-                                    })
-                            except asyncio.CancelledError:
-                                log.info("reply interrupted by caller (%s)", call_sid)
-                                raise
-                            except Exception:
-                                log.exception("model reply FAILED (%s) — speaking error line", call_sid)
-                                try:
-                                    await ws.send_json({"type": "text", "token": spoken_error, "last": True})
-                                except Exception:
-                                    log.exception("could not even deliver the spoken error (%s)", call_sid)
-
-                        reply_task = asyncio.create_task(respond(list(history)))
+                        reply_task = asyncio.create_task(
+                            respond(list(history), turn_state["n"], http))
 
                     elif etype == "interrupt":
                         if reply_task and not reply_task.done():
@@ -2946,13 +3496,26 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             # bug M-2 closed.
                             if reply_task and not reply_task.done():
                                 reply_task.cancel()
-                            history.append({"role": "user", "content": f"[keypress: {digit}]"})
+                            # Masked before it is written down ANYWHERE: the
+                            # history the model sees, the stored turn, the pad
+                            # and the summarizer all get the same two dots and
+                            # the last two digits. The raw keypresses exist
+                            # only for as long as this branch runs.
+                            keyed = f"[keypress: {mask_digits(digit)}]"
+                            history.append({"role": "user", "content": keyed})
                             del history[:-MAX_HISTORY_TURNS * 2]
                             turn_state["n"] += 1
-                            # The digits themselves belong in the store, where
-                            # retention and delete_caller can reach them — a
-                            # card number in journald can never be taken back.
-                            store_turn(turn_state["n"], "keypress", f"[keypress: {digit}]")
+                            store_turn(turn_state["n"], "keypress", keyed)
+                            if not within_budget():
+                                await refuse_over_budget(profile_number(
+                                    profile, "caller_turn_budget_per_hour"))
+                                break
+                            # There is no menu on this line, so a caller who
+                            # presses keys and hears nothing back assumes the
+                            # line is dead. Answer the keypress like any other
+                            # turn and say so.
+                            reply_task = asyncio.create_task(
+                                respond(list(history), turn_state["n"], http))
 
                     elif etype == "error":
                         # Twilio's own words, not the caller's — but scrubbed
@@ -2978,6 +3541,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                     continue
 
         finally:
+            watchdog_task.cancel()
             if reply_task and not reply_task.done():
                 reply_task.cancel()
             log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
@@ -2985,17 +3549,20 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
             try:
                 if any(m["role"] == "user" for m in history):
                     try:
-                        # shield + its own session: a shutdown (or any cancel of
-                        # this handler) must not take the delivery with it.
-                        # CancelledError is a BaseException, so it would otherwise
-                        # walk straight past the handler below with the caller's
-                        # message lost and nothing recorded.
-                        delivery = await asyncio.shield(deliver_after_call(
-                            call_sid=call_sid, caller_id=caller_id,
-                            profile=profile, profile_key=profile_key, history=history,
-                            model=model, brain=brain,
-                            overpromise_terms=overpromise_terms,
-                        ))
+                        # A task of its own, in a set the shutdown can find, on
+                        # a session of its own, awaited under a shield: a
+                        # shutdown (or any cancel of this handler) must not take
+                        # the delivery with it. CancelledError is a
+                        # BaseException, so it would otherwise walk straight
+                        # past the handler below with the caller's message lost
+                        # and nothing recorded.
+                        delivery = await asyncio.shield(start_delivery(
+                            deliver_after_call(
+                                call_sid=call_sid, caller_id=caller_id,
+                                profile=profile, profile_key=profile_key,
+                                history=history, model=model, brain=brain,
+                                overpromise_terms=overpromise_terms,
+                            )))
                     except Exception as e:
                         log.exception(
                             "message delivery FAILED (%s) — the transcript is in the "
@@ -3026,6 +3593,49 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                 # completes even while the cancellation is unwinding.
                 close_call_row(delivery)
     return ws
+
+
+# ------------------------------------------------------------- retention --
+# Transcripts are kept for as long as the business says and not a day longer.
+# The first sweep waits a minute so a bridge that has just been restarted is
+# answering calls before it starts deleting anything.
+RETENTION_FIRST_RUN_SECONDS = 60
+RETENTION_INTERVAL_SECONDS = 24 * 3600
+
+
+def purge_all_profiles() -> dict:
+    """Age out every business's words past its own retention_days.
+
+    Returns {profile_key: turns removed}. A profile whose purge failed is
+    missing from that mapping and has an `events` row saying why — a retention
+    promise that silently stopped being kept is a promise broken twice.
+    """
+    store = STORE
+    if store is None:
+        return {}
+    removed: dict = {}
+    for key, profile in list(PROFILES.items()):
+        try:
+            # Inside the try on purpose: a retention_days nobody can read is
+            # one profile's problem, not a reason to stop purging the others.
+            days = profile_number(profile, "retention_days")
+            removed[key] = int(store.purge_expired(key, days))
+        except Exception as e:
+            log.exception("retention purge FAILED for profile %s", key)
+            record_event("error", "retention_failed",
+                         f"{type(e).__name__}: {e}", None, key)
+    if removed:
+        log.info("retention sweep: %s", ", ".join(
+            f"{key} {count} turn(s) removed" for key, count in removed.items()))
+    return removed
+
+
+async def retention_task() -> None:
+    """Run the purge a minute after boot and every day after that."""
+    await asyncio.sleep(RETENTION_FIRST_RUN_SECONDS)
+    while True:
+        purge_all_profiles()
+        await asyncio.sleep(RETENTION_INTERVAL_SECONDS)
 
 
 def public_health() -> tuple[int, dict]:
@@ -3065,6 +3675,15 @@ async def health_snapshot() -> tuple[dict, bool]:
                 model_ok = resp.status == 200
                 if not model_ok:
                     probe_error = f"HTTP {resp.status}"
+            if model_ok:
+                # Whether this backend can report token usage is settled here,
+                # once per brain, and never in the middle of a live call.
+                try:
+                    probe_error = await probe_stream_options(http, brain) or probe_error
+                except Exception as e:
+                    log.warning("brain %s usage probe could not run (%s: %s) — "
+                                "it will be asked again at the next health check",
+                                brain.key, type(e).__name__, e)
     except Exception as e:
         # "UNREACHABLE" with the reason thrown away leaves the operator
         # guessing between an expired key, DNS, a timeout and TLS (M-7).
@@ -3110,7 +3729,9 @@ async def _serve() -> None:
     # default access log would write the WS_TOKEN query param into journald.
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", BRIDGE_PORT).start()
+    site = web.TCPSite(runner, "127.0.0.1", BRIDGE_PORT)
+    await site.start()
+    track_server(runner, site)
     log.info("atlas-phone-bridge listening on 127.0.0.1:%d (public: %s)",
              BRIDGE_PORT, PUBLIC_BASE)
 
@@ -3132,12 +3753,35 @@ async def _serve() -> None:
         )
         admin_runner = web.AppRunner(admin_app, access_log=None)
         await admin_runner.setup()
-        await web.TCPSite(admin_runner, "127.0.0.1", ADMIN_PORT).start()
+        admin_site = web.TCPSite(admin_runner, "127.0.0.1", ADMIN_PORT)
+        await admin_site.start()
+        track_server(admin_runner, admin_site)
         log.info("admin dashboard on 127.0.0.1:%d — expose it tailnet-only "
                  "(tailscale serve), NEVER on the public funnel path", ADMIN_PORT)
     else:
         log.info("admin dashboard: off (ADMIN_TOKEN unset)")
-    await asyncio.Event().wait()
+
+    housekeeping = asyncio.create_task(retention_task())
+    # systemd stops this unit with SIGTERM and a terminal with SIGINT. Both mean
+    # the same thing here: finish what is in flight, then go.
+    stop = asyncio.Event()
+    stopped_by = ""
+
+    def _stop(name: str) -> None:
+        nonlocal stopped_by
+        stopped_by = name
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _stop, sig.name)
+        except NotImplementedError:      # not a unix event loop
+            log.warning("this platform cannot catch %s — a stop will not wait "
+                        "for messages still being delivered", sig.name)
+    await stop.wait()
+    housekeeping.cancel()
+    await shutdown(stopped_by or "stop requested")
 
 
 USAGE = (
