@@ -196,15 +196,18 @@ panel on `127.0.0.1:ADMIN_PORT` (default 8891) — expose it to the owner
 http://127.0.0.1:8891`), never on the public path Twilio uses. It edits
 the number→business mapping and every profile field (greeting, services,
 facts, extra prompt instructions, forward number), picks the active brain
-when more than one is defined, shows the exact live prompt per business, and
-tails the message pad and call transcripts.
+when more than one is defined, shows the exact live prompt per business,
+tails the message pad, and lists the last ten real calls from the call store
+with their transcripts (test calls excluded, caller numbers masked).
 Saves go through the same fail-closed validation as boot — a bad edit is
 rejected with the reason and changes nothing — and good saves hot-apply
 with no restart; in-flight calls keep the settings they started with.
 
 ## Operating
 
-- Every call is transcribed in `journalctl --user -u atlas-phone-bridge`.
+- Every call is transcribed into the call store (`calls.db`) and read from
+  the owner dashboard. The journal carries CallSid, turn numbers and
+  character counts only — never what anyone said (audit H-7).
 - Ask Atlas "is the phone line up?" — that's the `phone_line_status` tool in
   this plugin (override the probe URL with `ATLAS_PHONE_HEALTH_URL`; loopback
   only).

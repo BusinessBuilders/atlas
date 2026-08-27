@@ -784,6 +784,7 @@ async def test_duplicate_numbers_in_the_dashboard_are_refused(tmp_path, monkeypa
         emit_business_toml=svc.emit_business_toml,
         messages_file=str(tmp_path / "messages.md"),
         known_keys=svc._PROFILE_KNOWN_KEYS,
+        store=svc.STORE,
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -893,6 +894,7 @@ async def _drive_admin_save(svc, tmp_path, form: dict) -> str:
         emit_business_toml=svc.emit_business_toml,
         messages_file=str(tmp_path / "messages.md"),
         known_keys=svc._PROFILE_KNOWN_KEYS,
+        store=svc.STORE,
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

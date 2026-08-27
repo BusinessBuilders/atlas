@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import html
-import subprocess
+import time
 
 from aiohttp import web
 
@@ -73,9 +73,66 @@ def _login_page(error: str = "") -> web.Response:
     )
 
 
+def _mask_number(number: str) -> str:
+    """Enough of a caller's number to recognise the call, not enough to read a
+    stranger's number off a screen someone is standing behind. The full number
+    is on the message pad, where the owner already keeps it."""
+    text = str(number or "").strip()
+    if not text:
+        return "unknown"
+    if len(text) <= 6:
+        return text
+    return text[:2] + "\u2022" * (len(text) - 6) + text[-4:]
+
+
+def _duration(seconds) -> str:
+    if seconds is None:
+        return "duration unknown"
+    seconds = int(seconds)
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+_TURN_SPEAKER = {"caller": "Caller", "agent": "Atlas", "keypress": "Keypad"}
+
+
+def _recent_calls(store, profile_keys) -> str:
+    """The last ten real calls, read from the CALL STORE.
+
+    This panel used to grep journald for two log formats the bridge stopped
+    writing when transcripts moved into the store — so it printed "(no calls
+    in the recent journal)" on a line that was answering calls all day. A
+    dashboard that says "nothing happened" when things happened is worse than
+    one that says nothing at all.
+    """
+    calls = store.list_calls(profile_keys, include_test=False, limit=10)
+    if not calls:
+        return "No calls recorded yet."
+    status_of = {m["call_sid"]: m["status"]
+                 for m in store.list_messages(profile_keys)}
+    blocks = []
+    for call in calls:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(call["started_at"]))
+        message = status_of.get(call["call_sid"])
+        lines = [
+            f"{when}  {_mask_number(call['from_number'])}  "
+            f"{_duration(call['duration_s'])}  {call['outcome'] or 'in progress'}  "
+            f"message: {message or 'none'}"
+        ]
+        detail = store.get_call(call["call_sid"])
+        turns = detail["turns"] if detail else []
+        for turn in turns:
+            speaker = _TURN_SPEAKER.get(turn["role"], turn["role"])
+            lines.append(f"  {speaker}: {turn['text']}")
+        if not turns:
+            lines.append("  (no transcript kept)")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def build_admin_app(
     *, token: str, health_snapshot, get_state, get_brains, get_prompts,
     apply_config_text, emit_business_toml, messages_file: str, known_keys: tuple,
+    store,
 ) -> web.Application:
 
     def authed(request: web.Request) -> bool:
@@ -182,22 +239,7 @@ def build_admin_app(
         except FileNotFoundError:
             pad = "(no messages yet)"
 
-        def _journal() -> str:
-            try:
-                out = subprocess.run(
-                    ["journalctl", "--user", "-u", "atlas-phone-bridge",
-                     "-n", "400", "--no-pager", "-o", "cat"],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout
-            except Exception as e:
-                return f"(could not read journal: {e})"
-            keep = [l for l in out.splitlines()
-                    if any(t in l for t in ("caller (", "atlas (", "incoming call",
-                                            "ended the call", "is transferring",
-                                            "action callback"))]
-            return "\n".join(keep[-40:]) or "(no calls in the recent journal)"
-
-        transcript = await asyncio.to_thread(_journal)
+        transcript = await asyncio.to_thread(_recent_calls, store, sorted(profiles))
 
         body = (
             "<h1>Atlas Phone Agent <small>owner dashboard</small></h1>"

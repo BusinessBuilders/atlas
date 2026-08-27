@@ -22,7 +22,7 @@ import json
 import logging
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -405,27 +405,48 @@ def test_log_notify_records_both_outcomes(store):
 
 # ------------------------------------------------------------------ stats --
 
+def _local_noon() -> float:
+    """Midday today, local time. Seeding "60 seconds ago" makes a test that
+    fails for the two minutes after midnight — from noon, "an hour either way"
+    is still the same day everywhere."""
+    return datetime.now().astimezone().replace(
+        hour=12, minute=0, second=0, microsecond=0).timestamp()
+
+
 def test_stats_counts_today_and_the_window(store):
-    now = time.time()
-    _add_call(store, call_sid="CAtoday1", started=now - 60)
-    _add_call(store, call_sid="CAtoday2", started=now - 120, outcome="no_info_given")
-    _add_call(store, call_sid="CAyesterday", started=now - 1 * DAY)
-    _add_call(store, call_sid="CAlastmonth", started=now - 40 * DAY)
-    _add_call(store, call_sid="CAtest_today", started=now - 60, frm="+15550001234",
+    noon = _local_noon()
+    _add_call(store, call_sid="CAtoday1", started=noon - 60)
+    _add_call(store, call_sid="CAtoday2", started=noon - 120, outcome="no_info_given")
+    _add_call(store, call_sid="CAyesterday", started=noon - 1 * DAY)
+    _add_call(store, call_sid="CAlastmonth", started=noon - 40 * DAY)
+    _add_call(store, call_sid="CAtest_today", started=noon - 60, frm="+15550001234",
               is_test=True)
     store.add_message("CAtoday1", "acme", "Dana", None, None, None, "note")
 
-    stats = store.stats(["acme"], days=7)
+    stats = store.stats(["acme"], days=7, now=noon)
     assert stats["calls_today"] == 2                 # the fixture call is not one
     assert stats["no_info_today"] == 1
     assert stats["messages_waiting"] == 1
     assert stats["avg_duration_s"] == pytest.approx(30.0)
     assert len(stats["per_day"]) == 7
-    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    today = datetime.fromtimestamp(noon).strftime("%Y-%m-%d")
     assert stats["per_day"][-1] == {"date": today, "calls": 2, "no_info": 1}
-    yesterday = (datetime.now().astimezone() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = datetime.fromtimestamp(noon - DAY).strftime("%Y-%m-%d")
     assert stats["per_day"][-2] == {"date": yesterday, "calls": 1, "no_info": 0}
     assert stats["per_day"][0]["calls"] == 0         # empty days are still days
+
+
+def test_stats_measures_today_from_the_moment_it_is_given(store):
+    """`now` is injectable so the window is a fact, not whatever the clock
+    happens to say when the suite runs."""
+    noon = _local_noon()
+    _add_call(store, call_sid="CAnoon", started=noon)
+
+    assert store.stats(["acme"], days=3, now=noon)["calls_today"] == 1
+    later = store.stats(["acme"], days=3, now=noon + 3 * DAY)
+    assert later["calls_today"] == 0                 # three days on, not today
+    assert [d["calls"] for d in later["per_day"]] == [0, 0, 0]
+    assert store.stats(["acme"], days=5, now=noon + 2 * DAY)["per_day"][2]["calls"] == 1
 
 
 def test_stats_on_an_empty_store(store):
@@ -664,21 +685,41 @@ async def test_a_transfer_is_recorded_as_the_outcome(tmp_path, monkeypatch):
         assert call["decision_reason"] == "transfer"
 
 
-async def test_a_no_message_call_is_recorded_as_no_info_given(tmp_path, monkeypatch):
+REAL_CALL_SID = "CA00000000000000000000000000000001"
+REAL_CALLER = "+17770001111"
+
+
+async def test_a_no_message_call_writes_no_message_row(tmp_path, monkeypatch):
+    """A call that left nothing to act on is not a message. A row here would
+    sit in the owner's list at "new" forever and inflate messages-waiting —
+    the note goes to the call's events instead, where the detail can show it.
+    (A real caller, not a +1555 fixture, so it reaches the dashboard numbers.)"""
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
         line.brain.note = "No message — caller asked what services are offered."
-        await run_call(line, [setup_frame(), prompt_frame("what do you do")])
+        await run_call(line, [setup_frame(REAL_CALL_SID, REAL_CALLER),
+                              prompt_frame("what do you do")],
+                       call_sid=REAL_CALL_SID)
         store = _store_of(line)
-        [call] = store.list_calls(["acme"], include_test=True)
+        [call] = store.list_calls(["acme"])
         assert call["outcome"] == "no_info_given"
-        [msg] = store.list_messages(["acme"], include_test=True)
-        assert msg["caller_name"] is None and msg["callback"] is None
-        assert msg["summary"].startswith("No message")
+        assert store.list_messages(["acme"]) == []
+
+        with _sql(store.path) as conn:
+            notes = [dict(r) for r in conn.execute(
+                "SELECT * FROM events WHERE kind = 'no_info_note'")]
+        assert len(notes) == 1
+        assert notes[0]["detail"].startswith("No message")
+        assert notes[0]["call_sid"] == REAL_CALL_SID
+        assert len(notes[0]["detail"]) <= line.svc.MAX_EVENT_DETAIL_CHARS
+
+        stats = store.stats(["acme"])
+        assert stats["messages_waiting"] == 0
+        assert stats["no_info_today"] == 1
 
 
 async def test_the_message_row_carries_what_the_summarizer_found(tmp_path, monkeypatch):
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
-        line.brain.note = ("Dana Whitfield\nCallback: +17770002222\n"
+        line.brain.note = ("Caller: Dana Whitfield\nCallback: +17770002222\n"
                            "dana@example.invalid\nNeeds a quote for a new roof.")
         await run_call(line, [setup_frame(), prompt_frame("i need a roof quote")])
         [msg] = _store_of(line).list_messages(["acme"], include_test=True)
@@ -750,13 +791,41 @@ async def test_repeated_events_collapse_in_the_ring_but_not_in_the_store(tmp_pat
         assert svc.RECENT_EVENTS[-1]["kind"] == "pad_write_failed"
 
 
-async def test_the_data_dir_is_private(tmp_path, monkeypatch):
+async def test_the_data_dir_and_the_database_are_private(tmp_path, monkeypatch):
+    """The directory AND the file. sqlite creates its database with the
+    process umask — usually 0644 — so a transcript store that only chmods the
+    directory is still world-readable on a box with other accounts."""
     data_dir = tmp_path / "phone-data-perm"
     async with phone_line(tmp_path, monkeypatch, ntfy=False,
                           extra_env={"PHONE_DATA_DIR": str(data_dir)}) as line:
         assert line.svc.PHONE_DATA_DIR == str(data_dir)
-        assert (data_dir / "calls.db").exists()
         assert oct(data_dir.stat().st_mode & 0o777) == "0o700"
+        assert oct((data_dir / "calls.db").stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_loose_data_dir_is_tightened_at_boot(tmp_path, monkeypatch, caplog):
+    """A directory and database left readable by an earlier release (or made
+    by hand) are tightened on the NEXT boot, loudly — not only on the boot
+    that created them."""
+    from test_phone_agent_plugin import _import_service
+
+    data_dir = tmp_path / "loose-data"
+    data_dir.mkdir(mode=0o755)
+    db = data_dir / "calls.db"
+    seed = _load("callstore").CallStore(str(db))
+    seed.close()
+    db.chmod(0o644)
+    data_dir.chmod(0o755)
+
+    with caplog.at_level(logging.WARNING):
+        _import_service(tmp_path, monkeypatch,
+                        extra_env={"PHONE_DATA_DIR": str(data_dir)})
+
+    assert oct(data_dir.stat().st_mode & 0o777) == "0o700"
+    assert oct(db.stat().st_mode & 0o777) == "0o600"
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "tightened to 0700" in logged
+    assert "tightened to 0600" in logged
 
 
 def test_the_bridge_refuses_to_start_without_a_usable_data_dir(tmp_path, monkeypatch):
@@ -917,3 +986,229 @@ def test_migrate_pad_reports_entries_it_cannot_parse(migrate_pad, tmp_path, db_p
     out = capsys.readouterr().out
     assert rc == 1
     assert "unparseable (no CallSid): 1" in out
+
+
+# ============================================================================
+# What can be read out of a summarizer note — and what must NOT be guessed.
+# ============================================================================
+
+NOTE_CASES = [
+    (
+        "a labelled note gives every column",
+        "Caller: Dana Whitfield\nCallback: +17770002222\n"
+        "dana@example.invalid\nNeeds a quote for a new roof.",
+        {"caller_name": "Dana Whitfield", "callback": "+17770002222",
+         "email": "dana@example.invalid", "need": "Needs a quote for a new roof."},
+    ),
+    (
+        "labels in a different order are the same note",
+        "Needs: a roof quote\nName: Ray Iverson\nPhone: +17770003333",
+        {"caller_name": "Ray Iverson", "callback": "+17770003333",
+         "email": None, "need": "a roof quote"},
+    ),
+    (
+        "a bare line is a need, never a name",
+        "Wants pricing",
+        {"caller_name": None, "callback": None, "email": None, "need": "Wants pricing"},
+    ),
+    (
+        "a note that opens by saying what is missing",
+        "The caller did not give a name.\nWants a quote for a new roof.",
+        {"caller_name": None, "callback": None, "email": None,
+         "need": "Wants a quote for a new roof."},
+    ),
+    (
+        "when every line says what is missing, keep the last one",
+        "No callback number was given.\nThe caller did not leave a name.",
+        {"caller_name": None, "callback": None, "email": None,
+         "need": "The caller did not leave a name."},
+    ),
+    (
+        "an email is contact information all by itself",
+        "dana@example.invalid",
+        {"caller_name": None, "callback": None, "email": "dana@example.invalid",
+         "need": None},
+    ),
+    (
+        "a name stated in words",
+        "The caller's name is Ray Iverson.\nWants a callback tomorrow morning.",
+        {"caller_name": "Ray Iverson", "callback": None, "email": None,
+         "need": "Wants a callback tomorrow morning."},
+    ),
+    (
+        "a bare number line is the callback",
+        "+17770002222\nNeeds someone to call back about a leak.",
+        {"caller_name": None, "callback": "+17770002222", "email": None,
+         "need": "Needs someone to call back about a leak."},
+    ),
+    (
+        "a No message note yields nothing",
+        "No message — caller asked what services are offered.",
+        {"caller_name": None, "callback": None, "email": None, "need": None},
+    ),
+    (
+        "an empty note yields nothing",
+        "",
+        {"caller_name": None, "callback": None, "email": None, "need": None},
+    ),
+    (
+        "the pad's caller-derived marker is not the message",
+        "> Caller-derived text.\nWants a quote",
+        {"caller_name": None, "callback": None, "email": None, "need": "Wants a quote"},
+    ),
+]
+
+
+@pytest.mark.parametrize("note, expected", [(c[1], c[2]) for c in NOTE_CASES],
+                         ids=[c[0] for c in NOTE_CASES])
+def test_parse_message_fields(tmp_path, monkeypatch, note, expected):
+    """Guessing a name out of an unlabelled first line put "Wants pricing" in
+    the column where the owner expects a person. A name now comes only from a
+    label or from the summarizer saying so in words."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    assert svc.parse_message_fields(note) == expected
+
+
+async def test_an_email_only_note_is_a_message_not_a_no_info_call(tmp_path, monkeypatch):
+    """An email address IS something to act on — that call must reach the
+    owner's message list, not the no-info pile."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.note = "dana@example.invalid"
+        await run_call(line, [setup_frame(), prompt_frame("email me a quote")])
+        store = _store_of(line)
+        [call] = store.list_calls(["acme"], include_test=True)
+        assert call["outcome"] == "message_taken"
+        [msg] = store.list_messages(["acme"], include_test=True)
+        assert msg["email"] == "dana@example.invalid"
+
+
+# ============================================================================
+# Nothing owner-facing may promise a transcript the journal no longer holds.
+# ============================================================================
+
+def test_the_pad_entry_does_not_send_the_owner_to_the_journal(tmp_path, monkeypatch):
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    entry = svc.format_message_entry(
+        when="2026-08-27 09:15 EDT", business_name="Acme Co",
+        caller_id="+17770001111", note="Wants a quote", call_sid="CAtest_footer",
+        turns=3,
+    )
+    assert "journal" not in entry.lower()
+    assert "transcript in the dashboard" in entry
+    assert "CAtest_footer" in entry and "3 caller turns" in entry
+
+
+async def test_the_failure_note_does_not_send_the_owner_to_the_journal(tmp_path,
+                                                                       monkeypatch):
+    """That note is read three times over — on the pad, in the push, and in the
+    dashboard's message list — so it must name a place the transcript is."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        async def boom(*args, **kwargs):
+            raise RuntimeError("summarizer down")
+
+        monkeypatch.setattr(line.svc, "summarize_call", boom)
+        await run_call(line, [setup_frame(), prompt_frame("hello")], drain=False)
+
+        pad = line.pad.read_text(encoding="utf-8")
+        [msg] = _store_of(line).list_messages(["acme"], include_test=True)
+        push = line.ntfy.pushes[0]["body"]
+        for text in (pad, msg["summary"], push):
+            assert "MESSAGE EXTRACTION FAILED" in text
+            assert "journal" not in text.lower()
+        assert "in the dashboard" in msg["summary"]
+
+
+# ============================================================================
+# The dashboard's "Recent calls" panel — read from the store, not a log grep.
+# ============================================================================
+
+async def _admin_page(tmp_path, svc) -> str:
+    """Serve the real dashboard on loopback and fetch the real page."""
+    import aiohttp
+    from aiohttp import web
+
+    admin = _load("admin")
+
+    async def snapshot():
+        return {"bridge": "ok", "model_backend": "ok", "model": "m", "brain": "b",
+                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
+
+    app = admin.build_admin_app(
+        token="sesame", health_snapshot=snapshot,
+        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_brains=lambda: ({}, ""),
+        get_prompts=lambda: svc.SYSTEM_PROMPTS,
+        apply_config_text=svc.apply_config_text,
+        emit_business_toml=svc.emit_business_toml,
+        messages_file=str(tmp_path / "no-messages-yet.md"),
+        known_keys=svc._PROFILE_KNOWN_KEYS,
+        store=svc.STORE,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
+            async with session.get(f"http://127.0.0.1:{port}/") as resp:
+                return await resp.text()
+    finally:
+        await runner.cleanup()
+
+
+async def test_recent_calls_panel_shows_the_stored_call(tmp_path, monkeypatch):
+    """The panel used to grep journald for two log formats the bridge stopped
+    writing, so a line answering calls all day printed "(no calls in the
+    recent journal)" — a dashboard stating something false."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    store = svc.STORE
+    store.start_call(REAL_CALL_SID, "acme", REAL_CALLER, "+15550001111",
+                     "local_qwen", "test-model")
+    store.add_turn(REAL_CALL_SID, 1, "caller", "my sink is leaking")
+    store.add_turn(REAL_CALL_SID, 1, "agent", "I can take a message for Jo")
+    store.end_call(REAL_CALL_SID, "message_taken", "", 1, [])
+    store.add_message(REAL_CALL_SID, "acme", "Dana", REAL_CALLER, None,
+                      "leaking sink", "Dana\nleaking sink")
+
+    page = await _admin_page(tmp_path, svc)
+
+    assert "my sink is leaking" in page                  # the transcript is there
+    assert "I can take a message for Jo" in page
+    assert "Caller:" in page and "Atlas:" in page
+    assert "message_taken" in page and "message: new" in page
+    assert "journal" not in page.lower()                 # no stale promise
+    assert "No calls recorded yet." not in page
+    assert REAL_CALLER not in page                       # the number is masked
+    assert "1111" in page                                # …still recognisable
+
+
+async def test_recent_calls_panel_is_honest_when_there_are_no_calls(tmp_path,
+                                                                    monkeypatch):
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    page = await _admin_page(tmp_path, svc)
+    assert "No calls recorded yet." in page
+    assert "journal" not in page.lower()
+
+
+async def test_recent_calls_panel_hides_test_calls(tmp_path, monkeypatch):
+    """A demo call must not look like business on the owner's own screen."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    svc.STORE.start_call("CAtest_demo", "acme", "+15550001234", "+15550001111",
+                         "b", "m", is_test=True)
+    svc.STORE.add_turn("CAtest_demo", 1, "caller", "this is only a demo call")
+    svc.STORE.end_call("CAtest_demo", "message_taken", "", 1, [])
+
+    page = await _admin_page(tmp_path, svc)
+    assert "this is only a demo call" not in page
+    assert "No calls recorded yet." in page

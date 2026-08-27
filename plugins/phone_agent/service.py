@@ -133,6 +133,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import time
 import tomllib
@@ -330,15 +331,32 @@ ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8891").strip() or "8891")
 PHONE_DATA_DIR = os.environ.get("PHONE_DATA_DIR", "").strip() or os.path.expanduser(
     "~/.local/share/atlas-phone"
 )
+PHONE_DB_PATH = os.path.join(PHONE_DATA_DIR, "calls.db")
 try:
-    # 0700: the file holds what strangers said out loud to a business. Nobody
-    # else on the box needs to read it. makedirs' mode is masked by the umask,
-    # so it is set again explicitly on a directory we created.
-    fresh_dir = not os.path.isdir(PHONE_DATA_DIR)
+    # 0700 on the directory and 0600 on the database, EVERY boot — not only
+    # the boot that created them. This file holds what strangers said out loud
+    # to a business; makedirs' mode is masked by the umask, sqlite creates its
+    # file with the umask too, and a directory made by hand (or by an earlier
+    # release) is whatever it was. Tighten it and say so.
+    dir_existed = os.path.isdir(PHONE_DATA_DIR)
+    db_existed = os.path.exists(PHONE_DB_PATH)
     os.makedirs(PHONE_DATA_DIR, mode=0o700, exist_ok=True)
-    if fresh_dir:
+    dir_mode = stat.S_IMODE(os.stat(PHONE_DATA_DIR).st_mode)
+    if dir_mode != 0o700:
         os.chmod(PHONE_DATA_DIR, 0o700)
-    STORE = callstore.CallStore(os.path.join(PHONE_DATA_DIR, "calls.db"))
+        if dir_existed and dir_mode & 0o077:
+            # Not ours to begin with, and readable by others — that is a
+            # finding, not routine tightening of a directory we just made.
+            log.warning("call store directory %s was mode %o — tightened to 0700; it "
+                        "holds call transcripts and nobody else on this box needs to "
+                        "read them", PHONE_DATA_DIR, dir_mode)
+    STORE = callstore.CallStore(PHONE_DB_PATH)
+    db_mode = stat.S_IMODE(os.stat(PHONE_DB_PATH).st_mode)
+    if db_mode != 0o600:
+        os.chmod(PHONE_DB_PATH, 0o600)
+        if db_existed and db_mode & 0o077:
+            log.warning("call store %s was mode %o — tightened to 0600; it holds what "
+                        "callers said out loud", PHONE_DB_PATH, db_mode)
 except Exception as exc:
     log.error(
         "cannot open the call store in %s (%s: %s) — every call, message and "
@@ -347,7 +365,7 @@ except Exception as exc:
         PHONE_DATA_DIR, type(exc).__name__, exc,
     )
     sys.exit(1)
-log.info("call store: %s", os.path.join(PHONE_DATA_DIR, "calls.db"))
+log.info("call store: %s", PHONE_DB_PATH)
 
 
 def _store_write(what: str, call_sid, profile_key, /, *args, **kwargs):
@@ -1302,58 +1320,85 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # A line that is nothing but a phone number, in any shape a summarizer writes
 # one: E.164, spaced digits, dashes, or an area code in parentheses.
 _PHONE_LINE_RE = re.compile(r"^\+?[\d][\d\s().+-]{6,20}$")
-_NAME_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z.'\-]*(?: [A-Za-z][A-Za-z.'\-]*){0,3}$")
+# The only unlabelled way a name is taken: the summarizer saying so in words.
+_NAME_IS_RE = re.compile(r"\bname is\s+([^.,;:!?\n]{1,60})", re.IGNORECASE)
 _FIELD_LABELS = {
-    "caller_name": ("caller", "name", "caller name", "from"),
+    "caller_name": ("caller", "name", "caller name", "caller's name"),
     "callback": ("callback", "callback number", "best callback number", "phone",
                  "phone number", "number", "best number", "call back"),
     "email": ("email", "email address", "e-mail"),
     "need": ("need", "needs", "needed", "reason", "request", "regarding",
              "wants", "looking for", "about"),
 }
+# Lines that say what is MISSING. They are still part of the message, but they
+# are the last thing to show as "what they need" — a note whose first line is
+# "The caller did not give a name." needs its SECOND line in that column.
+_NEGATION_MARKERS = (
+    "did not give", "didn't give", "did not leave", "didn't leave",
+    "did not provide", "didn't provide", "not provided", "no name",
+    "no callback", "no number", "no message", "unknown",
+)
 NO_MESSAGE_PREFIX = "no message"
+
+
+def _is_negation(line: str) -> bool:
+    lowered = line.lower()
+    return any(marker in lowered for marker in _NEGATION_MARKERS)
 
 
 def parse_message_fields(note: str) -> dict:
     """Best-effort structure for a free-text note: name, callback, email, need.
 
     The summarizer writes 2-6 plain lines with no fixed shape, so this reads
-    only what is unambiguous — an explicit `Label: value`, an email address, a
-    line that is nothing but a phone number, and a short opening line that
-    looks like a person's name. Everything else becomes `need` (the first
-    sentence-shaped line). A "No message" note yields nothing, which is the
-    honest answer and the one that makes the call's outcome `no_info_given`.
+    only what is unambiguous:
+
+      * `Label: value` for any of the four fields;
+      * an email address anywhere;
+      * a line that is nothing but a phone number;
+      * a name ONLY when the note says so in words ("her name is Dana") or
+        gives it a label. A bare opening line is NOT a name — "Wants pricing"
+        is a need, and guessing it into the name column puts a sentence where
+        the owner expects a person.
+
+    `need` is the first line that is neither a labelled field nor a sentence
+    about what the caller did NOT give; when every line is one of those, it is
+    the last such line, because something is better than an empty column.
     """
     fields: dict = {"caller_name": None, "callback": None, "email": None, "need": None}
-    opening_line = True
+    free_lines: list[str] = []
     for raw in str(note or "").splitlines():
         line = raw.strip().lstrip("*-• ").strip()
         if not line or line.startswith(">"):
             continue
         if line.lower().startswith(NO_MESSAGE_PREFIX):
             continue
-        first = opening_line
-        opening_line = False
         label, _, value = line.partition(":")
-        value = value.strip()
         key = next((k for k, names in _FIELD_LABELS.items()
                     if label.strip().lower() in names), None)
-        if key and value:
-            fields[key] = fields[key] or value
+        if key:
+            # A label with nothing after it says nothing — and must not become
+            # the need line either.
+            if value.strip():
+                fields[key] = fields[key] or value.strip()
             continue
         found_email = _EMAIL_RE.search(line)
-        if found_email and not fields["email"]:
-            fields["email"] = found_email.group(0)
+        if found_email:
+            fields["email"] = fields["email"] or found_email.group(0)
             if _EMAIL_RE.fullmatch(line):
                 continue
         if _PHONE_LINE_RE.match(line):
             fields["callback"] = fields["callback"] or line
             continue
-        if first and _NAME_LINE_RE.match(line) and not fields["caller_name"]:
-            fields["caller_name"] = line
-            continue
-        if not fields["need"] and len(line.split()) > 2:
-            fields["need"] = line
+        if not _is_negation(line):
+            named = _NAME_IS_RE.search(line)
+            if named:
+                fields["caller_name"] = fields["caller_name"] or named.group(1).strip()
+                # "her name is Dana" is identity, not what she needs
+                continue
+        free_lines.append(line)
+    if free_lines:
+        plain = [line for line in free_lines if not _is_negation(line)]
+        fields["need"] = plain[0] if plain else free_lines[-1]
     return fields
 
 
@@ -1363,8 +1408,7 @@ def format_message_entry(*, when: str, business_name: str, caller_id: str,
         f"\n## {when} — {business_name} line — call from {caller_id}\n"
         f"{CALLER_DERIVED_PREFIX}\n"
         f"{note.strip()}\n"
-        f"*(CallSid {call_sid}, {turns} caller turns — full transcript in "
-        f"`journalctl --user -u atlas-phone-bridge`)*\n"
+        f"*(CallSid {call_sid}, {turns} caller turns — transcript in the dashboard)*\n"
     )
 
 
@@ -1438,23 +1482,36 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         record_event("error", "summarizer_failed", f"{type(e).__name__}: {e}",
                      call_sid, profile_key)
         summary_failed = True
-        note = ("MESSAGE EXTRACTION FAILED — read the full transcript in the journal "
-                f"(CallSid {call_sid}).")
+        note = ("MESSAGE EXTRACTION FAILED — the full transcript is saved on this "
+                f"call in the dashboard (CallSid {call_sid}).")
     # The structured columns come from the note as the summarizer wrote it; the
     # review banner below is ours, and belongs on the pad, not in the record.
     fields = {"caller_name": None, "callback": None, "email": None, "need": None}
     if not summary_failed:
         fields = parse_message_fields(note)
+    # An email address IS contact information: a caller who leaves only an
+    # address left something to act on.
     no_info = not summary_failed and (
         note.lstrip().lower().startswith(NO_MESSAGE_PREFIX)
-        or not any((fields["caller_name"], fields["callback"], fields["need"]))
+        or not any((fields["caller_name"], fields["callback"], fields["email"],
+                    fields["need"]))
     )
-    message_id = _store_write(
-        "add_message", call_sid, profile_key,
-        call_sid, profile_key, fields["caller_name"], fields["callback"],
-        fields["email"], fields["need"], note,
-        review_flag=bool(summary_failed or overpromise_terms),
-    )
+    if no_info:
+        # A call that left nothing to act on is not a message. A row here
+        # would sit in the owner's list at "new" forever and inflate the
+        # messages-waiting count — but the note is still worth keeping, so it
+        # goes to this call's events, where the call detail can show it.
+        message_id = None
+        _store_write("add_event", call_sid, profile_key,
+                     profile_key, call_sid, "info", "no_info_note",
+                     _scrub(note, MAX_EVENT_DETAIL_CHARS))
+    else:
+        message_id = _store_write(
+            "add_message", call_sid, profile_key,
+            call_sid, profile_key, fields["caller_name"], fields["callback"],
+            fields["email"], fields["need"], note,
+            review_flag=bool(summary_failed or overpromise_terms),
+        )
     result = {"ok": False, "message_id": message_id, "no_info": no_info}
 
     pad_note = note
@@ -2278,6 +2335,7 @@ async def _serve() -> None:
             emit_business_toml=emit_business_toml,
             messages_file=MESSAGES_FILE,
             known_keys=_PROFILE_KNOWN_KEYS,
+            store=STORE,
         )
         admin_runner = web.AppRunner(admin_app, access_log=None)
         await admin_runner.setup()

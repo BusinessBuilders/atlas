@@ -704,6 +704,7 @@ def test_admin_app_auth_and_save(tmp_path, monkeypatch):
         emit_business_toml=svc.emit_business_toml,
         messages_file=str(tmp_path / "messages.md"),
         known_keys=svc._PROFILE_KNOWN_KEYS,
+        store=svc.STORE,
     )
 
     async def drive():

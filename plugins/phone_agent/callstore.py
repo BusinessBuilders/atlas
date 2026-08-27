@@ -494,12 +494,18 @@ class CallStore:
 
     # ------------------------------------------------------------- stats --
 
-    def stats(self, profile_keys, days: int = 7) -> dict:
+    def stats(self, profile_keys, days: int = 7, *, now=None) -> dict:
         """The dashboard's numbers. Test calls are excluded everywhere here —
-        a demo call must never move a number the owner reads as business."""
+        a demo call must never move a number the owner reads as business.
+
+        `now` names the moment "today" is measured from (default: the clock).
+        Without it a test that seeds "60 seconds ago" fails for the two
+        minutes after local midnight, when that timestamp lands on yesterday.
+        """
         keys = [str(k) for k in profile_keys]
+        moment = time.time() if now is None else float(now)
         day_list = [
-            time.strftime("%Y-%m-%d", time.localtime(time.time() - i * DAY_SECONDS))
+            time.strftime("%Y-%m-%d", time.localtime(moment - i * DAY_SECONDS))
             for i in range(max(1, int(days)) - 1, -1, -1)
         ]
         per_day = {d: {"date": d, "calls": 0, "no_info": 0} for d in day_list}
