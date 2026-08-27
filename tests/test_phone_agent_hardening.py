@@ -844,3 +844,17 @@ async def test_the_owner_status_tool_reads_the_trimmed_health(tmp_path, monkeypa
         assert degraded["ok"] is True
         assert degraded["line"].startswith("DEGRADED")
         assert "model backend unreachable" in degraded["line"]
+
+
+async def test_a_failed_summary_still_writes_a_pad_entry_that_says_so(tmp_path, monkeypatch):
+    """The one promise the agent makes a caller is that the message gets
+    written down. A dead brain must not turn that into nothing."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.chat_status = 500
+        await run_call(line, [setup_frame(), prompt_frame("please call me back")])
+
+        pad = line.pad.read_text(encoding="utf-8")
+        assert "MESSAGE EXTRACTION FAILED" in pad
+        assert CALL_SID in pad
+        kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
+        assert "summarizer_failed" in kinds

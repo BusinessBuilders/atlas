@@ -1214,14 +1214,21 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
                                model: str, brain: Brain,
                                overpromise_terms: list | None = None) -> None:
     """Summarize the finished call onto the message pad (and push if ntfy is
-    configured). Any failure is logged at ERROR and a fallback entry is still
-    written — a message must never vanish silently."""
+    configured).
+
+    A message must never vanish silently, so every step degrades loudly rather
+    than dropping anything: a failed summary still writes a pad entry saying so,
+    a pad the process cannot write escalates to an urgent push plus a fallback
+    file, and a failed push degrades public_health() until one succeeds.
+    """
+    global NTFY_FAILURES
     caller_turns = sum(1 for m in history if m["role"] == "user")
     when = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
     try:
         note = await summarize_call(http, history, profile, caller_id, model, brain)
-    except Exception:
+    except Exception as e:
         log.exception("call summarizer FAILED (%s) — writing fallback pad entry", call_sid)
+        record_event("error", "summarizer_failed", f"{type(e).__name__}: {e}", call_sid)
         note = ("MESSAGE EXTRACTION FAILED — read the full transcript in the journal "
                 f"(CallSid {call_sid}).")
     if overpromise_terms:
@@ -1234,7 +1241,6 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         when=when, business_name=profile["business_name"], caller_id=caller_id,
         note=note, call_sid=call_sid, turns=caller_turns,
     )
-    global NTFY_FAILURES
     try:
         async with _pad_lock:
             new_pad = not os.path.exists(MESSAGES_FILE)
