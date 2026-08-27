@@ -760,15 +760,18 @@ def test_an_unknown_flag_does_not_quietly_start_the_bridge(tmp_path):
     assert "--chek" in done.stderr
 
 
+@pytest.mark.parametrize("args", [[], ["--check"]], ids=["boot", "check"])
 @pytest.mark.parametrize("body,expected", [
     (None, "does not exist"),
     ("[numbers\n", "not valid TOML"),
-])
-def test_a_config_that_cannot_be_read_stops_the_boot(tmp_path, body, expected):
+], ids=["missing", "unparseable"])
+def test_a_config_that_cannot_be_read_stops_the_boot(tmp_path, args, body, expected):
+    """A config that is missing or unreadable stops the process itself, with
+    the reason on stderr — at boot and under --check alike, one code path."""
     config = tmp_path / "businesses.toml"
     if body is not None:
         config.write_text(body, encoding="utf-8")
-    done = _run_service(["--check"], config, tmp_path)
+    done = _run_service(args, config, tmp_path)
     assert done.returncode == 1
     assert expected in done.stderr
 
