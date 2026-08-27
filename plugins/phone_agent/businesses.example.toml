@@ -2,6 +2,14 @@
 # ~/.config/atlas-phone/businesses.toml and replace every value with your own.
 # The service refuses to start until the real file exists and validates.
 
+# active_brain = "local_qwen"     # optional; names the [brains.*] section that
+#                                 # answers calls. REQUIRED as soon as any
+#                                 # [brains.*] section exists, and it must sit
+#                                 # here — above the first [table] header —
+#                                 # because TOML puts top-level keys first.
+#                                 # With no [brains] at all, the env vars
+#                                 # OLLAMA_URL + MODEL are the single brain.
+
 [numbers]
 # Map every live Twilio number (E.164) to a profile. Calls to unmapped
 # numbers get a spoken configuration error and an ERROR journal line.
@@ -31,3 +39,29 @@ greeting = "Hi, you've reached Acme Plumbing. How can I help you today?"
 # '''                             # agent takes a message instead.
 # model = "qwen2.5:7b-instruct"   # optional per-profile override; must be a
 #                                 # NON-thinking model (phone latency)
+
+# Brains — named model backends the owner switches between on the dashboard.
+# Uncomment these together with `active_brain` above. A switch applies the
+# moment the dashboard save validates; calls already in progress finish on the
+# brain they started with. Validation is fail-closed: a brain naming an env var
+# that is unset, or an extra_body that is not a JSON object, is rejected and
+# nothing changes.
+#
+# [brains.local_qwen]
+# label = "Local qwen (private, free)"     # optional; shown on the dashboard
+# base_url = "http://127.0.0.1:11434/v1"   # OpenAI-compatible base
+# model = "qwen2.5:7b-instruct"            # must be NON-thinking (see above)
+#
+# [brains.cloud]
+# label = "Cloud (smarter, metered)"
+# base_url = "https://api.example.com/v1"
+# model = "some-cloud-model"
+# api_key_env = "PHONE_CLOUD_API_KEY"      # optional; the NAME of the env var
+#                                          # in ~/.config/atlas-phone/env that
+#                                          # holds the bearer key — never the
+#                                          # key itself. Unset var = refused.
+# extra_body = '{"thinking": {"type": "disabled"}}'
+#                                          # optional JSON OBJECT merged into
+#                                          # every chat request, under the
+#                                          # call's own keys (a preset can
+#                                          # never override model/stream).

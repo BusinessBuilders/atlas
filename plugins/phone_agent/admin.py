@@ -74,8 +74,8 @@ def _login_page(error: str = "") -> web.Response:
 
 
 def build_admin_app(
-    *, token: str, health_snapshot, get_state, get_prompts, apply_config_text,
-    emit_business_toml, messages_file: str, known_keys: tuple,
+    *, token: str, health_snapshot, get_state, get_brains, get_prompts,
+    apply_config_text, emit_business_toml, messages_file: str, known_keys: tuple,
 ) -> web.Application:
 
     def authed(request: web.Request) -> bool:
@@ -124,16 +124,40 @@ def build_admin_app(
             "</div>"
         )
 
+    def _brain_card(brains: dict, active: str) -> str:
+        if list(brains) == ["default"]:
+            return ""  # env-only setup: nothing to switch between
+        rows = []
+        for brain in brains.values():
+            label = brain.label.strip() or brain.key
+            checked = " checked" if brain.key == active else ""
+            rows.append(
+                "<label style='display:flex;gap:10px;align-items:baseline;"
+                "font-size:14px;color:#e6e9ec;margin:8px 0'>"
+                f"<input type='radio' name='active_brain' value='{html.escape(brain.key)}'{checked}>"
+                f"<span><strong>{html.escape(label)}</strong><br>"
+                f"<span class='hint'>{html.escape(brain.model)} — "
+                f"{html.escape(brain.base_url)}</span></span></label>"
+            )
+        return (
+            "<h2>Brain</h2><div class='card'>"
+            + "".join(rows) +
+            "<div class='hint'>The model answering every call. Switching applies "
+            "instantly on save; calls in progress finish on the brain they "
+            "started with. Brain definitions live in businesses.toml.</div></div>"
+        )
+
     async def index(request: web.Request) -> web.Response:
         if not authed(request):
             return _login_page()
         numbers, profiles = get_state()
+        brains, active_brain = get_brains()
         status, model_ok = await health_snapshot()
 
         chips = (
             f"<span class='ok'>bridge ok</span>"
             f"<span class='{'ok' if model_ok else 'bad'}'>model {html.escape(status['model_backend'])}</span>"
-            f"<span>{html.escape(status['model'])}</span>"
+            f"<span>{html.escape(status.get('brain', ''))}: {html.escape(status['model'])}</span>"
             f"<span>{len(numbers)} number(s)</span>"
             f"<span>ntfy {status['ntfy']}</span>"
         )
@@ -179,6 +203,7 @@ def build_admin_app(
             "<h1>Atlas Phone Agent <small>owner dashboard</small></h1>"
             f"<div class='chips'>{chips}</div>{saved}"
             "<form method='post' action='/save'>"
+            + _brain_card(brains, active_brain) +
             "<h2>Numbers</h2><div class='card'>"
             "<label>One per line: +15551234567 = profile_name</label>"
             f"<textarea name='numbers_text'>{numbers_text}</textarea></div>"
@@ -205,6 +230,10 @@ def build_admin_app(
             return _login_page()
         form = await request.post()
         _, current_profiles = get_state()
+        brains, current_active = get_brains()
+        # a stale/blank radio falls back to the current brain; a bogus value
+        # is caught by the same validation that guards service startup
+        active_brain = str(form.get("active_brain", "")).strip() or current_active
 
         errors: list[str] = []
         numbers: dict = {}
@@ -247,7 +276,9 @@ def build_admin_app(
                 )
 
         if not errors:
-            errors = apply_config_text(emit_business_toml(numbers, profiles))
+            errors = apply_config_text(
+                emit_business_toml(numbers, profiles, brains, active_brain)
+            )
         if errors:
             listing = "\n".join("• " + e for e in errors)
             # re-render the index with the error banner on top

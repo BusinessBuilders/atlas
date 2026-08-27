@@ -92,10 +92,7 @@ the journal at ERROR.
 - To hang up, the model ends its goodbye with the literal `[END CALL]`; the
   bridge scrubs the marker from speech, lets the goodbye play, then sends
   Twilio's end-session message. A caller speaking during that window cancels
-  the hangup and the conversation continues. **The bridge has the last
-  word** — `honor_markers()` ignores (and WARN-logs) any marker glued to a
-  reply that asks the caller a question, because a small model will
-  eventually hang up mid-intake if only the prompt forbids it.
+  the hangup and the conversation continues.
 - Profiles with `forward_to = "+1..."` can **transfer the call** via
   Twilio's `<Connect action>` callback (`/voice/action`, signature-checked)
   answering `<Dial>` to the forward number — original caller ID shown,
@@ -117,6 +114,36 @@ the journal at ERROR.
   Design + review record: `docs/superpowers/specs/2026-07-26-phone-call-
   control-hardening-design.md`.
 
+## Brains — switching the model that answers
+
+A **brain** is a named model backend: a label, an OpenAI-compatible
+`base_url`, a `model`, an optional `api_key_env` (the NAME of the env var in
+`~/.config/atlas-phone/env` holding the bearer key — the key itself never
+goes in the TOML), and an optional `extra_body` JSON object merged into every
+chat request (that is where a cloud provider's explicit thinking kill-switch
+lives). They are `[brains.*]` sections in the same `businesses.toml`, and the
+top-level `active_brain` names the one answering calls.
+
+Define none and nothing changes: `OLLAMA_URL` + `MODEL` from the env file are
+the single implicit brain, exactly as before brains existed. Define some and
+the dashboard shows them as radio buttons; saving switches instantly with no
+restart, and **calls already in progress finish on the brain they started
+with** — the brain is captured once per call, never mid-conversation. A
+profile's own `model =` still wins over the brain's default model.
+
+Validation is fail-closed like everything else here, at boot and on every
+dashboard save: an `active_brain` naming a brain that does not exist, an
+`api_key_env` naming an env var that is unset or empty, or an `extra_body`
+that is not a JSON object is refused with a plain-English reason, and neither
+the file nor the live config changes. `extra_body` merges *under* the call's
+own keys, so a preset can never silently override `model`, `messages`, or
+`stream`. `/health` and the dashboard chips always probe the ACTIVE brain, so
+a bad switch shows up immediately instead of at the next call.
+
+**Privacy follows the brain**: on a local brain, caller text never leaves the
+machine; point `active_brain` at a hosted API and every caller turn is sent to
+that vendor. Example config: `businesses.example.toml`.
+
 ## Owner dashboard
 
 Set `ADMIN_TOKEN` in the env file and the bridge also serves a control
@@ -124,8 +151,9 @@ panel on `127.0.0.1:ADMIN_PORT` (default 8891) — expose it to the owner
 **tailnet-only** (e.g. `tailscale serve --bg --https=8447
 http://127.0.0.1:8891`), never on the public path Twilio uses. It edits
 the number→business mapping and every profile field (greeting, services,
-facts, extra prompt instructions, forward number), shows the exact live
-prompt per business, and tails the message pad and call transcripts.
+facts, extra prompt instructions, forward number), picks the active brain
+when more than one is defined, shows the exact live prompt per business, and
+tails the message pad and call transcripts.
 Saves go through the same fail-closed validation as boot — a bad edit is
 rejected with the reason and changes nothing — and good saves hot-apply
 with no restart; in-flight calls keep the settings they started with.

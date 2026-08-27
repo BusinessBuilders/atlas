@@ -691,6 +691,7 @@ def test_admin_app_auth_and_save(tmp_path, monkeypatch):
     app = admin.build_admin_app(
         token="sesame", health_snapshot=snapshot,
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_brains=lambda: ({}, ""),
         get_prompts=lambda: svc.SYSTEM_PROMPTS,
         apply_config_text=svc.apply_config_text,
         emit_business_toml=svc.emit_business_toml,

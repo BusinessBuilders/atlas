@@ -90,6 +90,27 @@ Business config (~/.config/atlas-phone/businesses.toml):
   '''                                       # Empty -> the standard set.
   end_phrases = "goodbye\\nthat's all"      # optional; same rule for hangups.
   model = "qwen2.5:7b-instruct"             # optional per-profile override
+
+Brains (optional, same businesses.toml): named model backends the owner can
+switch between on the dashboard — hot-applied like every other save; calls in
+progress keep the brain they started with.
+
+  active_brain = "local_qwen"               # required when [brains.*] exist
+
+  [brains.local_qwen]
+  label = "Local qwen (private, free)"      # optional; shown on the dashboard
+  base_url = "http://127.0.0.1:11434/v1"    # OpenAI-compatible base
+  model = "qwen2.5:7b-instruct"             # MUST be non-thinking (see above)
+  api_key_env = "ZAI_API_KEY"               # optional; NAME of the env var in
+                                            # the phone env file holding the
+                                            # bearer key — never the key itself
+  extra_body = '{"thinking": {"type": "disabled"}}'
+                                            # optional JSON object merged into
+                                            # every chat request (e.g. Z.AI's
+                                            # explicit thinking kill-switch)
+
+With no [brains] section the env vars OLLAMA_URL + MODEL act as the single
+implicit brain, exactly as before brains existed.
 """
 
 import asyncio
@@ -285,6 +306,7 @@ DEFAULT_END_PHRASES = [
     "bye now",
     "hang up",
     "that's all",
+    "that's it",
     "that'll be all",
     "that is all",
     "nothing else",
@@ -593,23 +615,128 @@ def parse_business_config(data: dict) -> tuple[dict, dict]:
     return numbers, profiles
 
 
-def load_business_config(path: str) -> tuple[dict, dict]:
-    """Boot path: parse and validate businesses.toml or refuse to start.
-    A phone agent with a half-valid business config must not answer calls."""
+def load_business_config(path: str) -> tuple[dict, dict, dict, str]:
+    """Read and validate businesses.toml. Returns
+    (numbers, profiles, brains, active_brain) and raises ValueError with a
+    human sentence on any problem. The boot path below turns that into a loud
+    exit: a phone agent with a half-valid business config must not answer
+    calls."""
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
     except FileNotFoundError:
-        log.error("business config %s does not exist — refusing to start", path)
-        sys.exit(1)
+        raise ValueError("does not exist")
     except tomllib.TOMLDecodeError as e:
-        log.error("business config %s is not valid TOML: %s — refusing to start", path, e)
-        sys.exit(1)
-    try:
-        return parse_business_config(data)
-    except ValueError as e:
-        log.error("business config %s: %s — refusing to start", path, e)
-        sys.exit(1)
+        raise ValueError(f"is not valid TOML: {e}")
+    numbers, profiles = parse_business_config(data)
+    brains, active = parse_brains_config(data)
+    return numbers, profiles, brains, active
+
+
+# --------------------------------------------------------------- brains ----
+# Named model backends ([brains.*] in businesses.toml) the owner can switch
+# between on the dashboard. Validated fail-closed exactly like profiles: a
+# broken brain config stops the service (boot) or rejects the save (dashboard)
+# instead of mis-answering a customer with the wrong or no model.
+
+_BRAIN_REQUIRED_KEYS = ("base_url", "model")
+_BRAIN_KNOWN_KEYS = ("label", "base_url", "model", "api_key_env", "extra_body")
+
+
+@dataclass
+class Brain:
+    """One named model backend. `key` is its name in businesses.toml;
+    `api_key_env` is the NAME of the env var holding the bearer key (never the
+    key itself — secrets stay out of TOML); `extra_body` is the parsed JSON
+    object merged into every chat request."""
+    key: str
+    label: str
+    base_url: str
+    model: str
+    api_key_env: str
+    extra_body: dict
+
+
+def parse_brains_config(data: dict) -> tuple[dict[str, Brain], str]:
+    """Validate [brains.*] + active_brain. Returns (brains, active_name);
+    raises ValueError with a human sentence on any problem. With no [brains]
+    section, returns the single implicit brain built from OLLAMA_URL/MODEL —
+    exact pre-brains behavior."""
+    brains = data.get("brains")
+    active = str(data.get("active_brain", "")).strip()
+    if brains is None:
+        if active:
+            raise ValueError(
+                f"active_brain = {active!r} is set but there is no [brains.{active}] section"
+            )
+        return {"default": Brain(key="default", label="env default", base_url=OLLAMA_URL,
+                                 model=DEFAULT_MODEL, api_key_env="", extra_body={})}, "default"
+    if not isinstance(brains, dict) or not brains:
+        raise ValueError("[brains] must contain at least one [brains.<name>] section")
+    if not active:
+        raise ValueError("active_brain = \"<name>\" is required when [brains.*] are defined")
+    if active not in brains:
+        raise ValueError(
+            f"active_brain = {active!r} does not match any defined brain "
+            f"({', '.join(sorted(brains))})"
+        )
+    parsed: dict[str, Brain] = {}
+    for name, brain in brains.items():
+        if not re.match(r"^[A-Za-z0-9_-]+$", str(name)):
+            raise ValueError(
+                f"brain name {name!r} must be letters/digits/underscores only"
+            )
+        if not isinstance(brain, dict):
+            raise ValueError(f"[brains.{name}] must be a table of settings")
+        missing = [k for k in _BRAIN_REQUIRED_KEYS if not str(brain.get(k, "")).strip()]
+        if missing:
+            raise ValueError(f"brain {name!r} is missing required keys {missing}")
+        fields = {k: str(brain.get(k, "")).strip() for k in _BRAIN_KNOWN_KEYS}
+        key_env = fields["api_key_env"]
+        if key_env:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key_env):
+                raise ValueError(
+                    f"brain {name!r} api_key_env {key_env!r} is not a valid env var NAME "
+                    "(it must name the variable, never contain the key itself)"
+                )
+            if not os.environ.get(key_env, "").strip():
+                raise ValueError(
+                    f"brain {name!r} needs the env var {key_env} set (and non-empty) in "
+                    "the phone env file — add it and restart, or pick another brain"
+                )
+        raw_extra = fields["extra_body"]
+        extra: dict = {}
+        if raw_extra:
+            try:
+                extra = json.loads(raw_extra)
+            except ValueError as e:
+                raise ValueError(f"brain {name!r} extra_body is not valid JSON: {e}")
+            if not isinstance(extra, dict):
+                raise ValueError(f"brain {name!r} extra_body must be a JSON object")
+        parsed[name] = Brain(
+            key=str(name), label=fields["label"], base_url=fields["base_url"].rstrip("/"),
+            model=fields["model"], api_key_env=key_env, extra_body=extra,
+        )
+    return parsed, active
+
+
+def brain_key(brain: Brain) -> str:
+    """Resolve a brain's bearer API key from the env var it names ('' = no
+    auth). Read fresh from the environment every time so a rotated key needs
+    only a restart of the unit, never a config edit."""
+    return os.environ.get(brain.api_key_env, "").strip() if brain.api_key_env else ""
+
+
+def brain_request_args(brain: Brain, body: dict) -> tuple[str, dict, dict]:
+    """(url, headers, merged_body) for one chat-completions call on a brain.
+    The brain's extra_body merges UNDER the call's own keys so a preset can
+    never silently override model/messages/stream."""
+    headers = {}
+    key = brain_key(brain)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    merged = {**brain.extra_body, **body}
+    return f"{brain.base_url}/chat/completions", headers, merged
 
 
 # Field order for the emitter; unknown keys a human hand-added are preserved
@@ -628,12 +755,34 @@ def _toml_str(value: str) -> str:
     ) + '"'
 
 
-def emit_business_toml(numbers: dict, profiles: dict) -> str:
+def emit_business_toml(numbers: dict, profiles: dict,
+                       brains: dict[str, Brain] | None = None,
+                       active_brain: str = "") -> str:
     """Serialize the config back to TOML (round-trips through tomllib).
-    Used by the dashboard; hand edits with unknown keys survive a save."""
-    lines = ["[numbers]"]
+    Used by the dashboard; hand edits with unknown keys survive a save.
+    Brains round-trip too — a dashboard save must never drop them. The
+    implicit env-default brain (no [brains] in the file) is NOT emitted."""
+    lines = []
+    emit_brains = dict(brains or {})
+    if list(emit_brains) == ["default"] and not emit_brains["default"].api_key_env \
+            and emit_brains["default"].label == "env default":
+        emit_brains = {}
+    if emit_brains:
+        # top-level keys must precede the first [table] header in TOML
+        lines.append(f"active_brain = {_toml_str(active_brain)}")
+        lines.append("")
+    lines.append("[numbers]")
     for number, key in numbers.items():
         lines.append(f"{_toml_str(number)} = {_toml_str(key)}")
+    for name, brain in emit_brains.items():
+        lines += ["", f"[brains.{name}]"]
+        for field in _BRAIN_KNOWN_KEYS:
+            if field == "extra_body":
+                value = json.dumps(brain.extra_body) if brain.extra_body else ""
+            else:
+                value = str(getattr(brain, field)).strip()
+            if value:
+                lines.append(f"{field} = {_toml_str(value)}")
     for key, profile in profiles.items():
         lines += ["", f"[profiles.{key}]"]
         for field in _PROFILE_KNOWN_KEYS:
@@ -676,7 +825,11 @@ def build_system_prompt(profile: dict) -> str:
     return prompt
 
 
-NUMBERS, PROFILES = load_business_config(BUSINESS_CONFIG)
+try:
+    NUMBERS, PROFILES, BRAINS, ACTIVE_BRAIN = load_business_config(BUSINESS_CONFIG)
+except ValueError as e:
+    log.error("business config %s: %s — refusing to start", BUSINESS_CONFIG, e)
+    sys.exit(1)
 
 # Per-profile system prompts + compiled call gates, built once at boot so a
 # template or phrase mistake fails startup, not a live call.
@@ -686,6 +839,11 @@ log.info(
     "%d business profile(s) loaded: %s (self-contained phone persona, no resident import)",
     len(PROFILES), ", ".join(sorted(PROFILES)),
 )
+log.info(
+    "active brain: %s (model %s at %s%s)", ACTIVE_BRAIN,
+    BRAINS[ACTIVE_BRAIN].model, BRAINS[ACTIVE_BRAIN].base_url,
+    ", authenticated" if brain_key(BRAINS[ACTIVE_BRAIN]) else "",
+)
 
 
 def apply_config_text(text: str) -> list[str]:
@@ -693,13 +851,14 @@ def apply_config_text(text: str) -> list[str]:
     swap the live state. Returns [] on success, else human-readable errors —
     and on any error neither the file nor the live config changes (calls in
     progress keep the profile they started with either way)."""
-    global NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES
+    global NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES, BRAINS, ACTIVE_BRAIN
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         return [f"not valid TOML: {e}"]
     try:
         numbers, profiles = parse_business_config(data)
+        brains, active = parse_brains_config(data)
         prompts = {k: build_system_prompt(p) for k, p in profiles.items()}
     except (ValueError, KeyError) as e:
         return [str(e)]
@@ -712,8 +871,10 @@ def apply_config_text(text: str) -> list[str]:
         f.write(text)
     os.replace(tmp, BUSINESS_CONFIG)
     NUMBERS, PROFILES, SYSTEM_PROMPTS, GATES = numbers, profiles, prompts, gates
-    log.info("config hot-applied from dashboard: %d profile(s), %d number(s)",
-             len(profiles), len(numbers))
+    BRAINS, ACTIVE_BRAIN = brains, active
+    log.info("config hot-applied from dashboard: %d profile(s), %d number(s), "
+             "active brain %s (model %s)",
+             len(profiles), len(numbers), active, brains[active].model)
     return []
 
 # ----------------------------------------------------- end-call scrubbing --
@@ -819,12 +980,13 @@ def format_message_entry(*, when: str, business_name: str, caller_id: str,
 
 
 async def summarize_call(http: aiohttp.ClientSession, history: list,
-                         profile: dict, caller_id: str, model: str) -> str:
+                         profile: dict, caller_id: str, model: str,
+                         brain: Brain) -> str:
     transcript = "\n".join(
         f"{'Caller' if m['role'] == 'user' else 'Receptionist'}: {m['content']}"
         for m in history
     )
-    body = {
+    url, headers, body = brain_request_args(brain, {
         "model": model,
         "messages": [
             {"role": "system", "content": SUMMARIZER_PROMPT.format(
@@ -836,9 +998,9 @@ async def summarize_call(http: aiohttp.ClientSession, history: list,
         ],
         "stream": False,
         "temperature": 0,
-    }
+    })
     async with http.post(
-        f"{OLLAMA_URL}/chat/completions", json=body,
+        url, json=body, headers=headers,
         timeout=aiohttp.ClientTimeout(total=SUMMARIZER_TIMEOUT_SECONDS),
     ) as resp:
         if resp.status != 200:
@@ -852,14 +1014,15 @@ async def summarize_call(http: aiohttp.ClientSession, history: list,
 
 async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
                                caller_id: str, profile: dict, history: list,
-                               model: str, overpromise_terms: list | None = None) -> None:
+                               model: str, brain: Brain,
+                               overpromise_terms: list | None = None) -> None:
     """Summarize the finished call onto the message pad (and push if ntfy is
     configured). Any failure is logged at ERROR and a fallback entry is still
     written — a message must never vanish silently."""
     caller_turns = sum(1 for m in history if m["role"] == "user")
     when = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z").strip()
     try:
-        note = await summarize_call(http, history, profile, caller_id, model)
+        note = await summarize_call(http, history, profile, caller_id, model, brain)
     except Exception:
         log.exception("call summarizer FAILED (%s) — writing fallback pad entry", call_sid)
         note = ("MESSAGE EXTRACTION FAILED — read the full transcript in the journal "
@@ -1039,17 +1202,18 @@ async def stream_reply(
     http: aiohttp.ClientSession,
     system_prompt: str,
     model: str,
+    brain: Brain,
 ) -> tuple[str, set]:
     """Stream one model reply to Twilio as ConversationRelay text tokens.
 
     Returns (spoken_text, markers_found). Raises on model failure. Control
     markers are scrubbed from the stream — the caller never hears them.
     """
-    body = {
+    url, headers, body = brain_request_args(brain, {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}] + history,
         "stream": True,
-    }
+    })
     scrubber = MarkerScrubber()
     spoken: list[str] = []
 
@@ -1059,7 +1223,7 @@ async def stream_reply(
             await ws.send_json({"type": "text", "token": text, "last": False})
 
     async with http.post(
-        f"{OLLAMA_URL}/chat/completions", json=body,
+        url, json=body, headers=headers,
         timeout=aiohttp.ClientTimeout(total=MODEL_TIMEOUT_SECONDS),
     ) as resp:
         if resp.status != 200:
@@ -1093,7 +1257,10 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
     profile = PROFILES[profile_key]
     system_prompt = SYSTEM_PROMPTS[profile_key]
     gates = GATES[profile_key]
-    model = str(profile.get("model", "")).strip() or DEFAULT_MODEL
+    # The brain is captured ONCE per call: a dashboard brain switch applies to
+    # the next call, never mid-conversation.
+    brain = BRAINS[ACTIVE_BRAIN]
+    model = str(profile.get("model", "")).strip() or brain.model
     spoken_error = SPOKEN_ERROR_TEMPLATE.format(owner_name=profile["owner_name"])
 
     ws = web.WebSocketResponse(heartbeat=30)
@@ -1150,7 +1317,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                                   my_turn: int = turn_state["n"]) -> None:
                     try:
                         reply, found = await stream_reply(
-                            ws, hist_snapshot, http, system_prompt, model
+                            ws, hist_snapshot, http, system_prompt, model, brain
                         )
                         history.append({"role": "assistant", "content": reply})
                         log.info("atlas (%s): %s", call_sid, reply)
@@ -1233,7 +1400,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
             try:
                 await deliver_call_message(
                     http, call_sid=call_sid, caller_id=caller_id,
-                    profile=profile, history=history, model=model,
+                    profile=profile, history=history, model=model, brain=brain,
                     overpromise_terms=overpromise_terms,
                 )
             except Exception:
@@ -1245,10 +1412,16 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
 
 
 async def health_snapshot() -> tuple[dict, bool]:
-    """Health facts shared by /health and the dashboard."""
+    """Health facts shared by /health and the dashboard — always for the
+    ACTIVE brain, so a broken brain switch is visible immediately."""
+    brain = BRAINS[ACTIVE_BRAIN]
+    headers = {}
+    key = brain_key(brain)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
         async with aiohttp.ClientSession() as http:
-            async with http.get(f"{OLLAMA_URL}/models",
+            async with http.get(f"{brain.base_url}/models", headers=headers,
                                 timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 model_ok = resp.status == 200
     except Exception:
@@ -1256,7 +1429,8 @@ async def health_snapshot() -> tuple[dict, bool]:
     body = {
         "bridge": "ok",
         "model_backend": "ok" if model_ok else "UNREACHABLE",
-        "model": DEFAULT_MODEL,
+        "brain": brain.key,
+        "model": brain.model,
         "profiles": sorted(PROFILES),
         "numbers": len(NUMBERS),
         "ntfy": "on" if NTFY_URL else "off",
@@ -1290,6 +1464,7 @@ async def _serve() -> None:
             token=ADMIN_TOKEN,
             health_snapshot=health_snapshot,
             get_state=lambda: (NUMBERS, PROFILES),
+            get_brains=lambda: (BRAINS, ACTIVE_BRAIN),
             get_prompts=lambda: SYSTEM_PROMPTS,
             apply_config_text=apply_config_text,
             emit_business_toml=emit_business_toml,
