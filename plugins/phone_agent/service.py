@@ -114,6 +114,7 @@ implicit brain, exactly as before brains existed.
 """
 
 import asyncio
+import collections
 import hashlib
 import hmac
 import json
@@ -121,6 +122,7 @@ import logging
 import os
 import re
 import sys
+import time
 import tomllib
 from base64 import b64encode
 from dataclasses import dataclass
@@ -130,8 +132,37 @@ from xml.sax.saxutils import escape as xml_escape
 import aiohttp
 from aiohttp import web
 
+# service.py is loaded both as a script (systemd) and by file path (tests), so
+# its own directory is not always on sys.path — put it there for the sibling
+# modules (wstoken here, admin at startup).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("atlas-phone")
+
+# ------------------------------------------------------------- event ring --
+# Operational events worth a human's attention, kept in memory so the owner
+# dashboard can show what went wrong on this line without anyone reading
+# journald. Nothing a caller SAID goes in here — CallSid, kind and counts only.
+RECENT_EVENTS: collections.deque = collections.deque(maxlen=200)
+
+
+def record_event(level: str, kind: str, detail: str, call_sid: str | None = None) -> None:
+    """Record one operational event AND log it at the matching level.
+
+    Both, always: the log line is what wakes an operator tonight, the ring is
+    what the dashboard shows tomorrow. A failure that only appends here would
+    be exactly the silent failure this pass exists to remove.
+    """
+    RECENT_EVENTS.append({
+        "ts": time.time(), "level": level, "kind": kind,
+        "detail": str(detail)[:300], "call_sid": call_sid,
+    })
+    emit = log.error if level == "error" else log.warning
+    emit("%s: %s (CallSid=%s)", kind, str(detail)[:300], call_sid or "-")
 
 # ---------------------------------------------------------------- config ---
 
@@ -172,10 +203,10 @@ MODEL_TIMEOUT_SECONDS = 45      # hard cap on one model reply
 # In-band control markers. The model ends its goodbye with END_CALL_MARKER to
 # hang up, or ends a connecting-you sentence with TRANSFER_MARKER to forward
 # the call (only offered when the profile configures forward_to). The scrubber
-# below guarantees markers are never spoken, and honor_markers() refuses to
-# act on a marker glued to a question — a small model once hung up mid-intake
-# ("what time works best for you? [END CALL]"), so the bridge, not the model,
-# has the last word.
+# below guarantees markers are never spoken, and decide_call_action() refuses
+# to act on a marker the caller never authorized — or on one glued to a
+# question: a small model once hung up mid-intake ("what time works best for
+# you? [END CALL]"), so the bridge, not the model, has the last word.
 END_CALL_MARKER = "[END CALL]"
 TRANSFER_MARKER = "[TRANSFER CALL]"
 
@@ -1277,137 +1308,148 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
         await ws.send_json({"type": "text", "token": text, "last": True})
 
     async with aiohttp.ClientSession() as http:
-        async for msg in ws:
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            event = json.loads(msg.data)
-            etype = event.get("type")
-
-            if etype == "setup":
-                call_sid = event.get("callSid", "?")
-                if event.get("accountSid") != ACCOUNT_SID:
-                    log.warning("relay setup with foreign accountSid — closing (CallSid=%s)", call_sid)
-                    await ws.close()
-                    break
-                caller_id = event.get("from") or "unknown"
-                # Real caller ID from the phone network — lets the agent
-                # confirm the callback number instead of transcribing it.
-                system_prompt = (
-                    system_prompt
-                    + f"\n\nTHIS CALL: the caller-ID number the caller is dialing from is {caller_id}."
-                )
-                log.info("relay session started CallSid=%s from=%s profile=%s",
-                         call_sid, caller_id, profile_key)
-
-            elif etype == "prompt":
-                text = (event.get("voicePrompt") or "").strip()
-                if not text:
+        try:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                log.info("caller (%s): %s", call_sid, text)
-                if reply_task and not reply_task.done():
-                    reply_task.cancel()
-                resolved = resolve_alias_mishearing(text, gates)
-                if resolved != text:
-                    log.info("alias rewrite (%s): %r -> %r", call_sid, text, resolved)
-                history.append({"role": "user", "content": resolved})
-                del history[:-MAX_HISTORY_TURNS * 2]
-                turn_state["n"] += 1
+                try:
+                    event = json.loads(msg.data)
+                    etype = event.get("type")
 
-                async def respond(hist_snapshot: list,
-                                  my_turn: int = turn_state["n"]) -> None:
-                    try:
-                        reply, found = await stream_reply(
-                            ws, hist_snapshot, http, system_prompt, model, brain
+                    if etype == "setup":
+                        call_sid = event.get("callSid", "?")
+                        if event.get("accountSid") != ACCOUNT_SID:
+                            log.warning("relay setup with foreign accountSid — closing (CallSid=%s)", call_sid)
+                            await ws.close()
+                            break
+                        caller_id = event.get("from") or "unknown"
+                        # Real caller ID from the phone network — lets the agent
+                        # confirm the callback number instead of transcribing it.
+                        system_prompt = (
+                            system_prompt
+                            + f"\n\nTHIS CALL: the caller-ID number the caller is dialing from is {caller_id}."
                         )
-                        history.append({"role": "assistant", "content": reply})
-                        log.info("atlas (%s): %s", call_sid, reply)
-                        overpromises = detect_overpromise(reply)
-                        if overpromises:
-                            overpromise_terms.extend(overpromises)
-                            log.warning(
-                                "OVERPROMISE language in reply (%s): %s — flagged for review",
-                                call_sid, ", ".join(overpromises),
-                            )
-                        if loose_marker_spoken(reply):
-                            log.warning(
-                                "whitespace-variant control marker SPOKEN aloud (%s): %r",
-                                call_sid, reply[-120:],
-                            )
-                        caller_texts = [m["content"] for m in hist_snapshot
-                                        if m["role"] == "user"]
-                        decision, reason = decide_call_action(
-                            reply, found, caller_texts, gates
-                        )
-                        if decision is None and found:
-                            log.warning(
-                                "marker %s BLOCKED reason=%s (%s) — last caller: %r",
-                                "/".join(sorted(found)), reason, call_sid,
-                                caller_texts[-1] if caller_texts else "",
-                            )
-                            if reason == "no-caller-request" and "transfer" in found:
-                                # the model already SAID "connecting you" —
-                                # recover the false promise out loud, naming
-                                # this profile's ACTUAL phrase (BLIND-2)
-                                await speak(CORRECTIVE_TRANSFER.format(
-                                    owner_name=profile["owner_name"],
-                                    hint=gates.transfer_hint))
-                            elif reason == "transfer-unavailable":
-                                # whether or not the caller asked, the model
-                                # promised a transfer this line can't do —
-                                # correct it out loud (BLIND-3)
-                                await speak(CORRECTIVE_NO_TRANSFER.format(
-                                    owner_name=profile["owner_name"]))
-                        elif decision:
-                            # Let the last sentence play out, then act. A new
-                            # caller prompt cancels this task — and if one
-                            # slips in during the wait, the turn counter
-                            # aborts the action (EDGE-15).
-                            await asyncio.sleep(speech_seconds(reply))
-                            if turn_state["n"] != my_turn:
-                                log.info("call moved on during speech-wait — "
-                                         "%s aborted (%s)", decision, call_sid)
-                                return
-                            log.info("atlas %s the call (%s)",
-                                     "is transferring" if decision == "transfer" else "ended",
-                                     call_sid)
-                            await ws.send_json({
-                                "type": "end",
-                                "handoffData": json.dumps({"reason": decision}),
-                            })
-                    except asyncio.CancelledError:
-                        log.info("reply interrupted by caller (%s)", call_sid)
-                        raise
-                    except Exception:
-                        log.exception("model reply FAILED (%s) — speaking error line", call_sid)
-                        try:
-                            await ws.send_json({"type": "text", "token": spoken_error, "last": True})
-                        except Exception:
-                            log.exception("could not even deliver the spoken error (%s)", call_sid)
+                        log.info("relay session started CallSid=%s from=%s profile=%s",
+                                 call_sid, caller_id, profile_key)
 
-                reply_task = asyncio.create_task(respond(list(history)))
+                    elif etype == "prompt":
+                        text = (event.get("voicePrompt") or "").strip()
+                        if not text:
+                            continue
+                        log.info("caller (%s): %s", call_sid, text)
+                        if reply_task and not reply_task.done():
+                            reply_task.cancel()
+                        resolved = resolve_alias_mishearing(text, gates)
+                        if resolved != text:
+                            log.info("alias rewrite (%s): %r -> %r", call_sid, text, resolved)
+                        history.append({"role": "user", "content": resolved})
+                        del history[:-MAX_HISTORY_TURNS * 2]
+                        turn_state["n"] += 1
 
-            elif etype == "interrupt":
-                if reply_task and not reply_task.done():
-                    reply_task.cancel()
+                        async def respond(hist_snapshot: list,
+                                          my_turn: int = turn_state["n"]) -> None:
+                            try:
+                                reply, found = await stream_reply(
+                                    ws, hist_snapshot, http, system_prompt, model, brain
+                                )
+                                history.append({"role": "assistant", "content": reply})
+                                log.info("atlas (%s): %s", call_sid, reply)
+                                overpromises = detect_overpromise(reply)
+                                if overpromises:
+                                    overpromise_terms.extend(overpromises)
+                                    log.warning(
+                                        "OVERPROMISE language in reply (%s): %s — flagged for review",
+                                        call_sid, ", ".join(overpromises),
+                                    )
+                                if loose_marker_spoken(reply):
+                                    log.warning(
+                                        "whitespace-variant control marker SPOKEN aloud (%s): %r",
+                                        call_sid, reply[-120:],
+                                    )
+                                caller_texts = [m["content"] for m in hist_snapshot
+                                                if m["role"] == "user"]
+                                decision, reason = decide_call_action(
+                                    reply, found, caller_texts, gates
+                                )
+                                if decision is None and found:
+                                    log.warning(
+                                        "marker %s BLOCKED reason=%s (%s) — last caller: %r",
+                                        "/".join(sorted(found)), reason, call_sid,
+                                        caller_texts[-1] if caller_texts else "",
+                                    )
+                                    if reason == "no-caller-request" and "transfer" in found:
+                                        # the model already SAID "connecting you" —
+                                        # recover the false promise out loud, naming
+                                        # this profile's ACTUAL phrase (BLIND-2)
+                                        await speak(CORRECTIVE_TRANSFER.format(
+                                            owner_name=profile["owner_name"],
+                                            hint=gates.transfer_hint))
+                                    elif reason == "transfer-unavailable":
+                                        # whether or not the caller asked, the model
+                                        # promised a transfer this line can't do —
+                                        # correct it out loud (BLIND-3)
+                                        await speak(CORRECTIVE_NO_TRANSFER.format(
+                                            owner_name=profile["owner_name"]))
+                                elif decision:
+                                    # Let the last sentence play out, then act. A new
+                                    # caller prompt cancels this task — and if one
+                                    # slips in during the wait, the turn counter
+                                    # aborts the action (EDGE-15).
+                                    await asyncio.sleep(speech_seconds(reply))
+                                    if turn_state["n"] != my_turn:
+                                        log.info("call moved on during speech-wait — "
+                                                 "%s aborted (%s)", decision, call_sid)
+                                        return
+                                    log.info("atlas %s the call (%s)",
+                                             "is transferring" if decision == "transfer" else "ended",
+                                             call_sid)
+                                    await ws.send_json({
+                                        "type": "end",
+                                        "handoffData": json.dumps({"reason": decision}),
+                                    })
+                            except asyncio.CancelledError:
+                                log.info("reply interrupted by caller (%s)", call_sid)
+                                raise
+                            except Exception:
+                                log.exception("model reply FAILED (%s) — speaking error line", call_sid)
+                                try:
+                                    await ws.send_json({"type": "text", "token": spoken_error, "last": True})
+                                except Exception:
+                                    log.exception("could not even deliver the spoken error (%s)", call_sid)
 
-            elif etype == "error":
-                log.error("Twilio relay error (%s): %s", call_sid, event.get("description"))
+                        reply_task = asyncio.create_task(respond(list(history)))
 
-        if reply_task and not reply_task.done():
-            reply_task.cancel()
-        log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
-        if any(m["role"] == "user" for m in history):
-            try:
-                await deliver_call_message(
-                    http, call_sid=call_sid, caller_id=caller_id,
-                    profile=profile, history=history, model=model, brain=brain,
-                    overpromise_terms=overpromise_terms,
-                )
-            except Exception:
-                log.exception(
-                    "message delivery FAILED (%s) — transcript remains in the journal",
-                    call_sid,
-                )
+                    elif etype == "interrupt":
+                        if reply_task and not reply_task.done():
+                            reply_task.cancel()
+
+                    elif etype == "error":
+                        log.error("Twilio relay error (%s): %s", call_sid, event.get("description"))
+                except Exception as e:
+                    # One bad frame must never cost the caller their message:
+                    # this used to propagate out of the loop, past the delivery
+                    # block below, and the message was gone (C-4).
+                    log.exception("relay event failed CallSid=%s", call_sid)
+                    record_event("error", "relay_event_failed",
+                                 f"{type(e).__name__}: {e}", call_sid)
+                    continue
+
+        finally:
+            if reply_task and not reply_task.done():
+                reply_task.cancel()
+            log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
+            if any(m["role"] == "user" for m in history):
+                try:
+                    await deliver_call_message(
+                        http, call_sid=call_sid, caller_id=caller_id,
+                        profile=profile, history=history, model=model, brain=brain,
+                        overpromise_terms=overpromise_terms,
+                    )
+                except Exception:
+                    log.exception(
+                        "message delivery FAILED (%s) — transcript remains in the journal",
+                        call_sid,
+                    )
     return ws
 
 
