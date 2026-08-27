@@ -1165,12 +1165,14 @@ async def test_the_failure_note_does_not_send_the_owner_to_the_journal(tmp_path,
 # The dashboard's "Recent calls" panel — read from the store, not a log grep.
 # ============================================================================
 
-async def _admin_page(tmp_path, svc) -> str:
+async def _admin_page(tmp_path, svc, patch=None) -> str:
     """Serve the real dashboard on loopback and fetch the real page."""
     import aiohttp
     from aiohttp import web
 
     admin = _load("admin")
+    if patch is not None:
+        patch(admin)
 
     async def snapshot():
         return {"bridge": "ok", "model_backend": "ok", "model": "m", "brain": "b",
@@ -1286,4 +1288,75 @@ async def test_a_broken_store_does_not_take_the_dashboard_down(tmp_path, monkeyp
 
     assert "Could not read recent calls: OperationalError: database is locked" in page
     assert "profile: acme" in page                    # the config form still renders
+    assert "name='acme::greeting'" in page
+
+
+# ============================================================================
+# The caller ID the phone network gave us, where the owner needs it.
+# ============================================================================
+
+async def test_the_push_carries_the_caller_id(tmp_path, monkeypatch):
+    """The push is read without the pad entry's header around it, and the
+    summarizer is told not to copy the caller ID into its Callback line — so
+    a caller who stated no number used to reach the owner's phone as
+    "Callback: unknown" while we held the number all along."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        line.brain.note = ("Name: Dana Whitfield\nCallback: unknown\n"
+                           "Email: unknown\nNeed: A quote for a new roof.")
+        await run_call(line, [setup_frame(), prompt_frame("i need a roof quote")])
+
+        push = line.ntfy.pushes[0]["body"]
+        assert push.startswith("From: +15550001234 — Acme Co line\n")
+        assert "A quote for a new roof." in push          # the note is intact
+        assert line.brain.note in line.pad.read_text(encoding="utf-8")
+
+
+async def test_the_message_row_falls_back_to_the_caller_id(tmp_path, monkeypatch):
+    """The dashboard's call-back link always needs a number."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.note = ("Name: Dana Whitfield\nCallback: unknown\n"
+                           "Email: unknown\nNeed: A quote for a new roof.")
+        await run_call(line, [setup_frame(), prompt_frame("i need a roof quote")])
+
+        [msg] = _store_of(line).list_messages(["acme"], include_test=True)
+        assert msg["callback"] == "+15550001234"          # the caller ID
+        assert msg["caller_name"] == "Dana Whitfield"
+        assert msg["summary"] == line.brain.note          # the note is unchanged
+
+
+async def test_the_caller_id_alone_is_still_a_nothing_call(tmp_path, monkeypatch):
+    """The no-info decision runs on the summarizer's fields ONLY: a call where
+    the caller said nothing must not become a message just because the phone
+    network knew their number."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.note = ("Name: unknown\nCallback: unknown\n"
+                           "Email: unknown\nNeed: unknown")
+        await run_call(line, [setup_frame(REAL_CALL_SID, REAL_CALLER),
+                              prompt_frame("hello?")],
+                       call_sid=REAL_CALL_SID)
+
+        store = _store_of(line)
+        [call] = store.list_calls(["acme"])
+        assert call["outcome"] == "no_info_given"
+        assert store.list_messages(["acme"]) == []
+        assert store.stats(["acme"])["messages_waiting"] == 0
+
+
+async def test_an_unreadable_pad_does_not_take_the_dashboard_down(tmp_path, monkeypatch):
+    """Same failure class as the calls panel: the pad read caught only
+    FileNotFoundError, so a permission problem 500'd the page that tells the
+    owner why their config save was rejected."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    page = await _admin_page(
+        tmp_path, svc,
+        patch=lambda admin: monkeypatch.setattr(admin, "open", denied, raising=False),
+    )
+    assert "Could not read the message pad: PermissionError:" in page
+    assert "profile: acme" in page                        # the config form survives
     assert "name='acme::greeting'" in page

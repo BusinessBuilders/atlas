@@ -258,6 +258,11 @@ def build_admin_app(
                 pad = f.read()[-6000:]
         except FileNotFoundError:
             pad = "(no messages yet)"
+        except (OSError, UnicodeDecodeError) as e:
+            # Same rule as the calls panel: one unreadable card must not take
+            # down the page that carries the config-rejection reason.
+            log.exception("could not read the message pad %s", messages_file)
+            pad = f"Could not read the message pad: {type(e).__name__}: {e}"
 
         transcript = await asyncio.to_thread(_recent_calls, store, sorted(profiles))
 

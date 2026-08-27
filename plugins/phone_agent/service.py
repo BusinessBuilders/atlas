@@ -1531,9 +1531,18 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
                      profile_key, call_sid, "info", "no_info_note",
                      _scrub(note, MAX_EVENT_DETAIL_CHARS))
     else:
+        # The dashboard's call-back link always needs a number. The summarizer
+        # is told NOT to copy the caller ID into its Callback line (we already
+        # hold it), so it is filled in here — AFTER the no_info decision, which
+        # runs on the summarizer's fields only. A call where the caller said
+        # nothing stays a nothing-call; it does not become a message because
+        # the phone network knew the number.
+        known_caller_id = (caller_id if caller_id and caller_id.lower() != "unknown"
+                           else None)
         message_id = _store_write(
             "add_message", call_sid, profile_key,
-            call_sid, profile_key, fields["caller_name"], fields["callback"],
+            call_sid, profile_key, fields["caller_name"],
+            fields["callback"] or known_caller_id,
             fields["email"], fields["need"], note,
             review_flag=bool(summary_failed or overpromise_terms),
         )
@@ -1550,6 +1559,11 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         when=when, business_name=profile["business_name"], caller_id=caller_id,
         note=pad_note, call_sid=call_sid, turns=caller_turns,
     )
+    # The push is the only place the owner reads a message WITHOUT the pad
+    # entry's header around it, and "Callback: unknown" on a phone screen is
+    # useless when the phone network told us who called. This goes to the
+    # owner's own device, so the number is unmasked, exactly as dialled.
+    push_body = f"From: {caller_id} — {profile['business_name']} line\n{pad_note}"
     try:
         async with _pad_lock:
             new_pad = not os.path.exists(MESSAGES_FILE)
@@ -1566,7 +1580,7 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
                      call_sid, profile_key)
         _note_delivery(call_sid, ok=False, error=f"pad write: {type(e).__name__}")
         await _escalate_undelivered(http, call_sid=call_sid, profile=profile,
-                                    profile_key=profile_key, note=pad_note, entry=entry)
+                                    profile_key=profile_key, note=push_body, entry=entry)
         return result
     _note_delivery(call_sid, ok=True, error="")
     result["ok"] = True
@@ -1578,7 +1592,7 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         return result
     try:
         async with http.post(
-            f"{NTFY_URL}/{NTFY_TOPIC}", data=pad_note.encode(),
+            f"{NTFY_URL}/{NTFY_TOPIC}", data=push_body.encode(),
             headers={"Title": f"Phone message - {profile['business_name']} line"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
