@@ -1,0 +1,10 @@
+[Unit]
+Description=Atlas phone line alert — push the failed unit %i to ntfy
+# Triggered only by OnFailure= on the phone units; there is no [Install]
+# section because nothing should ever enable or start this by hand.
+
+[Service]
+Type=oneshot
+# NTFY_URL and NTFY_TOPIC come from the same env file as the bridge.
+EnvironmentFile=%h/.config/atlas-phone/env
+ExecStart=%h/atlas-phone-deploy/deploy/phone/alert.sh %i

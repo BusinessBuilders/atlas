@@ -71,9 +71,12 @@ the journal at ERROR.
    port another app depends on.
 5. Point the Twilio number's voice webhook (POST) at
    `PUBLIC_BASE/voice/incoming`.
-6. `cp deploy/systemd/atlas-phone-bridge.service ~/.config/systemd/user/ &&
-   systemctl --user daemon-reload && systemctl --user enable --now
-   atlas-phone-bridge`
+6. Install the service: put the checkout at `~/atlas-phone-deploy` (the path
+   the unit files use) and run `deploy/phone/install.sh ~/atlas-phone-deploy`,
+   then `systemctl --user enable --now atlas-phone-bridge`. The installer
+   builds the venv and installs the units but deliberately starts nothing —
+   see `deploy/phone/README.md` for the full runbook, the SSH tunnel and the
+   failure alerts.
 7. Verify: `curl -s http://127.0.0.1:<BRIDGE_PORT>/health` shows
    `"model_backend": "ok"` and your profiles — then call the number.
 

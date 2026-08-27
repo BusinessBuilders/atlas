@@ -1,18 +1,37 @@
 [Unit]
 Description=Atlas phone agent — Twilio ConversationRelay bridge (plugins/phone_agent/service.py)
+# Wants= as well as After=: After= only orders us *behind* network-online.target,
+# it does not ask for it. Without Wants= the target may never be pulled in and
+# the bridge starts before the network is up.
 After=network-online.target
+Wants=network-online.target
+# No After=ollama.service. The model that answers calls is whichever brain is
+# active in businesses.toml — usually a cloud endpoint — so ordering the phone
+# line behind a local Ollama unit is wrong, and on a machine without Ollama it
+# is a dependency on a unit that will never exist.
+#
+# A crash loop must end in a FAILED unit, not spin forever: after 10 starts in
+# 5 minutes systemd gives up and OnFailure= pages the owner via ntfy. A phone
+# line that is quietly restarting every 5 seconds looks alive and is not.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+OnFailure=atlas-phone-alert@%n.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/atlas
+WorkingDirectory=%h/atlas-phone-deploy
 # All config and secrets live in the env file (Twilio creds, ports, model,
 # public base URL) plus businesses.toml next to it — see
 # plugins/phone_agent/README.md. The service validates both at boot and
 # refuses to start on a broken config.
 EnvironmentFile=%h/.config/atlas-phone/env
-ExecStart=%h/atlas/.venv/bin/python %h/atlas/plugins/phone_agent/service.py
+ExecStart=%h/atlas-phone-deploy/.venv/bin/python %h/atlas-phone-deploy/plugins/phone_agent/service.py
 Restart=always
 RestartSec=5
+# Deliberately NO WatchdogSec=: the bridge is a plain aiohttp application and
+# never calls sd_notify(WATCHDOG=1), so systemd would kill a perfectly healthy
+# phone line at every interval. Liveness is checked from outside instead — the
+# atlas-phone-line tripwire polls the public /health endpoint.
 
 [Install]
 WantedBy=default.target

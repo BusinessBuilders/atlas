@@ -1,0 +1,26 @@
+[Unit]
+Description=Atlas phone tunnel - reverse SSH carrying VPS :8890 to local phone bridge (Plan B for dead Tailscale funnel DNS)
+After=network-online.target
+Wants=network-online.target
+# A tunnel that can never bind used to retry silently forever while Twilio got
+# 502s. Now: 20 attempts in 10 minutes, then the unit fails and pages.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+OnFailure=atlas-phone-alert@%n.service
+
+[Service]
+# The VPS sshd has no ClientAliveInterval, so a network blip leaves a DEAD session
+# squatting :8890 for hours — every reconnect then fails and Twilio gets 502.
+# This clears the corpse first (it refuses to touch a healthy tunnel).
+ExecStartPre=%h/atlas-phone-deploy/deploy/phone/tunnel-guard.sh
+# -i/IdentitiesOnly pins the key so the tunnel does NOT depend on the gnome-keyring
+# ssh-agent being unlocked — otherwise a reboot leaves the phone line dead until
+# William logs in graphically.
+ExecStart=/usr/bin/ssh -N -i %h/.ssh/AgentChad -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -R 127.0.0.1:8890:127.0.0.1:8890 linuxuser@66.42.116.215
+Restart=always
+# 15s, not 5s: every retry opens an ssh session to the VPS, and a fast loop
+# against a refusing sshd is what fail2ban bans.
+RestartSec=15
+
+[Install]
+WantedBy=default.target
