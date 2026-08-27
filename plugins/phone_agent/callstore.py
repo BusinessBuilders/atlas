@@ -23,8 +23,9 @@ Design rules, deliberately narrow:
     the owner's message list looking like paying customers.
 
 Retention and deletion:
-  * `purge_expired(profile_key, retention_days)` drops the WORDS (turns, and
-    the free-text message summary/need) past the horizon and keeps the
+  * `purge_expired(profile_key, retention_days)` drops the WORDS (turns, the
+    free-text message summary/need, and the `no_info_note` events that hold a
+    summary of a call which left no message) past the horizon and keeps the
     aggregates — the owner's call counts and outcomes survive forever, the
     transcripts do not.
   * `delete_caller(from_number)` is the CCPA/GDPR path: every row for that
@@ -561,18 +562,27 @@ class CallStore:
 
     # --------------------------------------------- retention + deletion ---
 
-    def purge_expired(self, profile_key: str, retention_days: int) -> int:
+    def purge_expired(self, profile_key: str, retention_days: int, *,
+                      now=None) -> int:
         """Age out the WORDS past the horizon; keep the aggregates.
 
-        Turns are deleted outright and each expired message loses its free-text
-        summary and need. The calls row and the message row stay, so the
-        owner's history and counts never move. Returns the number of turns
-        deleted.
+        Turns are deleted outright, each expired message loses its free-text
+        summary and need, and the `no_info_note` events go too — that event
+        holds the summarizer's note for a call that left no message, which is
+        caller-derived text like any other. The calls row, the message row and
+        every other operational event stay, so the owner's history and counts
+        never move. Returns the number of turns deleted.
+
+        `now` names the moment the horizon is measured from (default: the
+        clock), so a test can put a row exactly on the boundary. A row AT the
+        horizon is KEPT: retention_days means "for this many days", and the
+        last of them is a day the business still has.
         """
         retention_days = int(retention_days)
         if retention_days <= 0:
             raise ValueError("retention_days must be a positive number of days")
-        horizon = time.time() - retention_days * DAY_SECONDS
+        moment = time.time() if now is None else float(now)
+        horizon = moment - retention_days * DAY_SECONDS
         with self._lock, self.conn:
             deleted = self.conn.execute(
                 "DELETE FROM turns WHERE call_sid IN (SELECT call_sid FROM calls "
@@ -583,6 +593,11 @@ class CallStore:
                 "UPDATE messages SET summary = NULL, need = NULL "
                 "WHERE profile_key = ? AND created_at < ? "
                 "AND (summary IS NOT NULL OR need IS NOT NULL)",
+                (str(profile_key), horizon),
+            )
+            self.conn.execute(
+                "DELETE FROM events WHERE kind = 'no_info_note' "
+                "AND profile_key = ? AND ts < ?",
                 (str(profile_key), horizon),
             )
         return int(deleted)

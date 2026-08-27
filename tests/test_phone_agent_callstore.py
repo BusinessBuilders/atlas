@@ -509,6 +509,49 @@ def test_purge_expired_drops_old_transcripts_but_keeps_the_call(store):
     assert store.purge_expired("acme", 90) == 0       # idempotent
 
 
+def test_purge_expired_clears_the_notes_left_by_a_no_message_call(store):
+    """A call that left nothing to act on has no message row — its summarizer
+    note is kept as a `no_info_note` event instead, and that note is caller-
+    derived text like any other, so the retention horizon has to reach it."""
+    now = time.time()
+    old = _add_call(store, call_sid="CAnotesold", started=now - 100 * DAY)
+    fresh = _add_call(store, call_sid="CAnotesnew", started=now - 2 * DAY)
+    for call_sid, ts in ((old, now - 100 * DAY), (fresh, now - 2 * DAY)):
+        store.add_event("acme", call_sid, "info", "no_info_note",
+                        "caller asked for a takeaway two doors down")
+        store.add_event("acme", call_sid, "error", "ntfy_push_failed", "TimeoutError")
+    with _sql(store.path) as conn:
+        conn.execute("UPDATE events SET ts = ? WHERE call_sid = ?",
+                     (now - 100 * DAY, old))
+        conn.commit()
+
+    store.purge_expired("acme", 90)
+
+    with _sql(store.path) as conn:
+        left = [(r["kind"], r["call_sid"]) for r in conn.execute(
+            "SELECT kind, call_sid FROM events ORDER BY id")]
+    assert ("no_info_note", old) not in left            # the words are gone
+    assert ("no_info_note", fresh) in left              # this one is still in date
+    # every other event survives: an operational record is not caller speech
+    assert [c for k, c in left if k == "ntfy_push_failed"] == [old, fresh]
+
+
+def test_purge_expired_keeps_a_row_sitting_exactly_on_the_horizon(store):
+    """retention_days = 90 means ninety days of transcripts, and the ninetieth
+    is one the business still has. Only what is PAST the horizon goes."""
+    now = 1_700_000_000.0
+    horizon = now - 90 * DAY
+    on_the_line = _add_call(store, call_sid="CAexactly", started=horizon)
+    just_past = _add_call(store, call_sid="CApastit", started=horizon - 1)
+    for call_sid in (on_the_line, just_past):
+        store.add_turn(call_sid, 1, "caller", "my sink is leaking")
+
+    assert store.purge_expired("acme", 90, now=now) == 1
+
+    assert len(store.get_call(on_the_line)["turns"]) == 1
+    assert store.get_call(just_past)["turns"] == []
+
+
 def test_purge_expired_is_scoped_to_one_profile(store):
     now = time.time()
     a = _add_call(store, call_sid="CApurgeA", profile="acme", started=now - 100 * DAY)
@@ -670,12 +713,17 @@ async def test_the_journal_holds_no_caller_text(tmp_path, monkeypatch, caplog):
 
 
 async def test_a_keypress_is_a_stored_turn(tmp_path, monkeypatch):
+    """The keypress is a turn of its own — with the digits masked, and with the
+    agent's answer to it stored right after (Task 5b)."""
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
         await run_call(line, [setup_frame(), {"type": "dtmf", "digit": "5"}])
         store = _store_of(line)
         [call] = store.list_calls(["acme"], include_test=True)
         turns = store.get_call(call["call_sid"])["turns"]
-        assert [(t["role"], t["text"]) for t in turns] == [("keypress", "[keypress: 5]")]
+        assert [(t["role"], t["text"]) for t in turns] == [
+            ("keypress", "[keypress: ••5]"),
+            ("agent", line.brain.reply),
+        ]
 
 
 async def test_a_call_with_no_words_is_recorded_as_a_hang_up(tmp_path, monkeypatch):
