@@ -441,9 +441,15 @@ class CallStore:
             if cur.rowcount == 0:
                 raise KeyError(f"no message with id {id!r}")
 
-    def list_messages(self, profile_keys, status=None, include_test=False) -> list:
+    def list_messages(self, profile_keys, status=None, include_test=False, *,
+                      call_sids=None, limit=None) -> list:
         """The owner's message list, newest first, with the caller's number
-        joined in from the call."""
+        joined in from the call.
+
+        `call_sids` narrows the query to specific calls and `limit` bounds it —
+        a caller that wants the status of ten calls must not read every message
+        this line has ever taken to find them.
+        """
         keys = [str(k) for k in profile_keys]
         if not keys:
             return []
@@ -456,14 +462,21 @@ class CallStore:
             params.append(status)
         if not include_test:
             where.append("c.is_test = 0")
+        if call_sids is not None:
+            sids = [str(s) for s in call_sids]
+            if not sids:
+                return []
+            where.append("m.call_sid IN (%s)" % ",".join("?" * len(sids)))
+            params += sids
+        sql = ("SELECT m.*, c.from_number, c.is_test, c.started_at AS call_started_at "
+               "FROM messages m JOIN calls c ON c.call_sid = m.call_sid WHERE "
+               + " AND ".join(where)
+               + " ORDER BY m.created_at DESC, m.id DESC")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT m.*, c.from_number, c.is_test, c.started_at AS call_started_at "
-                "FROM messages m JOIN calls c ON c.call_sid = m.call_sid WHERE "
-                + " AND ".join(where)
-                + " ORDER BY m.created_at DESC, m.id DESC",
-                params,
-            ).fetchall()
+            rows = self.conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     # ----------------------------------------------- events + notify log --

@@ -336,6 +336,21 @@ def test_list_messages_hides_test_calls_by_default(store):
     assert len(store.list_messages(["acme"], include_test=True)) == 2
 
 
+def test_list_messages_can_be_narrowed_to_specific_calls(store):
+    """The dashboard looks up the status of ten calls — it must not read every
+    message this line has ever taken to do it."""
+    for i in range(3):
+        _add_call(store, call_sid=f"CAmsgnarrow{i}")
+        store.add_message(f"CAmsgnarrow{i}", "acme", "Dana", None, None, None, f"note {i}")
+
+    wanted = ["CAmsgnarrow0", "CAmsgnarrow2"]
+    got = store.list_messages(["acme"], call_sids=wanted)
+    assert sorted(m["call_sid"] for m in got) == wanted
+    assert len(store.list_messages(["acme"], limit=1)) == 1
+    assert store.list_messages(["acme"], call_sids=[]) == []
+    assert len(store.list_messages(["acme"])) == 3          # unchanged default
+
+
 def test_set_message_status_moves_it_and_stamps_updated_at(store):
     _add_call(store, call_sid="CAstatus")
     msg_id = store.add_message("CAstatus", "acme", "Dana", None, None, None, "note")
@@ -1052,6 +1067,30 @@ NOTE_CASES = [
         {"caller_name": None, "callback": None, "email": None, "need": None},
     ),
     (
+        "the four labelled lines the prompt asks for",
+        "Name: Dana Whitfield\nCallback: +17770002222\n"
+        "Email: dana@example.invalid\nNeed: A quote for a new roof.",
+        {"caller_name": "Dana Whitfield", "callback": "+17770002222",
+         "email": "dana@example.invalid", "need": "A quote for a new roof."},
+    ),
+    (
+        "unknown is the prompt's word for nothing, not a value",
+        "Name: unknown\nCallback: unknown\nEmail: unknown\nNeed: unknown",
+        {"caller_name": None, "callback": None, "email": None, "need": None},
+    ),
+    (
+        "a name in a sentence never swallows the rest of the clause",
+        "Her name is Dana Whitfield and she wants a roof quote.",
+        {"caller_name": "Dana Whitfield", "callback": None, "email": None,
+         "need": "Her name is Dana Whitfield and she wants a roof quote."},
+    ),
+    (
+        "an unlabelled note keeps its request, not its first line",
+        "Dana Whitfield\n+17770002222\nNeeds a quote for a new roof.",
+        {"caller_name": None, "callback": "+17770002222", "email": None,
+         "need": "Needs a quote for a new roof."},
+    ),
+    (
         "the pad's caller-derived marker is not the message",
         "> Caller-derived text.\nWants a quote",
         {"caller_name": None, "callback": None, "email": None, "need": "Wants a quote"},
@@ -1156,6 +1195,9 @@ async def _admin_page(tmp_path, svc) -> str:
         async with aiohttp.ClientSession() as session:
             session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
             async with session.get(f"http://127.0.0.1:{port}/") as resp:
+                # 200 is part of every assertion here: a panel that raises must
+                # not turn the owner's dashboard into a 500 page.
+                assert resp.status == 200, await resp.text()
                 return await resp.text()
     finally:
         await runner.cleanup()
@@ -1212,3 +1254,36 @@ async def test_recent_calls_panel_hides_test_calls(tmp_path, monkeypatch):
     page = await _admin_page(tmp_path, svc)
     assert "this is only a demo call" not in page
     assert "No calls recorded yet." in page
+
+
+def test_the_summarizer_is_asked_for_labelled_lines(tmp_path, monkeypatch):
+    """The parser's happy path is a labelled note, so the prompt has to ask
+    for one — free prose is what put a whole clause in the name column."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+    prompt = svc.SUMMARIZER_PROMPT
+    for label in ("Name:", "Callback:", "Email:", "Need:"):
+        assert label in prompt
+    assert "unknown" in prompt
+    assert "No message" in prompt                     # the no-info escape survives
+    assert svc.TRANSCRIPT_FENCE_OPEN in prompt        # and the injection fence
+
+
+async def test_a_broken_store_does_not_take_the_dashboard_down(tmp_path, monkeypatch):
+    """The recent-calls panel is one card on a page whose main job is editing
+    the config. A store read that raised used to 500 the whole dashboard —
+    including the page that tells the owner why a save was rejected."""
+    from test_phone_agent_plugin import _import_service
+
+    svc = _import_service(tmp_path, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(svc.STORE, "list_calls", boom)
+    page = await _admin_page(tmp_path, svc)
+
+    assert "Could not read recent calls: OperationalError: database is locked" in page
+    assert "profile: acme" in page                    # the config form still renders
+    assert "name='acme::greeting'" in page

@@ -83,11 +83,12 @@ the journal at ERROR.
 ## Messages, caller ID, and hanging up
 
 - After every call with caller turns, the bridge summarizes the transcript
-  (one non-streamed pass on the same local model) into a structured note —
-  name, callback number, email, what they need — appended to the message pad
-  (`MESSAGES_FILE`, default `~/atlas-phone-messages.md`). Extraction failure
-  writes a loud fallback entry pointing at the journal transcript; a message
-  never vanishes silently. Optional `NTFY_URL` + `NTFY_TOPIC` (set together
+  (one non-streamed pass on the same local model) into four labelled lines —
+  `Name:` / `Callback:` / `Email:` / `Need:`, each `unknown` when the caller
+  did not say — appended to the message pad (`MESSAGES_FILE`, default
+  `~/atlas-phone-messages.md`) and stored as the call's message. Extraction
+  failure writes a loud fallback entry pointing at the call in the dashboard,
+  where the transcript is; a message never vanishes silently. Optional `NTFY_URL` + `NTFY_TOPIC` (set together
   or not at all) also push each note as a phone notification.
 - The caller's real number comes from the phone network, not speech-to-text:
   it's injected into the call context so the agent *confirms* the callback

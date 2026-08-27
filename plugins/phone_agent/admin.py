@@ -19,9 +19,14 @@ from __future__ import annotations
 import asyncio
 import hmac
 import html
+import logging
 import time
 
 from aiohttp import web
+
+# The bridge's logger: the dashboard's failures belong in the same
+# journal as the line's.
+log = logging.getLogger("atlas-phone")
 
 COOKIE = "atlas_admin"
 
@@ -104,11 +109,26 @@ def _recent_calls(store, profile_keys) -> str:
     dashboard that says "nothing happened" when things happened is worse than
     one that says nothing at all.
     """
-    calls = store.list_calls(profile_keys, include_test=False, limit=10)
+    try:
+        calls = store.list_calls(profile_keys, include_test=False, limit=10)
+    except Exception as e:
+        # This panel is one card on a page whose main job is editing the
+        # config. A store read that raised here used to 500 the whole
+        # dashboard — including the page that shows why a save was rejected.
+        log.exception("could not read recent calls for the dashboard")
+        return f"Could not read recent calls: {type(e).__name__}: {e}"
     if not calls:
         return "No calls recorded yet."
-    status_of = {m["call_sid"]: m["status"]
-                 for m in store.list_messages(profile_keys)}
+    try:
+        return _render_calls(store, profile_keys, calls)
+    except Exception as e:
+        log.exception("could not render recent calls for the dashboard")
+        return f"Could not read recent calls: {type(e).__name__}: {e}"
+
+
+def _render_calls(store, profile_keys, calls) -> str:
+    status_of = {m["call_sid"]: m["status"] for m in store.list_messages(
+        profile_keys, call_sids=[c["call_sid"] for c in calls])}
     blocks = []
     for call in calls:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(call["started_at"]))
