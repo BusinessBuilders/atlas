@@ -117,6 +117,47 @@ the journal at ERROR.
   Design + review record: `docs/superpowers/specs/2026-07-26-phone-call-
   control-hardening-design.md`.
 
+## The call store (`callstore.py`)
+
+Every call, every turn, every message and every operational event is written
+to one SQLite file — `$PHONE_DATA_DIR/calls.db`, default
+`~/.local/share/atlas-phone/calls.db`, created `0700` at boot. If that
+directory cannot be created or the database cannot be opened, the bridge
+**refuses to start**: a line that answers calls and records nothing is worse
+than a line that is down.
+
+- **The journal no longer holds what callers said.** It carries CallSid, turn
+  number and character counts; the words live in the store, which has a
+  retention horizon and a delete path (journald has neither).
+- One `calls` row per call, opened at Twilio's `setup` and finalised in the
+  relay's `finally:` with the outcome (`message_taken`, `transferred`,
+  `caller_hung_up`, `no_info_given`, `agent_error`), the caller-turn count,
+  overpromise flags and the per-call TTFT percentiles — the silence a caller
+  actually sat through before the agent spoke, measured per turn.
+- Calls made from a `CAtest…` CallSid or a `+1555…` number are flagged
+  `is_test` and stay out of the owner's message list and numbers.
+- `purge_expired(profile_key, retention_days)` deletes the transcript turns
+  and blanks the free-text message summary past the horizon while keeping the
+  call and message rows, so history and counts never move.
+- `delete_caller("+1…")` removes every row this store holds for one caller
+  (the "delete my data" path) and reports the CallSids it removed — the
+  Markdown pad is append-only text, so those entries still have to be
+  redacted by hand.
+
+**Importing the old pad**: the messages taken before the store existed live
+only in `~/atlas-phone-messages.md`. `migrate_pad.py` reads that file
+(read-only — it never writes to the pad) and imports each entry:
+
+```bash
+python plugins/phone_agent/migrate_pad.py \
+    --pad ~/atlas-phone-messages.md \
+    --db ~/.local/share/atlas-phone/calls.db \
+    --profile business_builders [--dry-run]
+```
+
+It prints counts only (never caller details) and is idempotent: a CallSid
+already in the store is skipped, so running it twice imports nothing.
+
 ## Brains — switching the model that answers
 
 A **brain** is a named model backend: a label, an OpenAI-compatible

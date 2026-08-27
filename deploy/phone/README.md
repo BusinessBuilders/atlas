@@ -50,7 +50,13 @@ Three things are deliberate:
 | Secrets and settings | `~/.config/atlas-phone/env` (mode 600) |
 | Business profiles | `~/.config/atlas-phone/businesses.toml` |
 | Installed units | `~/.config/systemd/user/` |
+| The call store (calls, transcripts, messages) | `~/.local/share/atlas-phone/calls.db` (mode 700; `PHONE_DATA_DIR` moves it) |
+| The message pad (Markdown, append-only) | `~/atlas-phone-messages.md` |
 | The old hand-made directory | `~/atlas-phone-bridge.archived-<date>` (kept 30 days) |
+
+The call store is the one file here that cannot be rebuilt from the repo: it
+holds what callers said and the messages they left. Back it up with the
+config, and remember it is the file a "delete my data" request has to reach.
 
 The unit files use `%h/atlas-phone-deploy` — `%h` is systemd's shorthand for
 your home directory. That is why the checkout has to be at exactly
