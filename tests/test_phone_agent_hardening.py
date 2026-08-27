@@ -650,8 +650,10 @@ def test_every_save_leaves_a_restorable_backup(tmp_path, monkeypatch):
                                     {"acme": _profile(greeting="second")})
     assert svc.apply_config_text(second) == []
 
+    # oldest first — the same ordering backup_config prunes by (two saves can
+    # land in the same second, so the name breaks the tie)
     backups = sorted(config.parent.glob(config.name + ".bak-*"),
-                     key=lambda p: p.stat().st_mtime)
+                     key=lambda p: (p.stat().st_mtime, p.name))
     assert len(backups) == 2
     assert backups[0].read_text(encoding="utf-8") == original
     assert backups[1].read_text(encoding="utf-8") == first
@@ -699,3 +701,101 @@ def test_the_emitter_refuses_a_nested_table_instead_of_mangling_it(tmp_path, mon
     with pytest.raises(ValueError, match="nested table"):
         svc.emit_business_toml({"+15550001111": "acme"},
                                {"acme": _profile(hours={"mon": "9-5"})})
+
+
+# -------------------------------------------- M-10: forwarding to ourselves --
+
+def test_forwarding_to_one_of_our_own_numbers_is_refused(tmp_path, monkeypatch):
+    """Twilio would dial straight back into /voice/incoming, which answers and
+    can transfer again: billable, and it looks like an outage."""
+    svc = _import_service(tmp_path, monkeypatch)
+    numbers = {"+15550001111": "acme", "+15550002222": "acme"}
+
+    with pytest.raises(ValueError, match="loop"):
+        svc.check_forward_loop(numbers, {"acme": _profile(forward_to="+15550002222")})
+    # a real outside number is fine
+    svc.check_forward_loop(numbers, {"acme": _profile(forward_to="+15085550100")})
+
+    # and the same check guards the boot path and every dashboard save
+    errors = svc.apply_config_text(svc.emit_business_toml(
+        numbers, {"acme": _profile(forward_to="+15550001111")}))
+    assert errors and "loop" in errors[0]
+    assert svc.PROFILES["acme"].get("forward_to", "") == ""   # nothing changed
+
+
+# ------------------------------ L-1 / L-3: what lands in the journal, and --
+#                                           when the hangup wait binds
+
+async def test_a_provider_error_page_does_not_land_in_the_journal(tmp_path, monkeypatch, caplog):
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.chat_status = 502
+        with caplog.at_level(logging.ERROR, logger="atlas-phone"):
+            spoken = await run_call(line, [setup_frame(), prompt_frame("hello")])
+
+        # the caller hears the apology, not silence
+        assert any("having trouble thinking" in m.get("token", "") for m in spoken)
+        assert "HTTP 502" in caplog.text
+        assert "upstream provider error page" in caplog.text   # a short reason, kept
+        assert "x" * 121 not in caplog.text                    # the page itself, not
+
+
+def test_speech_seconds_warns_when_the_hangup_wait_binds(tmp_path, monkeypatch, caplog):
+    """The goodbye gets clipped when it runs past the cap — a documented
+    trade-off that was invisible when it happened."""
+    svc = _import_service(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        assert svc.speech_seconds("Thanks, goodbye.") < 8.0
+    assert "clipped" not in caplog.text
+
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        assert svc.speech_seconds("word " * 60) == 8.0
+    assert "clipped" in caplog.text
+
+
+# -------------------------------- L-6: duplicate numbers on the dashboard --
+
+async def test_duplicate_numbers_in_the_dashboard_are_refused(tmp_path, monkeypatch):
+    """Two lines for the same number silently kept the last one — the owner
+    would think they had routed a number they had not."""
+    import importlib.util
+
+    from test_phone_agent_plugin import PLUGINS_DIR
+
+    svc = _import_service(tmp_path, monkeypatch)
+    spec = importlib.util.spec_from_file_location(
+        "phone_agent_admin_hardening", PLUGINS_DIR / "phone_agent" / "admin.py")
+    admin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admin)
+
+    async def snapshot():
+        return {"bridge": "ok", "model_backend": "ok", "model": "m",
+                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
+
+    app = admin.build_admin_app(
+        token="sesame", health_snapshot=snapshot,
+        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_brains=lambda: ({}, ""),
+        get_prompts=lambda: svc.SYSTEM_PROMPTS,
+        apply_config_text=svc.apply_config_text,
+        emit_business_toml=svc.emit_business_toml,
+        messages_file=str(tmp_path / "messages.md"),
+        known_keys=svc._PROFILE_KNOWN_KEYS,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", 0).start()
+    port = runner.addresses[0][1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
+            async with session.post(
+                f"http://127.0.0.1:{port}/save",
+                data={"numbers_text": "+15550001111 = acme\n+15550001111 = acme"},
+            ) as resp:
+                text = await resp.text()
+    finally:
+        await runner.cleanup()
+
+    assert "Not applied" in text
+    assert "more than once" in text
+    assert svc.NUMBERS == {"+15550001111": "acme"}

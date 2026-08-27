@@ -245,7 +245,13 @@ def build_admin_app(
                 errors.append(f"number line {line!r} must look like +15551234567 = profile_name")
                 continue
             n, _, k = line.partition("=")
-            numbers[n.strip()] = k.strip()
+            number = n.strip()
+            if number in numbers:
+                # the last line silently won before, so the owner could think a
+                # number was routed somewhere it was not
+                errors.append(f"number {number} is listed more than once — keep one line per number")
+                continue
+            numbers[number] = k.strip()
 
         profiles: dict = {}
         for key, profile in current_profiles.items():

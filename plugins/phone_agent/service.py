@@ -674,7 +674,26 @@ def parse_business_config(data: dict) -> tuple[dict, dict]:
                 parse_phrase_lines(str(profile.get(field_name, "")))
             except ValueError as e:
                 raise ValueError(f"profile {key!r} {field_name}: {e}")
+    check_forward_loop(numbers, profiles)
     return numbers, profiles
+
+
+def check_forward_loop(numbers: dict, profiles: dict) -> None:
+    """Refuse a forward_to that is one of THIS bridge's own numbers.
+
+    Twilio would dial straight back into /voice/incoming, which answers and can
+    transfer again — billable, and to everyone watching it looks like an
+    outage (M-10).
+    """
+    ours = {str(number).strip() for number in numbers}
+    for key, profile in profiles.items():
+        forward_to = str(profile.get("forward_to", "")).strip()
+        if forward_to and forward_to in ours:
+            raise ValueError(
+                f"profile {key!r} forwards to {forward_to}, which is one of this "
+                "bridge's own [numbers] — that loops the call straight back into "
+                "the agent. Point forward_to at a real phone."
+            )
 
 
 def load_business_config(path: str) -> tuple[dict, dict, dict, str]:
@@ -1075,10 +1094,21 @@ class MarkerScrubber:
         return out
 
 
+SPEECH_SECONDS_CAP = 8.0
+
+
 def speech_seconds(text: str) -> float:
     """Rough TTS duration for the goodbye, so the hangup doesn't clip it.
     ~150 wpm speech plus a beat; capped so a runaway reply can't stall hangup."""
-    return min(1.0 + 0.45 * len(text.split()), 8.0)
+    words = len(text.split())
+    seconds = 1.0 + 0.45 * words
+    if seconds > SPEECH_SECONDS_CAP:
+        # A documented trade-off, but the caller hears the goodbye cut off —
+        # say so when it actually happens (L-3).
+        log.warning("goodbye needs ~%.1fs (%d words) but the hangup waits at most "
+                    "%.0fs — the tail will be clipped", seconds, words, SPEECH_SECONDS_CAP)
+        return SPEECH_SECONDS_CAP
+    return seconds
 
 
 # ------------------------------------------------------------ message pad --
@@ -1472,7 +1502,12 @@ async def stream_reply(
         timeout=aiohttp.ClientTimeout(total=MODEL_TIMEOUT_SECONDS),
     ) as resp:
         if resp.status != 200:
-            raise RuntimeError(f"model backend returned HTTP {resp.status}: {(await resp.text())[:200]}")
+            # A provider's HTML error page used to be pasted whole into the
+            # journal by the handler above — a status and a short reason is
+            # what an operator actually needs (L-1).
+            reason = " ".join((await resp.text())[:400].split())[:120]
+            log.error("brain %s returned HTTP %s: %s", brain.key, resp.status, reason)
+            raise RuntimeError(f"model backend returned HTTP {resp.status}")
         async for raw in resp.content:
             line = raw.decode().strip()
             if not line.startswith("data:"):
