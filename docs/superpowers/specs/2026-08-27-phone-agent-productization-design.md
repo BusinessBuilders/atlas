@@ -78,10 +78,10 @@ ai_disclosure = true                   # default true → "I'm an AI assistant" 
 ai_disclosure_text = "I'm the AI assistant for {business_name}."
 recording_notice = true                # default true (transcripts are stored)
 recording_notice_text = "This call may be recorded and transcribed."
-language = "en-US"                     # ConversationRelay language; "multi" allowed only with Deepgram+ElevenLabs (validated)
-tts_provider = "ElevenLabs"            # Google | Amazon | ElevenLabs
-voice = ""                             # provider voice id; empty = provider default
-transcription_provider = "Deepgram"    # Google | Deepgram
+language = "en-US"                     # ConversationRelay language (default "en-US", always emitted); "multi" allowed only when BOTH providers below are set explicitly to Deepgram+ElevenLabs (validated)
+tts_provider = "ElevenLabs"            # Google | Amazon | ElevenLabs; DEFAULT "" = provider default, attribute OMITTED from the TwiML
+voice = ""                             # provider voice id; DEFAULT "" = provider default, attribute OMITTED from the TwiML
+transcription_provider = "Deepgram"    # Google | Deepgram; DEFAULT "" = provider default, attribute OMITTED from the TwiML
 hints = ["Business Builders", "Atlas"] # STT bias terms
 ignore_backchannel = true
 brain = ""                             # per-profile brain override; empty = active_brain
@@ -94,7 +94,9 @@ block_list = []                        # E.164; blocked → short spoken line + 
 retention_days = 90                    # transcript/summary purge horizon (call rows and messages stay)
 ```
 
-Validation rules added: `forward_to` may not equal any mapped number (call loop); `timezone` must resolve via `zoneinfo`; `hours` values must be `HH:MM-HH:MM` (overnight ranges allowed); `language="multi"` requires Deepgram + ElevenLabs; unknown keys are rejected (already); non-string scalars are preserved by the emitter (bool/int/list/table), never stringified.
+Validation rules added: `forward_to` may not equal any mapped number (call loop); `timezone` must resolve via `zoneinfo`; `hours` values must be `HH:MM-HH:MM` (overnight ranges allowed); `language="multi"` requires both `transcription_provider = "Deepgram"` and `tts_provider = "ElevenLabs"` written out explicitly (an empty provider means Twilio's own, which cannot do it); non-string scalars are preserved by the emitter (bool/int/list/table), never stringified.
+
+Unknown keys, ruled 2026-08-27 (the earlier "unknown keys are rejected (already)" was never true of the code and conflicts with the hardening pass): an unknown key inside a `[profiles.*]` section is **preserved byte-for-byte and named in a boot WARNING** — Task 3's M-6 work exists so that a setting somebody hand-wrote survives a dashboard save, and rejecting unknown keys and preserving hand-added keys are mutually exclusive. A misspelt setting therefore does nothing, but never does nothing silently. Unknown keys inside `[brains.*]`, `[branding]` and `[owners.*]`, and unknown top-level keys, **are rejected**: those tables are entirely the product's, nobody hand-annotates them, and a setting the bridge does not read there is one that looked applied and never was.
 
 ### 3.4 Call store — `callstore.py` (SQLite, `PHONE_DATA_DIR` default `~/.local/share/atlas-phone/`, file `calls.db`, WAL mode)
 Tables: `calls` (call_sid PK, profile_key, from_number, to_number, started_at, ended_at, duration_s, caller_turns, outcome ∈ {message_taken, transferred, caller_hung_up, no_info_given, agent_error, blocked, rate_limited, after_hours_message}, decision_reason, brain, model, prompt_tokens, completion_tokens, ttft_ms_p50, ttft_ms_p95, overpromise_flags JSON, notify_status, twilio_status, twilio_duration_s, twilio_price, is_test) · `turns` (call_sid, n, role, text, ts, ttft_ms) · `messages` (id, call_sid, profile_key, caller_name, callback, email, need, summary, status ∈ {new, in_progress, done}, note, created_at, updated_at, review_flag) · `events` (ts, profile_key, call_sid, level, kind, detail — summarizer failure, ntfy failure, signature rejection, config rejection, watchdog, rate-limit, block) · `config_changes` (ts, actor, summary, diff, applied, reason) · `notify_log` (ts, profile_key, target, ok, error) · `sessions` (id, owner_key, created_at, last_seen).
@@ -110,7 +112,7 @@ C-4 loop guard + delivery in `finally` · H-1 pad-write failure → urgent ntfy 
 Opening line = `greeting` + (ai_disclosure ? ai_disclosure_text) + (recording_notice ? recording_notice_text), composed by one function that the dashboard preview also calls, so what the owner sees is what the caller hears. Neither can be disabled without `ack_disclosure_waived = true` in the profile (fail-closed at boot with a clear error). Spoken opt-out phrases ("stop calling me", "take me off your list") are detected and logged as an event on the call.
 
 ### 3.8 ConversationRelay attributes
-Emitted per profile: `language`, `ttsProvider`, `voice`, `transcriptionProvider`, `hints`, `ignoreBackchannel`, `dtmfDetection="true"`, `welcomeGreetingInterruptible="none"` (disclosure must be heard). `reportInputDuringAgentSpeech` stays at its default (`none`) in this pass — the bridge's turn logic is not designed for input during agent speech and changing it needs real-call testing; recorded in §7.
+Emitted per profile: `language` (always), `ttsProvider`, `voice`, `transcriptionProvider` and `hints` (each **only when the profile sets it** — an empty attribute is a value to Twilio, not "use your default", and omitting them is what keeps this release from changing the voice existing callers hear), `ignoreBackchannel`, `dtmfDetection="true"`, `welcomeGreetingInterruptible="none"` (disclosure must be heard). `reportInputDuringAgentSpeech` stays at its default (`none`) in this pass — the bridge's turn logic is not designed for input during agent speech and changing it needs real-call testing; recorded in §7.
 
 ### 3.9 Twilio-side settings (via API, values recorded in the plan)
 `voice_fallback_url` → a static TwiML on the BB VPS (`/phone/fallback.xml`: `<Dial>` to the profile's `forward_to`, else `<Say>` an apology) so an outage on this machine forwards callers to a human instead of "application error" · `status_callback` → `/voice/status` (signed) updating `calls.twilio_*` · `sms_url` → `/sms/incoming` (signed) writing a message + ntfy, replying with empty TwiML (no auto-reply until 10DLC). Warm transfer: `<Dial><Number url="/voice/whisper?call=…">` plays a one-line summary to the human before connecting (signed, TwiML `<Say>`).

@@ -30,11 +30,20 @@ greeting = "Thanks for calling Acme Plumbing, this is Atlas. How can I help?"
 '''
 
 
-def _cfg(profile_extra: str = "", other: str = "", top: str = "") -> dict:
+BASE_GREETING = ('greeting = "Thanks for calling Acme Plumbing, this is Atlas. '
+                 'How can I help?"')
+
+
+def _cfg(profile_extra: str = "", other: str = "", top: str = "",
+         greeting: str | None = None) -> dict:
     """BASE with extra lines in [profiles.acme] (`profile_extra`), extra
     sections after it (`other`), and top-level keys before it (`top` — TOML
-    puts bare keys in whatever table precedes them)."""
-    return tomllib.loads(top + BASE + profile_extra + other)
+    puts bare keys in whatever table precedes them). `greeting` REPLACES the
+    one BASE sets, since TOML refuses the same key twice."""
+    base = BASE
+    if greeting is not None:
+        base = base.replace(BASE_GREETING, f"greeting = {greeting!r}".replace("'", '"'))
+    return tomllib.loads(top + base + profile_extra + other)
 
 
 @pytest.fixture
@@ -42,10 +51,10 @@ def svc(tmp_path, monkeypatch):
     return _import_service(tmp_path, monkeypatch)
 
 
-def _err(svc, profile_extra="", other="", top=""):
+def _err(svc, profile_extra="", other="", top="", greeting=None):
     """The refusal sentence for a config, or '' when it validates."""
     try:
-        svc.parse_config(_cfg(profile_extra, other, top))
+        svc.parse_config(_cfg(profile_extra, other, top, greeting))
     except ValueError as e:
         return str(e)
     return ""
@@ -72,6 +81,9 @@ def test_every_documented_setting_has_a_default(svc):
     assert defaults["hints"] == [] and defaults["block_list"] == []
     assert defaults["voice"] == "" and defaults["brain"] == ""
     assert defaults["timezone"] == ""
+    # empty on purpose: naming a provider here would change the voice every
+    # existing caller hears the moment this ships
+    assert defaults["tts_provider"] == "" and defaults["transcription_provider"] == ""
 
 
 def test_a_default_list_cannot_be_mutated_into_every_other_profile(svc):
@@ -382,6 +394,18 @@ def test_branding_colors_must_be_text(svc):
     assert "colors" in _err(svc, other="\n[branding]\ncolors = { brand = 3 }\n")
 
 
+def test_a_colour_name_the_emitter_could_not_write_is_refused_at_boot(svc):
+    """The emitter can only write these names plainly. Catching it here means
+    the owner is not told on the day they press Save."""
+    error = _err(svc, other='\n[branding]\ncolors = { "brand color" = "#e85d1a" }\n')
+    assert "brand color" in error
+
+
+def test_a_font_name_the_emitter_could_not_write_is_refused_at_boot(svc):
+    assert "body font" in _err(
+        svc, other='\n[branding]\nfonts = { "body font" = "Inter" }\n')
+
+
 def test_a_logo_that_is_not_there_is_said_out_loud(svc, tmp_path, caplog):
     import logging
     missing = tmp_path / "no-such-logo.png"
@@ -575,6 +599,33 @@ def test_both_notices_waived_leaves_the_greeting_alone(svc):
     assert svc.opening_line(profile, _state(True)) == profile["greeting"]
 
 
+def test_the_greeting_takes_the_placeholders_too(svc):
+    """"Welcome to {business_name}." is the obvious thing an owner writes."""
+    config = svc.parse_config(
+        _cfg(greeting="Welcome to {business_name}. How can I help?"))
+    line = svc.opening_line(config.profiles["acme"], _state(True))
+    assert line.startswith("Welcome to Acme Plumbing.")
+    assert "{business_name}" not in line
+
+
+def test_the_after_hours_greeting_takes_them_as_well(svc):
+    config = svc.parse_config(_cfg(
+        'timezone = "America/New_York"\n'
+        'hours = { mon = "09:00-17:00" }\n'
+        'after_hours_greeting = "{business_name} is closed. {assistant_name} '
+        'can take a message."\n'))
+    line = svc.opening_line(config.profiles["acme"], _state(False))
+    assert line.startswith("Acme Plumbing is closed. Atlas can take a message.")
+
+
+def test_a_greeting_placeholder_that_does_not_exist_is_refused(svc):
+    assert "town" in _err(svc, greeting="Hello from {town}.")
+
+
+def test_an_after_hours_greeting_placeholder_that_does_not_exist_is_refused(svc):
+    assert "town" in _err(svc, 'after_hours_greeting = "Closed in {town}."\n')
+
+
 def test_the_notice_placeholders_are_substituted(svc):
     config = svc.parse_config(_cfg(
         'assistant_name = "Rex"\n'
@@ -608,12 +659,50 @@ ignore_backchannel = false
 
 def test_empty_relay_settings_are_left_out_entirely(svc):
     """An empty voice="" attribute is not 'the provider default' to Twilio —
-    it is a rejected TwiML document."""
+    it is a rejected TwiML document. Leaving the attribute out is also what
+    stops this release changing the voice existing callers hear."""
     attrs = svc.relay_attributes(svc.parse_config(_cfg()).profiles["acme"])
     assert "voice" not in attrs
     assert "hints" not in attrs
+    assert "ttsProvider" not in attrs
+    assert "transcriptionProvider" not in attrs
+    assert attrs["language"] == "en-US"       # the one that is always sent
     assert attrs["ignoreBackchannel"] == "true"
-    assert attrs["ttsProvider"] and attrs["transcriptionProvider"]
+
+
+def test_a_default_profile_sends_no_provider_to_twilio(svc):
+    """The cutover must not change how the line sounds: with nothing set, the
+    TwiML names no provider and no voice at all."""
+    xml = _incoming_twiml(svc, {"To": "+15550001111", "From": "+15550002222",
+                                "CallSid": "CA4"})
+    assert "ttsProvider" not in xml
+    assert "transcriptionProvider" not in xml
+    assert "voice=" not in xml
+    assert 'language="en-US"' in xml
+
+
+def test_a_named_provider_reaches_the_twiml(svc):
+    profile = svc.PROFILES["acme"]
+    profile["tts_provider"] = "ElevenLabs"
+    profile["transcription_provider"] = "Deepgram"
+    profile["voice"] = "Rachel"
+    xml = _incoming_twiml(svc, {"To": "+15550001111", "From": "+15550002222",
+                                "CallSid": "CA5"})
+    assert 'ttsProvider="ElevenLabs"' in xml
+    assert 'transcriptionProvider="Deepgram"' in xml
+    assert 'voice="Rachel"' in xml
+
+
+def test_multi_language_is_refused_when_the_providers_are_merely_unset(svc):
+    """Empty providers mean Twilio's own, which cannot do multi-language. The
+    refusal has to name the two values to write."""
+    error = _err(svc, 'language = "multi"\ntts_provider = "ElevenLabs"\n')
+    assert 'transcription_provider = "Deepgram"' in error
+    assert 'tts_provider = "ElevenLabs"' in error
+
+
+def test_an_empty_provider_is_a_valid_setting(svc):
+    assert _err(svc, 'tts_provider = ""\ntranscription_provider = ""\n') == ""
 
 
 def _incoming_twiml(svc, form) -> str:
@@ -674,6 +763,17 @@ def test_a_greeting_that_cannot_be_composed_never_drops_the_disclosure(svc):
     assert "isn&#39;t set up correctly" in xml or "isn't set up correctly" in xml
     assert "ConversationRelay" not in xml
     assert [e["kind"] for e in svc.RECENT_EVENTS] == ["greeting_failed"]
+
+
+def test_the_greeting_is_escaped_into_the_attribute(svc):
+    """A quote in the greeting would end the attribute early and an ampersand
+    would make the document invalid — Twilio answers "application error"."""
+    svc.PROFILES["acme"]["greeting"] = 'Ask for "Jo" & Co. How can I help?'
+    xml = _incoming_twiml(svc, {"To": "+15550001111", "From": "+15550002222",
+                                "CallSid": "CA6"})
+    assert 'welcomeGreeting="Ask for &quot;Jo&quot; &amp; Co.' in xml
+    assert 'for "Jo"' not in xml            # no raw quote inside the attribute
+    assert "& Co" not in xml                # no raw ampersand anywhere
 
 
 def test_the_twiml_greeting_follows_the_hours(svc, monkeypatch):

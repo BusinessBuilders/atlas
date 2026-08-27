@@ -224,13 +224,22 @@ does nothing, but it never does nothing silently.
 
 ## Who may sign in, and whose name is on it
 
-`[owners.<name>]` gives one dashboard login: `token_env` NAMES the environment
-variable holding their token (never the token itself) and `profiles` lists the
-businesses they may see, or `["*"]` for all of them. With no `[owners.*]` at
-all the legacy `ADMIN_TOKEN` is the single login and sees everything, so
-nothing breaks on an upgrade. `[branding]` puts a reseller's `vendor_name`,
-`product_name`, `logo_path`, `support_email`, `colors` and `fonts` over the
-dashboard; left out, it is plainly branded with its built-in palette.
+`[owners.<name>]` describes one dashboard login: `token_env` NAMES the
+environment variable holding their token (never the token itself) and
+`profiles` lists the businesses they may see, or `["*"]` for all of them.
+`[branding]` carries a reseller's `vendor_name`, `product_name`, `logo_path`,
+`support_email`, `colors` and `fonts`.
+
+**What is true today:** both tables are validated at boot, on `--check` and on
+every dashboard save, and both are preserved byte-for-byte through a save — an
+owner login written into the config cannot be lost by pressing Save. What
+*reads* them is the `admin/` dashboard package being built on this branch;
+until that is installed, `admin.py` still authenticates against the single
+`ADMIN_TOKEN` and renders its own plain styling, so an `[owners.jo]` section
+does not yet let Jo sign in and a `[branding]` section does not yet change what
+the page looks like. `ADMIN_TOKEN` keeps working either way: when it is set it
+appears as the implicit owner `_admin` with `["*"]`, which is what the new
+dashboard will accept on day one.
 
 ## Owner dashboard
 

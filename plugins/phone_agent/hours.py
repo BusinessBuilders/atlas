@@ -42,6 +42,27 @@ NEXT_OPEN_HORIZON_DAYS = 14
 _RANGE_RE = re.compile(r"^([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})$")
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
+# The three profile settings this module reads, each with the value that means
+# "the owner said nothing". They live HERE, and service.py folds them into
+# PROFILE_DEFAULTS, so the two modules cannot drift apart and there is still no
+# import cycle: service.py imports hours, hours never imports service.
+SETTING_DEFAULTS: dict = {"timezone": "", "hours": {}, "holidays": []}
+
+
+def setting(profile: Mapping, name: str):
+    """One scheduling setting, or its default when the profile is silent.
+    Tables and lists are copied on the way out so a caller cannot edit the
+    default itself."""
+    if name not in SETTING_DEFAULTS:
+        raise KeyError(f"{name!r} is not a scheduling setting "
+                       f"({', '.join(SETTING_DEFAULTS)})")
+    default = SETTING_DEFAULTS[name]
+    value = profile.get(name, None)
+    if value is None:
+        return dict(default) if isinstance(default, dict) else (
+            list(default) if isinstance(default, list) else default)
+    return value
+
 
 @dataclass(frozen=True)
 class OpenState:
@@ -144,7 +165,7 @@ def profile_zone(profile: Mapping) -> tzinfo:
     """The profile's timezone. Falls back to the host's zone ONLY when the
     profile schedules nothing — a profile with hours or holidays and no
     timezone is a question nobody can answer, so it raises."""
-    name = str(profile.get("timezone", "") or "").strip()
+    name = str(setting(profile, "timezone") or "").strip()
     if name:
         try:
             return ZoneInfo(name)
@@ -153,7 +174,7 @@ def profile_zone(profile: Mapping) -> tzinfo:
                 f"timezone {name!r} is not a name this machine knows. Use an IANA "
                 'name like "America/New_York" or "Europe/London".'
             )
-    if profile.get("hours") or profile.get("holidays"):
+    if setting(profile, "hours") or setting(profile, "holidays"):
         raise ValueError(
             'opening hours and holidays need a timezone — add timezone = '
             '"America/New_York" (or wherever the business is) to the profile'
@@ -191,8 +212,8 @@ def open_state(profile: Mapping, now: datetime) -> OpenState:
             "means the host's zone, which is not necessarily the business's"
         )
     zone = profile_zone(profile)
-    table = parse_hours_table(profile.get("hours") or {})
-    holidays = parse_holidays(profile.get("holidays") or [])
+    table = parse_hours_table(setting(profile, "hours") or {})
+    holidays = parse_holidays(setting(profile, "holidays") or [])
 
     local = now.astimezone(zone)
     today = local.date()

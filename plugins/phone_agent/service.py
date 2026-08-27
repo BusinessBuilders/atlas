@@ -828,11 +828,11 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Nothing here names a real business, a vendor account or one owner's
 # preference: the values a customer pays for live in their config file.
 PROFILE_DEFAULTS: dict = {
-    # when the business is open (see hours.py). No hours = open all the time,
-    # exactly as every profile behaved before hours existed.
-    "timezone": "",
-    "hours": {},
-    "holidays": [],
+    # when the business is open. hours.py owns these three defaults and reads
+    # them through its own accessor, so the two modules cannot drift. No hours
+    # = open all the time, exactly as every profile behaved before hours
+    # existed.
+    **hours.SETTING_DEFAULTS,
     "after_hours": "message",          # message | transfer | same
     "after_hours_greeting": "",
     # what the caller must be told (see §3.7). Both default ON; neither can be
@@ -842,13 +842,15 @@ PROFILE_DEFAULTS: dict = {
     "recording_notice": True,
     "recording_notice_text": "This call may be recorded and transcribed.",
     "ack_disclosure_waived": False,
-    # how Twilio's ConversationRelay hears and speaks. The provider defaults
-    # are Twilio's own, so a profile that says nothing sounds exactly as it
-    # did before these settings existed and needs no extra vendor account.
+    # how Twilio's ConversationRelay hears and speaks. Empty means "leave the
+    # attribute out of the TwiML entirely and let Twilio use its own default":
+    # naming a provider here would change the voice callers hear the moment
+    # this ships, and picking the wrong one would need a vendor account the
+    # customer's Twilio project may not have.
     "language": "en-US",
-    "tts_provider": "Google",
+    "tts_provider": "",
     "voice": "",
-    "transcription_provider": "Google",
+    "transcription_provider": "",
     "hints": [],
     "ignore_backchannel": True,
     # per-business plumbing
@@ -1010,19 +1012,26 @@ def _validate_profile_settings(key: str, profile: dict) -> None:
                 "would hear nothing where the notice should be"
             )
         _check_placeholders(text, where(text_name))
+    # The greetings take the same placeholders, so "Welcome to {business_name}."
+    # works — and a placeholder nobody can fill in is refused here rather than
+    # raising with a caller already on the line.
+    _check_placeholders(str(profile.get("greeting", "")), where("greeting"))
+    _check_placeholders(str(profile_setting(profile, "after_hours_greeting")),
+                        where("after_hours_greeting"))
 
     # --- how the call sounds ----------------------------------------------
-    tts = profile_setting(profile, "tts_provider")
-    if tts not in _TTS_PROVIDERS:
+    tts = str(profile_setting(profile, "tts_provider")).strip()
+    if tts and tts not in _TTS_PROVIDERS:
         raise ValueError(
             f"{where('tts_provider')} = {tts!r} must be one of "
-            f"{', '.join(_TTS_PROVIDERS)}"
+            f"{', '.join(_TTS_PROVIDERS)}, or empty for Twilio's own default"
         )
-    transcription = profile_setting(profile, "transcription_provider")
-    if transcription not in _TRANSCRIPTION_PROVIDERS:
+    transcription = str(profile_setting(profile, "transcription_provider")).strip()
+    if transcription and transcription not in _TRANSCRIPTION_PROVIDERS:
         raise ValueError(
             f"{where('transcription_provider')} = {transcription!r} must be one "
-            f"of {', '.join(_TRANSCRIPTION_PROVIDERS)}"
+            f"of {', '.join(_TRANSCRIPTION_PROVIDERS)}, or empty for Twilio's "
+            "own default"
         )
     language = str(profile_setting(profile, "language")).strip()
     if not language:
@@ -1035,8 +1044,10 @@ def _validate_profile_settings(key: str, profile: dict) -> None:
         raise ValueError(
             f'{where("language")} = "multi" (automatic language detection) works '
             'only with transcription_provider = "Deepgram" and '
-            'tts_provider = "ElevenLabs". Set both, or name a single language '
-            'like "en-US".'
+            'tts_provider = "ElevenLabs". Both must be written out in this '
+            "profile — left empty they mean Twilio's own default providers, "
+            'which cannot do it. Set both, or name a single language like '
+            '"en-US".'
         )
 
     hint_list = profile_setting(profile, "hints")
@@ -1229,6 +1240,14 @@ def parse_branding_config(data: dict) -> Branding:
                 f'[branding] {name} must be a table like {{ brand = "#e85d1a" }}'
             )
         for token, value in table.items():
+            if not re.match(r"^[A-Za-z0-9_-]+$", str(token)):
+                # The emitter can only write these names plainly, so a name it
+                # would choke on must be refused at boot — not on the day
+                # somebody presses Save.
+                raise ValueError(
+                    f"[branding] {name} has an entry named {token!r} — use "
+                    "letters, digits, underscores or hyphens"
+                )
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(
                     f'[branding] {name}.{token} must be text like "#e85d1a", '
@@ -1737,7 +1756,8 @@ def _split_off_final_sentence(text: str) -> tuple[str, str]:
 
 def opening_line(profile: dict, state) -> str:
     """Exactly what the caller hears first: the greeting with the AI
-    disclosure and the recording notice composed into it.
+    disclosure and the recording notice composed into it. The greeting and the
+    notices all take {business_name} and {assistant_name}.
 
     When the greeting ends in a question ("...How can I help?"), the notices go
     BEFORE that question — a caller starts answering the moment they hear it,
@@ -1746,15 +1766,25 @@ def opening_line(profile: dict, state) -> str:
 
     One function, so the dashboard's preview is the caller's experience.
     """
-    greeting = str(profile.get("greeting", "")).strip()
-    if state is not None and not state.open:
-        after_hours = str(profile_setting(profile, "after_hours_greeting")).strip()
-        if after_hours:
-            greeting = after_hours
     filled = {
         "business_name": str(profile.get("business_name", "")).strip(),
         "assistant_name": str(profile.get("assistant_name", "")).strip() or "Atlas",
     }
+
+    def fill(text: str, text_name: str) -> str:
+        try:
+            return text.format(**filled)
+        except (KeyError, IndexError, ValueError) as e:
+            # Config validation refuses these, so reaching here means something
+            # bypassed it — say so rather than speak a broken sentence.
+            raise ValueError(f"{text_name} cannot be filled in ({e})")
+
+    greeting_name = "greeting"
+    greeting = str(profile.get("greeting", "")).strip()
+    if state is not None and not state.open:
+        after_hours = str(profile_setting(profile, "after_hours_greeting")).strip()
+        if after_hours:
+            greeting, greeting_name = after_hours, "after_hours_greeting"
     notices = []
     for flag, text_name in (("ai_disclosure", "ai_disclosure_text"),
                             ("recording_notice", "recording_notice_text")):
@@ -1763,13 +1793,8 @@ def opening_line(profile: dict, state) -> str:
         raw = str(profile_setting(profile, text_name)).strip()
         if not raw:
             continue
-        try:
-            notices.append(_as_sentence(raw.format(**filled)))
-        except (KeyError, IndexError, ValueError) as e:
-            # Config validation refuses these, so reaching here means something
-            # bypassed it — say so rather than speak a broken sentence.
-            raise ValueError(f"{text_name} cannot be filled in ({e})")
-    greeting = _as_sentence(greeting)
+        notices.append(_as_sentence(fill(raw, text_name)))
+    greeting = _as_sentence(fill(greeting, greeting_name))
     if not notices:
         return greeting
     before, last = _split_off_final_sentence(greeting)
@@ -1783,21 +1808,23 @@ def opening_line(profile: dict, state) -> str:
 def relay_attributes(profile: dict) -> dict:
     """The <ConversationRelay> attributes for one business.
 
-    `voice` and `hints` appear only when the profile sets them: Twilio reads an
-    empty attribute as a value, not as "use your default", and rejects the
-    document. dtmfDetection is always on (a caller pressing keys must not be
-    silence), and the welcome greeting is never interruptible — the disclosure
-    has to be heard.
+    The two providers, `voice` and `hints` appear ONLY when the profile names
+    them. Twilio reads an empty attribute as a value rather than "use your
+    default" and rejects the document — and leaving the attribute out entirely
+    is also what keeps this release from changing the voice existing callers
+    hear, whatever Twilio's default happens to be.
+
+    dtmfDetection is always on (a caller pressing keys must not be silence),
+    and the welcome greeting is never interruptible — the disclosure has to be
+    heard.
     """
-    attributes = {
-        "language": str(profile_setting(profile, "language")).strip(),
-        "ttsProvider": str(profile_setting(profile, "tts_provider")).strip(),
-    }
-    voice = str(profile_setting(profile, "voice")).strip()
-    if voice:
-        attributes["voice"] = voice
-    attributes["transcriptionProvider"] = str(
-        profile_setting(profile, "transcription_provider")).strip()
+    attributes = {"language": str(profile_setting(profile, "language")).strip()}
+    for attribute, name in (("ttsProvider", "tts_provider"),
+                            ("voice", "voice"),
+                            ("transcriptionProvider", "transcription_provider")):
+        value = str(profile_setting(profile, name)).strip()
+        if value:
+            attributes[attribute] = value
     hint_words = [str(hint).strip() for hint in profile_setting(profile, "hints")
                   if str(hint).strip()]
     if hint_words:

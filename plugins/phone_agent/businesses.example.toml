@@ -86,21 +86,29 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # assistant_aliases = '''         # optional; words the transcriber confuses
 # Alice                           # with the assistant's name. Empty -> the
 # '''                             # standard set for the name Atlas.
-# facts = '''                     # optional; the ONLY specifics the agent may
-# Email: office@acmeplumbing.com  # state as fact (hours, contact, service
-# Hours: Mon-Fri 8am-5pm          # area, pricing posture). Omit it and the
-# '''                             # agent takes a message instead.
+# facts = '''                        # optional; the ONLY specifics the agent
+# Email: office@acmeplumbing.example # may state as fact (hours, contact,
+# Hours: Mon-Fri 8am-5pm             # service area, pricing posture). Omit it
+# '''                                # and the agent takes a message instead.
 # extra_instructions = '''        # optional; appended to this business's
 # Ask which town the caller is in.# prompt. It can never override the safety
 # '''                             # rules.
 
 # ---- how the call sounds (Twilio ConversationRelay) ---------------------
 # language = "en-US"              # default "en-US". "multi" (automatic
-#                                 # detection) needs Deepgram + ElevenLabs.
-# tts_provider = "Google"         # Google | Amazon | ElevenLabs (default
-#                                 # Google — Twilio's own, no extra account).
-# voice = ""                      # provider voice id; empty = their default
-# transcription_provider = "Google"   # Google | Deepgram (default Google)
+#                                 # detection) needs BOTH providers below
+#                                 # written out as Deepgram + ElevenLabs.
+# tts_provider = ""               # Google | Amazon | ElevenLabs. DEFAULT ""
+#                                 # = leave it out of the TwiML entirely and
+#                                 # let Twilio use its own default, so filling
+#                                 # in this file never changes the voice your
+#                                 # callers already hear. ElevenLabs and
+#                                 # Deepgram need those integrations enabled
+#                                 # on your Twilio project.
+# voice = ""                      # provider voice id. Default "" = omitted,
+#                                 # i.e. the provider's own default voice.
+# transcription_provider = ""     # Google | Deepgram. Default "" = omitted,
+#                                 # i.e. Twilio's own default.
 # hints = ["Acme Plumbing"]       # words the transcriber should expect —
 #                                 # business name, staff names, product names.
 #                                 # No commas inside a hint.
@@ -129,8 +137,13 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # ---- who may sign in to the dashboard -----------------------------------
 # Each owner's sign-in token lives in ~/.config/atlas-phone/env under the NAME
 # given here — never in this file. An owner sees only the businesses listed;
-# ["*"] means every business on this line. With no [owners.*] at all, the
-# legacy ADMIN_TOKEN env var is the single login and it sees everything.
+# ["*"] means every business on this line.
+#
+# WHAT THIS DOES TODAY: these sections are validated at boot and on every save,
+# and a save can never drop them. The dashboard that READS them is the admin/
+# package being built on this branch; until it is installed, sign-in still uses
+# the single ADMIN_TOKEN env var (which counts as an owner of every business),
+# so adding [owners.jo] here does not yet give Jo a login of her own.
 #
 # [owners.jo]
 # token_env = "PHONE_OWNER_JO_TOKEN"
@@ -145,6 +158,12 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # Optional. Left out, the dashboard is plainly branded ("Atlas", "Phone
 # Agent") with its built-in palette. Fill it in to put your own agency's name,
 # logo and colours over it.
+#
+# WHAT THIS DOES TODAY: validated and preserved by every save, exactly like the
+# owners above. The dashboard that READS it is the admin/ package being built
+# on this branch; until that is installed the current page keeps its own plain
+# styling whatever you write here. Colour and font names must be letters,
+# digits, underscores or hyphens.
 #
 # [branding]
 # vendor_name = "Acme Digital"
