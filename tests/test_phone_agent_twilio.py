@@ -239,6 +239,63 @@ async def test_the_same_text_delivered_twice_is_kept_once(tmp_path, monkeypatch)
         assert "sms_already_recorded" in kinds(line.svc)
 
 
+async def test_a_retry_after_a_crash_mid_delivery_still_reaches_the_owner(
+        tmp_path, monkeypatch):
+    """The call row is written before the message is delivered. If the process
+    dies in between, the row is there and the owner has nothing — so the row
+    alone must never be read as "already on the pad". `notify_status` is the
+    marker, and it is written at the END of delivery."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        form = _sms_form()
+
+        # the first delivery dies the way a crash would: after the rows, before
+        # the pad and the push
+        async def die(*args, **kwargs):
+            raise RuntimeError("the process went away mid-delivery")
+
+        monkeypatch.setattr(line.svc, "deliver_note", die)
+        with pytest.raises(aiohttp.ClientResponseError):
+            async with aiohttp.ClientSession(raise_for_status=True) as session:
+                async with session.post(
+                        f"{line.base}/sms/incoming",
+                        **_twilio_post_kwargs(line, "/sms/incoming", form)):
+                    pass
+        assert line.svc.STORE.get_call(MESSAGE_SID) is not None    # the row is there
+        assert not line.pad.exists()                               # the message is not
+
+        # Twilio retries. The text must land this time — and only once.
+        monkeypatch.undo()
+        status, _ = await _post(line, "/sms/incoming",
+                                **_twilio_post_kwargs(line, "/sms/incoming", form))
+
+        assert status == 200
+        assert form["Body"] in line.pad.read_text(encoding="utf-8")
+        assert len(line.ntfy.pushes) == 1
+        assert len(line.svc.STORE.list_messages(["acme"])) == 1     # not two
+        assert "sms_delivery_retried" in kinds(line.svc)
+        assert "sms_already_recorded" not in kinds(line.svc)
+
+
+async def test_a_retried_blocked_text_is_one_clean_event(tmp_path, monkeypatch):
+    """A blocked text is never delivered, so it has no notify_status — the
+    dedupe must recognise it by its outcome instead of trying to write its rows
+    a second time and logging store failures."""
+    nuisance = "+15085550123"
+    async with phone_line(tmp_path, monkeypatch, ntfy=False,
+                          cfg_extra=f'block_list = ["{nuisance}"]\n') as line:
+        form = _sms_form(caller=nuisance)
+        for _ in range(2):
+            status, _body = await _post(
+                line, "/sms/incoming",
+                **_twilio_post_kwargs(line, "/sms/incoming", form))
+            assert status == 200
+
+        assert "store_write_failed" not in kinds(line.svc)
+        assert kinds(line.svc).count("sms_already_recorded") == 1
+        assert line.svc.STORE.get_call(MESSAGE_SID)["outcome"] == "blocked"
+        assert line.svc.STORE.list_messages(["acme"], include_test=True) == []
+
+
 async def test_a_text_to_an_unmapped_number_is_recorded_and_answered_emptily(
         tmp_path, monkeypatch):
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
@@ -839,6 +896,85 @@ async def test_apply_writes_only_the_fields_that_differ(tmp_path, monkeypatch, c
     assert AUTH_TOKEN not in out + err
 
 
+async def test_a_differing_voice_url_is_shown_and_warned_but_never_written(
+        tmp_path, monkeypatch, capsys):
+    """voice_url is what makes the number answer at all, and pointing it
+    somewhere else is sometimes deliberate. This script says so; it does not
+    decide."""
+    tc = twilio_config_module()
+    async with fake_twilio() as api:
+        api.numbers[0]["voice_url"] = "https://maintenance.example/holding"
+        _cli_env(tmp_path, api, monkeypatch)
+        code, out, err = await _run(tc, ["--apply", "--out", str(tmp_path / "r")],
+                                    capsys)
+
+    assert code == 0, err
+    assert "https://maintenance.example/holding" in out          # shown
+    assert "WARNING" in err and "voice_url" in err               # and warned
+    assert "--apply-voice-url" in err                            # with the way out
+    assert "VoiceUrl" not in api.updates[0]["form"]              # never written
+    assert set(api.updates[0]["form"]) == {
+        "VoiceFallbackUrl", "StatusCallback", "SmsUrl"}
+
+
+async def test_writing_the_voice_url_takes_two_deliberate_flags(
+        tmp_path, monkeypatch, capsys):
+    tc = twilio_config_module()
+    async with fake_twilio() as api:
+        api.numbers[0]["voice_url"] = "https://maintenance.example/holding"
+        _cli_env(tmp_path, api, monkeypatch)
+
+        code, _out, err = await _run(tc, ["--apply-voice-url"], capsys)
+        assert code == 2 and "--yes" in err
+        assert api.updates == [] and api.auth_seen == []
+
+        code, out, err = await _run(
+            tc, ["--apply-voice-url", "--yes", "--out", str(tmp_path / "r")], capsys)
+
+    assert code == 0, err
+    assert len(api.updates) == 1
+    form = api.updates[0]["form"]
+    assert form["VoiceUrl"] == "https://ai.business-builder.online/phone/voice/incoming"
+    assert set(form) == {"VoiceUrl", "VoiceFallbackUrl", "StatusCallback", "SmsUrl"}
+    assert "WARNING" not in err          # it was asked for; it is not a surprise
+
+
+async def test_show_warns_about_the_voice_url_without_writing_anything(
+        tmp_path, monkeypatch, capsys):
+    tc = twilio_config_module()
+    async with fake_twilio() as api:
+        api.numbers[0]["voice_url"] = "https://maintenance.example/holding"
+        _cli_env(tmp_path, api, monkeypatch)
+        code, out, err = await _run(tc, ["--show"], capsys)
+
+    assert code == 0, err
+    assert "WARNING" in err
+    assert api.updates == []
+    # the count offered to --apply excludes the field --apply will not write
+    assert "3 setting(s) would change" in out
+
+
+async def test_the_serve_instruction_follows_the_public_base(
+        tmp_path, monkeypatch, capsys):
+    """The bridge has moved mount once already. An instruction that says
+    /phone when PUBLIC_BASE says /line sends the operator to the wrong nginx
+    block."""
+    tc = twilio_config_module()
+    assert tc.public_path("https://ai.business-builder.online/phone") == "/phone"
+    assert tc.public_path("https://example.test/line/") == "/line"
+    assert tc.public_path("https://example.test") == ""
+
+    async with fake_twilio() as api:
+        _cli_env(tmp_path, api, monkeypatch,
+                 PUBLIC_BASE="https://example.test/line")
+        code, out, err = await _run(tc, ["--show"], capsys)
+
+    assert code == 0, err
+    assert "serve it on the VPS as /line/fallback.xml" in out
+    served = [ln for ln in out.splitlines() if "serve it on the VPS" in ln]
+    assert served and all("/phone/" not in ln for ln in served), served
+
+
 async def test_apply_with_nothing_to_change_writes_nothing(
         tmp_path, monkeypatch, capsys):
     tc = twilio_config_module()
@@ -972,3 +1108,23 @@ def test_every_new_route_is_registered(tmp_path, monkeypatch):
                  'add_post("/voice/whisper", voice_whisper)',
                  'add_get("/voice/whisper", voice_whisper)'):
         assert line in source, line
+
+
+def test_the_script_and_the_bridge_agree_on_the_paths(tmp_path, monkeypatch):
+    """twilio_config.py writes these paths onto a live phone number. A typo in
+    one of them, or a route renamed on one side only, points that number at a
+    404 — every call would fall through to the fallback and the owner would
+    hear about it from a customer."""
+    svc = _import_service(tmp_path, monkeypatch)
+    source = Path(svc.__file__).read_text(encoding="utf-8")
+    tc = twilio_config_module()
+
+    assert set(tc.ROUTES) == {"voice_url", "status_callback", "sms_url"}
+    for field, path in tc.ROUTES.items():
+        assert f'add_post("{path}"' in source, f"{field} -> {path} is not mounted"
+
+    # and the URLs the script would write really are built from those paths
+    plans = tc.load_numbers(_numbers_config(tmp_path))
+    intended = tc.intended_settings("https://example.test/phone", plans)
+    for field, path in tc.ROUTES.items():
+        assert intended["+15088863046"][field] == f"https://example.test/phone{path}"

@@ -23,9 +23,15 @@ Usage:
     twilio_config.py --show                 what Twilio has vs what it should
     twilio_config.py --render [--out DIR]   write the fallback TwiML files
     twilio_config.py --apply                write the differing fields to Twilio
+    twilio_config.py --apply-voice-url --yes   …including voice_url
 
 `--show` and `--render` change nothing on Twilio. `--apply` writes ONLY the
-fields that differ, and prints each one.
+fields that differ, and prints each one — except `voice_url`, which it never
+writes. That one field is what makes the number answer at all, and pointing it
+somewhere else is sometimes deliberate (a maintenance page, a second bridge, a
+migration mid-flight); a wrong value there is a dead line, not a missing
+feature. When it does not match, `--show` and `--apply` say so loudly and leave
+it alone. Change it in the Twilio console, or with `--apply-voice-url --yes`.
 
 Reads (never writes) the same settings file systemd hands the bridge —
 ~/.config/atlas-phone/env, or $ATLAS_PHONE_ENV — for TWILIO_ACCOUNT_SID,
@@ -52,7 +58,7 @@ import tomllib
 from base64 import b64encode
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 import aiohttp
@@ -69,6 +75,21 @@ DEFAULT_API_BASE = "https://api.twilio.com"
 
 # The four fields this script owns, in the order a person reads them.
 FIELDS = ("voice_url", "voice_fallback_url", "status_callback", "sms_url")
+# The bridge routes those three of them point at. These paths MUST match the
+# ones service.py registers in _serve(); the test suite ties the two together,
+# because a typo here would point a live number at a 404 and every call would
+# fall through to the fallback.
+ROUTES = {
+    "voice_url": "/voice/incoming",
+    "status_callback": "/voice/status",
+    "sms_url": "/sms/incoming",
+}
+# voice_url is READ but never written by --apply. It is the setting that
+# decides whether the phone line answers at all: a wrong value there is a dead
+# number, and it is the one field that may legitimately have been pointed
+# somewhere else on purpose (a maintenance page, a second bridge, a migration).
+# It changes by hand in the Twilio console, or with --apply-voice-url --yes.
+GUARDED_FIELDS = ("voice_url",)
 # Their names in Twilio's API, which are not their names in its JSON.
 API_NAMES = {
     "voice_url": "VoiceUrl",
@@ -189,12 +210,22 @@ def intended_settings(public_base: str, plans: dict) -> dict:
     for number in plans:
         fallback = "fallback.xml" if shared else fallback_filename(number)
         intended[number] = {
-            "voice_url": f"{base}/voice/incoming",
+            "voice_url": base + ROUTES["voice_url"],
             "voice_fallback_url": f"{base}/{fallback}",
-            "status_callback": f"{base}/voice/status",
-            "sms_url": f"{base}/sms/incoming",
+            "status_callback": base + ROUTES["status_callback"],
+            "sms_url": base + ROUTES["sms_url"],
         }
     return intended
+
+
+def public_path(public_base: str) -> str:
+    """The path PUBLIC_BASE is mounted at on the VPS ("/phone"), or "".
+
+    Read from the configured base rather than assumed: this bridge has already
+    moved between mounts once, and an instruction that says /phone when the
+    base says something else sends the operator to the wrong nginx block.
+    """
+    return urlparse(str(public_base)).path.rstrip("/")
 
 
 def plan(current: dict, intended: dict) -> dict:
@@ -328,15 +359,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="write the fallback TwiML files (no network)")
     parser.add_argument("--apply", action="store_true",
                         help="write the differing fields to Twilio, and render "
-                             "the fallback files")
+                             "the fallback files. Never writes voice_url.")
+    parser.add_argument("--apply-voice-url", action="store_true",
+                        help="also write voice_url — the setting that decides "
+                             "whether the line answers at all. Requires --yes.")
+    parser.add_argument("--yes", action="store_true",
+                        help="confirm --apply-voice-url. Nothing else needs it.")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR),
                         help=f"where --render/--apply write the fallback files "
                              f"(default: {DEFAULT_OUT_DIR})")
     return parser
 
 
+def writable(changes: dict, *, include_voice_url: bool) -> dict:
+    """The part of a change set --apply is allowed to write."""
+    if include_voice_url:
+        return dict(changes)
+    return {f: v for f, v in changes.items() if f not in GUARDED_FIELDS}
+
+
 def _print_number(entry: NumberPlan, current: dict, want: dict, changes: dict,
-                  out_dir: Path, shared: bool) -> None:
+                  out_dir: Path, shared: bool, base_path: str) -> None:
     print(f"\n{entry.number}  {entry.profile_key}  \"{entry.business_name}\"")
     for field in FIELDS:
         have = current.get(field) or "(not set)"
@@ -349,16 +392,34 @@ def _print_number(entry: NumberPlan, current: dict, want: dict, changes: dict,
     where = (f"dials {entry.forward_to}" if entry.forward_to
              else "apologises and hangs up (this business has no forward_to)")
     print(f"    fallback file       {out_dir / fallback_filename(entry.number)}")
-    print(f"                        serve it on the VPS as /phone/{name} — {where}")
+    print(f"                        serve it on the VPS as {base_path}/{name} "
+          f"— {where}")
+
+
+def _warn_voice_url(number: str, current, intended: str) -> None:
+    """The one field --apply will not touch, said loudly enough to act on."""
+    print(
+        f"WARNING: {number} answers calls at {current or '(not set)'}, not at "
+        f"{intended}. This script will NOT change that: voice_url is what makes "
+        "the line answer at all, and pointing it somewhere else is sometimes "
+        "deliberate. Change it in the Twilio console, or re-run with "
+        "--apply-voice-url --yes once you are sure.",
+        file=sys.stderr)
 
 
 async def run(argv) -> int:
     """The whole script. Returns the exit code; raises nothing on a bad
     config or a Twilio error — those are printed and turned into a code."""
     args = build_parser().parse_args(list(argv))
-    if not (args.show or args.render or args.apply):
+    applying = args.apply or args.apply_voice_url
+    if not (args.show or args.render or applying):
         print("nothing to do: pass --show to see what Twilio holds, --render to "
               "write the fallback TwiML, or --apply to set the URLs.",
+              file=sys.stderr)
+        return 2
+    if args.apply_voice_url and not args.yes:
+        print("twilio_config: --apply-voice-url changes the URL that makes this "
+              "number answer at all. Add --yes if that is what you mean.",
               file=sys.stderr)
         return 2
 
@@ -373,11 +434,12 @@ async def run(argv) -> int:
         return 2
     intended = intended_settings(public_base, plans)
     out_dir = Path(os.path.expanduser(args.out))
+    base_path = public_path(public_base)
 
-    if args.render or args.apply:
+    if args.render or applying:
         for path in render_all(plans, out_dir):
             print(f"rendered {path}")
-    if args.render and not (args.show or args.apply):
+    if args.render and not (args.show or applying):
         return 0
 
     try:
@@ -403,23 +465,35 @@ async def run(argv) -> int:
                 return 1
 
             planned: dict = {}
+            warned: list = []
             for number in sorted(plans):
                 current = {f: held[number].get(f) for f in FIELDS}
                 changes = plan(current, intended[number])
                 planned[number] = changes
                 _print_number(plans[number], current, intended[number], changes,
-                              out_dir, len(plans) == 1)
+                              out_dir, len(plans) == 1, base_path)
+                if "voice_url" in changes and not args.apply_voice_url:
+                    warned.append(number)
 
-            if not args.apply:
-                total = sum(len(c) for c in planned.values())
+            # Said after the whole listing, on stderr, so it survives a pipe and
+            # is the last thing on the screen.
+            for number in warned:
+                _warn_voice_url(number, held[number].get("voice_url"),
+                                intended[number]["voice_url"])
+
+            writes = {n: writable(c, include_voice_url=args.apply_voice_url)
+                      for n, c in planned.items()}
+            if not applying:
+                total = sum(len(c) for c in writes.values())
                 print(f"\n{total} setting(s) would change — run --apply to write them."
-                      if total else "\nEverything already matches; --apply would "
-                                    "write nothing.")
+                      if total else "\nEverything --apply can write already matches."
+                      if warned else "\nEverything already matches; --apply would "
+                                     "write nothing.")
                 return 0
 
             wrote = 0
             for number in sorted(plans):
-                changes = planned[number]
+                changes = writes[number]
                 if not changes:
                     continue
                 await update_number(session, api_base, account_sid,
@@ -428,6 +502,8 @@ async def run(argv) -> int:
                 print(f"\nwrote {len(changes)} setting(s) to {number}: "
                       + ", ".join(sorted(changes)))
             print(f"\n{wrote} setting(s) written." if wrote
+                  else "\nEverything --apply can write already matches; nothing "
+                       "was written." if warned
                   else "\nEverything already matches; nothing was written.")
             return 0
     except (TwilioError, aiohttp.ClientError, asyncio.TimeoutError) as e:

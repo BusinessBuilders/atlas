@@ -1156,7 +1156,7 @@ async def test_a_brain_that_dies_turns_health_red_on_the_next_sweep(
         await svc.refresh_brain_health(now=1.0)          # the very next sweep
 
         status, body = svc.public_health()
-        assert status == 503 and body["reason"] == "model backend unreachable"
+        assert status == 503 and body["reason"] == "the active brain is unreachable"
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{line.base}/health") as resp:
                 assert resp.status == 503
@@ -1260,7 +1260,13 @@ async def test_a_business_on_its_own_backend_is_never_silently_down(
 
             status, body = svc.public_health()
             assert status == 503
-            assert "theirs" in body["reason"], body
+            # …but the PUBLIC page never says which brain: the key is a name the
+            # owner chose and it names a vendor (H-9)
+            assert body["reason"] == "a configured brain is unreachable"
+            assert "theirs" not in json.dumps(body)
+            # the owner's own dashboard does say it
+            snapshot, _ok = await svc.health_snapshot()
+            assert snapshot["unreachable_brains"] == ["theirs"]
 
             # and it comes back green when the backend does
             theirs.models_status = 200
@@ -1280,7 +1286,7 @@ async def test_the_active_brain_going_down_still_reads_as_the_line_being_down(
         await svc.refresh_brain_health(now=0.0)
 
         status, body = svc.public_health()
-        assert status == 503 and body["reason"] == "model backend unreachable"
+        assert status == 503 and body["reason"] == "the active brain is unreachable"
         assert "brain_unreachable" in kinds(svc)
 
 

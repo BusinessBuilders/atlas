@@ -862,7 +862,11 @@ async def test_public_health_still_degrades_when_the_brain_is_dead(tmp_path, mon
             async with session.get(f"{line.base}/health") as resp:
                 assert resp.status == 503
                 body = await resp.json()
-        assert body == {"status": "degraded", "reason": "model backend unreachable"}
+        assert body == {"status": "degraded",
+                        "reason": "the active brain is unreachable"}
+        # and it does not name the brain: that key is the owner's, and naming a
+        # vendor on a public page is what H-9 removed
+        assert line.svc.ACTIVE_BRAIN not in json.dumps(body)
 
 
 async def test_the_owner_status_tool_reads_the_trimmed_health(tmp_path, monkeypatch):
@@ -894,7 +898,7 @@ async def test_the_owner_status_tool_reads_the_trimmed_health(tmp_path, monkeypa
         degraded = await ask()
         assert degraded["ok"] is True
         assert degraded["line"].startswith("DEGRADED")
-        assert "model backend unreachable" in degraded["line"]
+        assert "the active brain is unreachable" in degraded["line"]
 
 
 async def test_a_failed_summary_still_writes_a_pad_entry_that_says_so(tmp_path, monkeypatch):

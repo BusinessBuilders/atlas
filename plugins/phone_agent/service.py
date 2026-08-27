@@ -3208,6 +3208,13 @@ async def voice_whisper(request: web.Request) -> web.Response:
     agree with the URL Twilio reconstructs for a DIALLED leg, and getting that
     wrong fails closed on a live transfer: the human hears silence and the
     caller waits. Bad or missing token: 403, nothing read, nothing spoken.
+
+    The token is deliberately NOT consumed, unlike the relay's. Twilio may
+    fetch this URL more than once for a single dial (a retry, a re-ring), and a
+    single-use token would turn the second fetch into silence on a live
+    transfer. What bounds it instead is its five-minute life and its binding to
+    this one CallSid: a replay after the transfer is over reads nothing new,
+    and a replay on any other call does not verify at all.
     """
     call_sid = str(request.query.get("call", ""))
     token = str(request.query.get("t", ""))
@@ -3244,6 +3251,11 @@ async def voice_whisper(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------- twilio status calls --
+# What Twilio is answered with when there is nothing to say back. Twilio parses
+# the body either way; an empty <Response> is how its own examples say "I took
+# this, do nothing else".
+EMPTY_TWIML = "<Response></Response>"
+
 
 def _twilio_whole_number(value):
     """Twilio's CallDuration, as an int — or None. Twilio sends "" on the
@@ -3292,13 +3304,10 @@ async def voice_status(request: web.Request) -> web.Response:
         except Exception as e:
             record_event("error", "store_write_failed",
                          f"update_twilio: {type(e).__name__}: {e}", call_sid)
-    return web.Response(text="<Response></Response>", content_type="text/xml")
+    return web.Response(text=EMPTY_TWIML, content_type="text/xml")
 
 
 # ------------------------------------------------------------ inbound SMS --
-
-EMPTY_TWIML = "<Response></Response>"
-
 
 async def sms_incoming(request: web.Request) -> web.Response:
     """A text to one of the line's numbers.
@@ -3338,6 +3347,36 @@ async def sms_incoming(request: web.Request) -> web.Response:
                      "a text arrived with no MessageSid — filed under a local id",
                      message_sid, profile_key)
 
+    # Have we seen this text before? Twilio retries a webhook that timed out,
+    # and the push below can take ten seconds — so this runs FIRST, before the
+    # block list and before any write, and it is the only place that decides
+    # whether a redelivery is a duplicate.
+    #
+    # The row alone does not mean the owner got the message: a crash between
+    # writing the row and finishing the delivery would leave one behind, and
+    # answering "already on the pad" to the retry would lose the text for good.
+    # `notify_status` is the marker, and it is written at the END of delivery
+    # (deliver_note → set_notify_status), so an unfinished attempt is exactly a
+    # row with no status — and that one is delivered again, WITHOUT a second
+    # message row. A finished attempt is never redone, even a `failed` one:
+    # there the pad entry exists and only the push failed, /health is already
+    # degraded for it, and a second pad entry would be a second thing for the
+    # owner to answer.
+    seen = None
+    store = STORE
+    if store is not None:
+        try:
+            seen = store.get_call(message_sid)
+        except Exception as e:
+            record_event("error", "store_read_failed",
+                         f"get_call: {type(e).__name__}: {e}", message_sid, profile_key)
+    if seen is not None and (seen["notify_status"] is not None
+                             or seen["outcome"] == "blocked"):
+        record_event("warning", "sms_already_recorded",
+                     "twilio delivered this text again — it is already on the pad, "
+                     "nothing was written twice", message_sid, profile_key)
+        return web.Response(text=EMPTY_TWIML, content_type="text/xml")
+
     brain = call_brain(profile, profile_key)
     if from_number and from_number.strip() in {
             str(n).strip() for n in profile_setting(profile, "block_list")}:
@@ -3348,46 +3387,41 @@ async def sms_incoming(request: web.Request) -> web.Response:
         record_event("warning", "blocked",
                      f"text from {mask_number(from_number)} refused by the block list",
                      message_sid, profile_key)
+        if seen is None:
+            _store_write("start_call", message_sid, profile_key,
+                         message_sid, profile_key, from_number, texted, brain.key,
+                         str(profile.get("model", "")).strip() or brain.model,
+                         is_test=callstore.is_test_call(message_sid, from_number))
+        _store_write("end_call", message_sid, profile_key,
+                     message_sid, "blocked", "block_list", 0, [])
+        return web.Response(text=EMPTY_TWIML, content_type="text/xml")
+
+    body = _scrub(form.get("Body", ""), MAX_SMS_BODY_CHARS)
+    log.info("inbound text MessageSid=%s from=%s to=%s profile=%s (%d characters)",
+             message_sid, mask_number(from_number), texted, profile_key, len(body))
+    if seen is None:
+        # A synthetic call row, so a text is a first-class thing in the store:
+        # the message rows reference it, retention reaches it, and
+        # delete_caller finds it by number exactly as it finds a call.
+        # `decision_reason = "sms"` is what tells a text apart from a call in
+        # every later read.
         _store_write("start_call", message_sid, profile_key,
                      message_sid, profile_key, from_number, texted, brain.key,
                      str(profile.get("model", "")).strip() or brain.model,
                      is_test=callstore.is_test_call(message_sid, from_number))
         _store_write("end_call", message_sid, profile_key,
-                     message_sid, "blocked", "block_list", 0, [])
-        return web.Response(text=EMPTY_TWIML, content_type="text/xml")
-
-    store = STORE
-    if store is not None:
-        # Twilio retries a webhook that timed out, and the push below can take
-        # ten seconds. Without this, one slow push turns one customer text into
-        # two rows, two pad entries and two notifications.
-        try:
-            if store.get_call(message_sid) is not None:
-                record_event("warning", "sms_already_recorded",
-                             "twilio delivered this text again — it is already on "
-                             "the pad, nothing was written twice",
-                             message_sid, profile_key)
-                return web.Response(text=EMPTY_TWIML, content_type="text/xml")
-        except Exception as e:
-            record_event("error", "store_read_failed",
-                         f"get_call: {type(e).__name__}: {e}", message_sid, profile_key)
-
-    body = _scrub(form.get("Body", ""), MAX_SMS_BODY_CHARS)
-    log.info("inbound text MessageSid=%s from=%s to=%s profile=%s (%d characters)",
-             message_sid, mask_number(from_number), texted, profile_key, len(body))
-    # A synthetic call row, so a text is a first-class thing in the store: the
-    # message rows reference it, retention reaches it, and delete_caller finds
-    # it by number exactly as it finds a call. `decision_reason = "sms"` is what
-    # tells a text apart from a call in every later read.
-    _store_write("start_call", message_sid, profile_key,
-                 message_sid, profile_key, from_number, texted, brain.key,
-                 str(profile.get("model", "")).strip() or brain.model,
-                 is_test=callstore.is_test_call(message_sid, from_number))
-    _store_write("end_call", message_sid, profile_key,
-                 message_sid, "message_taken", "sms", 1, [])
-    _store_write("add_message", message_sid, profile_key,
-                 message_sid, profile_key, None, from_number or None, None,
-                 body or None, body)
+                     message_sid, "message_taken", "sms", 1, [])
+        _store_write("add_message", message_sid, profile_key,
+                     message_sid, profile_key, None, from_number or None, None,
+                     body or None, body)
+    else:
+        # The rows are there from an attempt that never finished. Deliver the
+        # message this time; a second message row would be a second thing for
+        # the owner to answer.
+        record_event("warning", "sms_delivery_retried",
+                     "twilio delivered this text again and the first attempt had "
+                     "not reached the owner — delivering it now", message_sid,
+                     profile_key)
 
     targets = delivery_targets(profile)
     when = profile_now(profile, profile_key).strftime("%Y-%m-%d %H:%M %Z").strip()
@@ -4163,6 +4197,18 @@ def _blank_brain_health() -> dict:
             "attempts": 0, "next_at": 0.0}
 
 
+def unreachable_brains() -> list:
+    """Every brain a call could run on whose last probe failed, by config key.
+
+    For the EVENT LOG and the owner's dashboard only. The key is a name the
+    owner chose ("glm_52_test", "local_qwen") and it says something about the
+    vendor — exactly what H-9 took off the public health page — so it must
+    never reach public_health()'s body.
+    """
+    return sorted(name for name in referenced_brains()
+                  if BRAIN_HEALTH.get(name, {}).get("reachable") is False)
+
+
 def referenced_brains() -> set:
     """Every brain a call could actually run on: the active one, plus any a
     profile names for itself. Probing only the active brain left a business on
@@ -4295,25 +4341,22 @@ def public_health() -> tuple[int, dict]:
     failed. All of them are silent failures otherwise — the calls look fine and
     nobody learns the messages are not arriving.
 
-    A brain that is NOT the active one is named in the reason, because that is
-    the only way to tell which business is affected: the line as a whole is
-    still answering, and one customer on their own backend must never be down
-    with a green dashboard. What is named is the brain's key from
-    businesses.toml — never its URL, its model or its vendor, which is what
-    H-9 took off this public page.
+    A brain that is NOT the active one degrades this too — a business on its
+    own backend must never be down with a green dashboard — but NOTHING here
+    names it. The brain's key is a name the owner chose and it says something
+    about the vendor, which is what H-9 took off this public page; the key
+    lives in the `brain_unreachable` event and in health_snapshot(), where only
+    the owner reads it.
     """
     if NTFY_FAILURES > 0:
         return 503, {"status": "degraded", "reason": "message notifications failing"}
     if LAST_DELIVERY["ok"] is False:
         return 503, {"status": "degraded", "reason": "last message delivery failed"}
-    if BRAIN_HEALTH.get(ACTIVE_BRAIN, {}).get("reachable") is False:
-        return 503, {"status": "degraded", "reason": "model backend unreachable"}
-    others = sorted(name for name in referenced_brains()
-                    if name != ACTIVE_BRAIN
-                    and BRAIN_HEALTH.get(name, {}).get("reachable") is False)
-    if others:
-        return 503, {"status": "degraded",
-                     "reason": "model backend unreachable for " + ", ".join(others)}
+    down = unreachable_brains()
+    if ACTIVE_BRAIN in down:
+        return 503, {"status": "degraded", "reason": "the active brain is unreachable"}
+    if down:
+        return 503, {"status": "degraded", "reason": "a configured brain is unreachable"}
     return 200, {"status": "ok"}
 
 
@@ -4338,6 +4381,10 @@ async def health_snapshot() -> tuple[dict, bool]:
         "probe_checked_at": state["checked_at"],
         "brain": brain.key,
         "model": brain.model,
+        # Which brains are actually down, by name. The public page cannot say
+        # this (H-9), so this is the only place an owner can see that the ONE
+        # business running on its own backend is the one that is broken.
+        "unreachable_brains": unreachable_brains(),
         "profiles": sorted(PROFILES),
         "numbers": len(NUMBERS),
         "ntfy": "on" if NTFY_URL else "off",
