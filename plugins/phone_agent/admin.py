@@ -253,6 +253,18 @@ def build_admin_app(
             for k, p in get_prompts().items()
         )
 
+        # This panel reads ONE file. A business that keeps its own pad has its
+        # messages somewhere else entirely, and a panel that silently showed
+        # only part of the picture would read as "no messages" for them.
+        own_pads = [k for k, p in profiles.items()
+                    if str(p.get("messages_file", "")).strip()]
+        pad_notice = ""
+        if own_pads:
+            pad_notice = (
+                "<div class='hint'>Showing the default pad only — "
+                f"{len(own_pads)} business(es) keep their own pad: "
+                f"{html.escape(', '.join(sorted(own_pads)))}.</div>"
+            )
         try:
             with open(messages_file, encoding="utf-8") as f:
                 pad = f.read()[-6000:]
@@ -287,7 +299,7 @@ def build_admin_app(
             "progress keep the settings they started with.</div>"
             "</form>"
             f"<h2>Live prompts</h2><div class='card'>{prompts}</div>"
-            f"<h2>Message pad</h2><pre>{html.escape(pad)}</pre>"
+            f"<h2>Message pad</h2>{pad_notice}<pre>{html.escape(pad)}</pre>"
             f"<h2>Recent calls</h2><pre>{html.escape(transcript)}</pre>"
         )
         return _page(body)

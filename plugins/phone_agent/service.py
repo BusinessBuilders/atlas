@@ -235,17 +235,23 @@ def mask_number(number) -> str:
 
 
 def mask_digits(digits) -> str:
-    """Keypad digits with all but the last two hidden.
+    """A whole run of keypresses with all but its last two digits hidden.
 
     A caller who cannot be understood by speech recognition types instead, and
     what they type is as often a card number or a PIN as it is an extension.
     The two leading dots say "there were digits here" and deliberately do NOT
     say how many; the last two are kept so the owner reading a transcript can
-    still tell two different keypresses apart.
+    tell two different keypresses apart.
+
+    A run of ONE digit is never revealed — it has no "last two", and showing it
+    would show the whole thing. That matters because Twilio sends one event per
+    keypress: the bridge coalesces a run into a single turn (see the relay's
+    keypress accumulator) precisely so this mask applies to the sequence and
+    not to each digit of it.
     """
     text = str(digits or "").strip()
-    if not text:
-        return MASK_CHAR * 2
+    if len(text) <= 1:
+        return MASK_CHAR
     return MASK_CHAR * 2 + text[-MASKED_DIGITS_TAIL:]
 
 
@@ -362,6 +368,30 @@ def _consume_ws_token(token: str, now: float) -> bool:
         return False
     _CONSUMED_WS_TOKENS[token] = wstoken.expiry_of(token)
     return True
+
+# What /voice/incoming decided about one call, waiting for its websocket. The
+# greeting the caller hears is composed at TwiML time and the persona is built
+# when the socket opens, seconds later — a call placed at 16:59:59 must not be
+# greeted as closed and then answered as open. Twilio opens exactly one
+# websocket per TwiML, so this is read once and dropped, and anything left
+# behind ages out on the same clock as the websocket tokens.
+CALL_DECISIONS: dict[str, tuple] = {}
+CALL_DECISION_TTL_SECONDS = wstoken.DEFAULT_TTL_SECONDS
+
+
+def remember_call_decision(call_sid: str, state, now: float) -> None:
+    for stale in [sid for sid, (expiry, _) in CALL_DECISIONS.items() if expiry <= now]:
+        CALL_DECISIONS.pop(stale, None)
+    if call_sid:
+        CALL_DECISIONS[call_sid] = (now + CALL_DECISION_TTL_SECONDS, state)
+
+
+def recall_call_decision(call_sid: str, now: float):
+    """The open/closed decision /voice/incoming made for this call, or None
+    when there is none to have (a relay opened without our TwiML, or a bridge
+    restarted between the two)."""
+    expiry, state = CALL_DECISIONS.pop(call_sid, (0.0, None))
+    return state if expiry > now else None
 OLLAMA_URL = _require("OLLAMA_URL").rstrip("/")
 DEFAULT_MODEL = _require("MODEL")
 BUSINESS_CONFIG = os.environ.get("BUSINESS_CONFIG", "").strip() or os.path.expanduser(
@@ -497,6 +527,12 @@ CORRECTIVE_NO_TRANSFER = (
     "I'm sorry — I can't connect calls on this line, but I can take a message "
     "and {owner_name} will call you back."
 )
+# Twilio sends ONE dtmf event per keypress, so a card number arrives as
+# sixteen events. Events less than this far apart are one RUN: one turn, one
+# masked entry rewritten as the digits land, one acknowledgement.
+KEYPRESS_RUN_SECONDS = 2.0
+# What the persona is shown as an example of a keypress turn.
+KEYPRESS_EXAMPLE = "1234"
 # Spoken when the call has run past the profile's max_call_seconds. Short on
 # purpose: speech_seconds() clips anything over eight seconds, and a caller
 # being wrapped up should hear the whole sentence.
@@ -1612,6 +1648,26 @@ _STREAM_OPTIONS_PROBED: set[str] = set()
 STREAM_OPTIONS_PROBE_TIMEOUT_SECONDS = 10
 
 
+def note_stream_options_unsupported(brain: Brain, detail: str) -> None:
+    """Remember, once per brain, that this backend refuses `stream_options`.
+
+    Said out loud both ways: a warning line explaining what stops working, and
+    an event the dashboard shows. The option is never dropped without this.
+    """
+    if brain.key in BRAINS_WITHOUT_STREAM_OPTIONS:
+        return
+    BRAINS_WITHOUT_STREAM_OPTIONS.add(brain.key)
+    _STREAM_OPTIONS_PROBED.add(brain.key)
+    log.warning(
+        "brain %s rejects stream_options: %s. Calls on this brain will no "
+        "longer ask for it, so their prompt/completion token counts stay "
+        "empty — every other brain still reports them.",
+        brain.key, detail[:200],
+    )
+    record_event("warning", "stream_options_unsupported",
+                 f"brain {brain.key}: {detail[:160]}")
+
+
 async def probe_stream_options(http: aiohttp.ClientSession, brain: Brain) -> str:
     """Ask this brain, once, whether it accepts `stream_options`.
 
@@ -1639,14 +1695,7 @@ async def probe_stream_options(http: aiohttp.ClientSession, brain: Brain) -> str
         _STREAM_OPTIONS_PROBED.add(brain.key)
         return ""
     if status == 400 and "stream_options" in detail:
-        _STREAM_OPTIONS_PROBED.add(brain.key)
-        BRAINS_WITHOUT_STREAM_OPTIONS.add(brain.key)
-        log.warning(
-            "brain %s rejects stream_options: %s. Calls on this brain will no "
-            "longer ask for it, so their prompt/completion token counts stay "
-            "empty — every other brain still reports them.",
-            brain.key, detail[:200],
-        )
+        note_stream_options_unsupported(brain, detail)
         return (f"brain {brain.key} rejects stream_options — token counts are "
                 "not available on this brain")
     return ""
@@ -1870,7 +1919,7 @@ def build_system_prompt(profile: dict, *, transfer_offered: bool = True) -> str:
         owner_name=profile["owner_name"],
         facts=facts or NO_FACTS_LINE,
         marker=END_CALL_MARKER,
-        keypress_example=mask_digits("5"),
+        keypress_example=mask_digits(KEYPRESS_EXAMPLE),
         transfer_section=transfer_section,
     )
     extra = str(profile.get("extra_instructions", "")).strip()
@@ -2925,6 +2974,9 @@ async def voice_incoming(request: web.Request) -> web.Response:
     action_url = f"{PUBLIC_BASE}/voice/action?profile={profile_key}"
     attr = {chr(34): "&quot;"}
     state = open_state_for(profile, profile_key, call_sid)
+    # The websocket that follows must answer the call the same way this
+    # greeting does, even if the two land either side of opening time.
+    remember_call_decision(call_sid, state, time.time())
     try:
         greeting = opening_line(profile, state)
         relay_attrs = "".join(
@@ -3029,17 +3081,6 @@ async def stream_reply(
     interleaving into Twilio's text-to-speech is a garbled call. Every send is
     gated on the turn still being current (M-2).
     """
-    request: dict = {
-        "model": model,
-        "messages": [{"role": "system", "content": system_prompt}] + history,
-        "stream": True,
-    }
-    if brain.key not in BRAINS_WITHOUT_STREAM_OPTIONS:
-        # Ask the backend to close the stream with a usage chunk. What a call
-        # cost is a number the owner is billed for; a bridge that never asks
-        # for it can only ever guess (§3.4 prompt_tokens/completion_tokens).
-        request["stream_options"] = dict(STREAM_OPTIONS)
-    url, headers, body = brain_request_args(brain, request)
     scrubber = MarkerScrubber()
     spoken: list[str] = []
 
@@ -3050,38 +3091,61 @@ async def stream_reply(
             spoken.append(text)
             await ws.send_json({"type": "text", "token": text, "last": False})
 
-    sent_at = time.monotonic()
-    async with http.post(
-        url, json=body, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=MODEL_TIMEOUT_SECONDS),
-    ) as resp:
-        if resp.status != 200:
-            # A provider's HTML error page used to be pasted whole into the
-            # journal by the handler above — a status and a short reason is
-            # what an operator actually needs (L-1).
-            reason = " ".join((await resp.text())[:400].split())[:120]
-            log.error("brain %s returned HTTP %s: %s", brain.key, resp.status, reason)
-            raise RuntimeError(f"model backend returned HTTP {resp.status}")
-        async for raw in resp.content:
-            line = raw.decode().strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            usage = chunk.get("usage")
-            if usage and metrics is not None:
-                # The usage chunk carries no choices at all, which is why the
-                # token line below cannot assume there is a choices[0].
-                metrics["prompt_tokens"] = usage.get("prompt_tokens")
-                metrics["completion_tokens"] = usage.get("completion_tokens")
-            choices = chunk.get("choices") or []
-            token = (choices[0].get("delta", {}).get("content") if choices else "") or ""
-            if token:
-                if metrics is not None and "ttft_ms" not in metrics:
-                    metrics["ttft_ms"] = int((time.monotonic() - sent_at) * 1000)
-                await say(scrubber.feed(token))
+    # Ask the backend to close the stream with a usage chunk. What a call cost
+    # is a number the owner is billed for; a bridge that never asks for it can
+    # only ever guess (§3.4 prompt_tokens/completion_tokens). A backend that
+    # has never heard of the option answers HTTP 400 — the caller is mid-turn,
+    # so the SAME request goes again without it, once, loudly. It is never
+    # dropped quietly.
+    for attempt in (1, 2):
+        want_options = brain.key not in BRAINS_WITHOUT_STREAM_OPTIONS
+        request: dict = {
+            "model": model,
+            "messages": [{"role": "system", "content": system_prompt}] + history,
+            "stream": True,
+        }
+        if want_options:
+            request["stream_options"] = dict(STREAM_OPTIONS)
+        url, headers, body = brain_request_args(brain, request)
+        sent_at = time.monotonic()
+        async with http.post(
+            url, json=body, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=MODEL_TIMEOUT_SECONDS),
+        ) as resp:
+            if resp.status != 200:
+                # A provider's HTML error page used to be pasted whole into the
+                # journal by the handler above — a status and a short reason is
+                # what an operator actually needs (L-1).
+                reason = " ".join((await resp.text())[:400].split())[:120]
+                if attempt == 1 and want_options and resp.status == 400 \
+                        and "stream_options" in reason:
+                    note_stream_options_unsupported(brain, reason)
+                    continue
+                log.error("brain %s returned HTTP %s: %s", brain.key, resp.status, reason)
+                raise RuntimeError(f"model backend returned HTTP {resp.status}")
+            async for raw in resp.content:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                usage = chunk.get("usage")
+                if usage and metrics is not None:
+                    # The usage chunk carries no choices at all, which is why
+                    # the token line below cannot assume there is a choices[0].
+                    metrics["prompt_tokens"] = usage.get("prompt_tokens")
+                    metrics["completion_tokens"] = usage.get("completion_tokens")
+                choices = chunk.get("choices") or []
+                # …and a chunk can carry "delta": null, which is not a dict.
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                token = delta.get("content") or ""
+                if token:
+                    if metrics is not None and "ttft_ms" not in metrics:
+                        metrics["ttft_ms"] = int((time.monotonic() - sent_at) * 1000)
+                    await say(scrubber.feed(token))
+        break
     await say(scrubber.flush())
     if turn_state["n"] == my_turn:
         await ws.send_json({"type": "text", "token": "", "last": True})
@@ -3123,7 +3187,14 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
     # Out of hours on a message-taking profile the persona loses its
     # TRANSFERRING section and the gates lose transfer_available, so the two
     # can never disagree about what this call is allowed to do (§3.6).
-    open_now = open_state_for(profile, profile_key, request.query.get("call", ""))
+    open_now = recall_call_decision(query_call, time.time())
+    if open_now is None:
+        # No TwiML of ours preceded this socket (or the bridge restarted in
+        # between). Decide now rather than refuse the caller — and say so, so
+        # a line where this happens on every call is visible.
+        log.info("no open/closed decision carried for call %s — deciding now",
+                 query_call or "?")
+        open_now = open_state_for(profile, profile_key, query_call)
     message_only = takes_messages_only(profile, open_now)
     system_prompt = (build_system_prompt(profile, transfer_offered=False)
                      if message_only else SYSTEM_PROMPTS[profile_key])
@@ -3184,14 +3255,15 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
             record_event("error", "store_write_failed",
                          f"start_call: {type(e).__name__}: {e}", call_sid, profile_key)
 
-    def store_turn(n: int, role: str, text: str, ttft_ms=None) -> None:
+    def store_turn(n: int, role: str, text: str, ttft_ms=None):
         """Everything said on the call goes here — this store, not the journal,
-        is where a transcript lives now (audit H-7)."""
+        is where a transcript lives now (audit H-7). Returns the row id, which
+        a run of keypresses uses to rewrite its one turn in place."""
         open_call_row()
         if not call_row["open"]:
-            return
-        _store_write("add_turn", call_sid, profile_key,
-                     call_sid, n, role, text, ttft_ms=ttft_ms)
+            return None
+        return _store_write("add_turn", call_sid, profile_key,
+                            call_sid, n, role, text, ttft_ms=ttft_ms)
 
     def close_call_row(delivery: dict | None) -> None:
         """Finalise the row, whatever happened. The outcome is decided HERE,
@@ -3287,6 +3359,37 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
         """Count this caller turn against the profile's hourly budget."""
         budget = profile_number(profile, "caller_turn_budget_per_hour")
         return note_caller_turn(profile_key, caller_id, budget, time.time())
+
+    # ---------------------------------------------------- keypress runs --
+    # Twilio sends ONE dtmf event per keypress, so a card number arrives as
+    # sixteen events. One turn per event would put the whole number back
+    # together for anyone reading the transcript — each digit masked to
+    # itself is no mask at all — and would spend sixteen turns of the hourly
+    # budget on sixteen model requests. So a RUN of keypresses is ONE turn,
+    # whose text is the masked WHOLE sequence, rewritten in place as each
+    # digit lands. The raw digits exist only in `keys["digits"]`, which is
+    # emptied the moment the run closes; nothing else ever sees them.
+    keys: dict = {"digits": "", "turn": 0, "entry": None, "row_id": None,
+                  "task": None, "at": 0.0}
+
+    def forget_keypresses() -> None:
+        """Close the run and drop the digits. The masked turn stays."""
+        if keys["task"] is not None and not keys["task"].done():
+            keys["task"].cancel()
+        keys.update(digits="", turn=0, entry=None, row_id=None, task=None, at=0.0)
+
+    async def answer_keypresses(my_turn: int, http: aiohttp.ClientSession) -> None:
+        """Wait for the run to go quiet, drop the digits, then answer it ONCE.
+
+        Cancelled and restarted by every keypress in the run, so the reply
+        comes after the last one — not after each.
+        """
+        nonlocal reply_task
+        await asyncio.sleep(KEYPRESS_RUN_SECONDS)
+        keys.update(digits="", turn=0, entry=None, row_id=None, task=None, at=0.0)
+        if turn_state["n"] != my_turn:
+            return          # the caller spoke; their turn owns the reply
+        reply_task = asyncio.create_task(respond(list(history), my_turn, http))
 
     async def respond(hist_snapshot: list, my_turn: int,
                       http: aiohttp.ClientSession) -> None:
@@ -3434,6 +3537,10 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                         text = (event.get("voicePrompt") or "").strip()
                         if not text:
                             continue
+                        # Speech ends any run of keypresses: the next key
+                        # starts a new turn rather than being appended to one
+                        # that now sits behind the caller's words.
+                        forget_keypresses()
                         if reply_task and not reply_task.done():
                             reply_task.cancel()
                         resolved = resolve_alias_mishearing(text, gates)
@@ -3490,32 +3597,52 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                             # delete one call. CallSid and a count only.
                             log.info("caller keypress (%s): %d digit(s)",
                                      call_sid, len(digit))
-                            # A keypress is a caller turn, so it needs the same
-                            # turn accounting as speech — otherwise an in-flight
-                            # reply lands after it and re-creates the ordering
-                            # bug M-2 closed.
-                            if reply_task and not reply_task.done():
-                                reply_task.cancel()
+                            moment = _monotonic()
+                            same_run = (keys["entry"] is not None
+                                        and moment - keys["at"] <= KEYPRESS_RUN_SECONDS)
+                            keys["at"] = moment
+                            keys["digits"] = (keys["digits"] + digit) if same_run else digit
                             # Masked before it is written down ANYWHERE: the
                             # history the model sees, the stored turn, the pad
                             # and the summarizer all get the same two dots and
-                            # the last two digits. The raw keypresses exist
-                            # only for as long as this branch runs.
-                            keyed = f"[keypress: {mask_digits(digit)}]"
-                            history.append({"role": "user", "content": keyed})
-                            del history[:-MAX_HISTORY_TURNS * 2]
-                            turn_state["n"] += 1
-                            store_turn(turn_state["n"], "keypress", keyed)
-                            if not within_budget():
-                                await refuse_over_budget(profile_number(
-                                    profile, "caller_turn_budget_per_hour"))
-                                break
+                            # the last two digits of the WHOLE run.
+                            keyed = f"[keypress: {mask_digits(keys['digits'])}]"
+                            if same_run:
+                                # Same turn, rewritten — never a second row.
+                                keys["entry"]["content"] = keyed
+                                if keys["row_id"] is not None:
+                                    _store_write("set_turn_text", call_sid, profile_key,
+                                                 keys["row_id"], keyed)
+                            else:
+                                # A keypress is a caller turn, so it needs the
+                                # same turn accounting as speech — otherwise an
+                                # in-flight reply lands after it and re-creates
+                                # the ordering bug M-2 closed.
+                                if reply_task and not reply_task.done():
+                                    reply_task.cancel()
+                                entry = {"role": "user", "content": keyed}
+                                history.append(entry)
+                                del history[:-MAX_HISTORY_TURNS * 2]
+                                turn_state["n"] += 1
+                                keys["entry"] = entry
+                                keys["turn"] = turn_state["n"]
+                                keys["row_id"] = store_turn(turn_state["n"],
+                                                            "keypress", keyed)
+                                # One run costs one turn of the hourly budget,
+                                # not one per digit.
+                                if not within_budget():
+                                    forget_keypresses()
+                                    await refuse_over_budget(profile_number(
+                                        profile, "caller_turn_budget_per_hour"))
+                                    break
                             # There is no menu on this line, so a caller who
                             # presses keys and hears nothing back assumes the
-                            # line is dead. Answer the keypress like any other
-                            # turn and say so.
-                            reply_task = asyncio.create_task(
-                                respond(list(history), turn_state["n"], http))
+                            # line is dead. Answer the RUN — once, after the
+                            # last key.
+                            if keys["task"] is not None and not keys["task"].done():
+                                keys["task"].cancel()
+                            keys["task"] = asyncio.create_task(
+                                answer_keypresses(keys["turn"], http))
 
                     elif etype == "error":
                         # Twilio's own words, not the caller's — but scrubbed
@@ -3542,6 +3669,7 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
 
         finally:
             watchdog_task.cancel()
+            forget_keypresses()
             if reply_task and not reply_task.done():
                 reply_task.cancel()
             log.info("relay session ended CallSid=%s (%d turns)", call_sid, len(history))
@@ -3634,8 +3762,105 @@ async def retention_task() -> None:
     """Run the purge a minute after boot and every day after that."""
     await asyncio.sleep(RETENTION_FIRST_RUN_SECONDS)
     while True:
-        purge_all_profiles()
+        # In a thread: these are blocking DELETEs over what can be months of
+        # transcripts, and the event loop they would otherwise run on is the
+        # one answering a live call.
+        await asyncio.to_thread(purge_all_profiles)
         await asyncio.sleep(RETENTION_INTERVAL_SECONDS)
+
+
+# --------------------------------------------------------- brain health ---
+# Whether a model backend answers is checked on a schedule by ONE background
+# task, and everything else reads what it found. /health is a public URL: a
+# probe on the request path let anyone on the internet make this bridge send a
+# billable chat-completion by refreshing a page.
+HEALTH_REFRESH_SECONDS = 60
+# An unsettled brain is not re-asked every minute forever: 1 min, 5 min, 30
+# min, then every 6 hours.
+HEALTH_BACKOFF_SECONDS = (60, 300, 1800, 21600)
+BRAIN_HEALTH: dict[str, dict] = {}
+
+
+def _blank_brain_health() -> dict:
+    return {"reachable": None, "probe_error": "", "checked_at": None,
+            "attempts": 0, "next_at": 0.0}
+
+
+def referenced_brains() -> set:
+    """Every brain a call could actually run on: the active one, plus any a
+    profile names for itself. Probing only the active brain left a business on
+    its own backend with nobody watching it."""
+    names = {ACTIVE_BRAIN}
+    for profile in PROFILES.values():
+        chosen = str(profile_setting(profile, "brain")).strip()
+        if chosen in BRAINS:
+            names.add(chosen)
+    return names
+
+
+async def probe_brain(http: aiohttp.ClientSession, brain: Brain) -> tuple[bool, str]:
+    """(reachable, why not). Also settles, once, whether this brain accepts
+    `stream_options` — the one place that question costs a model request."""
+    headers = {}
+    key = brain_key(brain)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        async with http.get(f"{brain.base_url}/models", headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        # "UNREACHABLE" with the reason thrown away leaves the operator
+        # guessing between an expired key, DNS, a timeout and TLS (M-7).
+        return False, f"{type(e).__name__}: {e}"[:120]
+    try:
+        return True, await probe_stream_options(http, brain)
+    except Exception as e:
+        log.warning("brain %s usage probe could not run (%s: %s) — it will be "
+                    "asked again at the next health check",
+                    brain.key, type(e).__name__, e)
+        return True, ""
+
+
+async def refresh_brain_health(now: float | None = None) -> dict:
+    """Probe every referenced brain whose backoff has expired, and remember
+    what came back. The ONLY place this process talks to a model outside a
+    call."""
+    moment = _monotonic() if now is None else float(now)
+    async with aiohttp.ClientSession() as http:
+        for name in sorted(referenced_brains()):
+            brain = BRAINS.get(name)
+            if brain is None:
+                continue
+            state = BRAIN_HEALTH.setdefault(name, _blank_brain_health())
+            if state["checked_at"] is not None and state["next_at"] > moment:
+                continue                      # still backing off
+            reachable, why = await probe_brain(http, brain)
+            state.update(reachable=reachable, probe_error=why,
+                         checked_at=time.time())
+            if reachable and name in _STREAM_OPTIONS_PROBED:
+                state.update(attempts=0, next_at=moment)
+            else:
+                # Unreachable, or the usage question is still open: ask again,
+                # but further and further apart.
+                state["attempts"] += 1
+                state["next_at"] = moment + HEALTH_BACKOFF_SECONDS[
+                    min(state["attempts"], len(HEALTH_BACKOFF_SECONDS)) - 1]
+            if not reachable:
+                log.warning("brain %s health probe failed: %s", name, why)
+    return BRAIN_HEALTH
+
+
+async def health_refresh_task() -> None:
+    """Keep the brain-health cache warm for as long as the bridge runs."""
+    while True:
+        try:
+            await refresh_brain_health()
+        except Exception as e:
+            log.exception("brain health refresh FAILED")
+            record_event("error", "health_refresh_failed", f"{type(e).__name__}: {e}")
+        await asyncio.sleep(HEALTH_REFRESH_SECONDS)
 
 
 def public_health() -> tuple[int, dict]:
@@ -3648,53 +3873,45 @@ def public_health() -> tuple[int, dict]:
     count (H-9). The detailed picture lives in health_snapshot(), for the
     tailnet-only dashboard.
 
-    Degraded means: a message was taken and could not be delivered, or the
-    owner's push channel is down. Both are silent failures otherwise — the
-    calls keep working and nobody learns the messages are not arriving.
+    Reads only: the brain state comes from the background refresher's cache, so
+    nothing on this path can be made to call a model. A brain nobody has probed
+    yet is "unknown", and unknown is NOT degraded — a bridge that has been up
+    for two seconds is not sick, and every other degrade condition still
+    applies.
+
+    Degraded means: a message was taken and could not be delivered, the owner's
+    push channel is down, or the last probe of the active brain failed. All
+    three are silent failures otherwise — the calls look fine and nobody learns
+    the messages are not arriving.
     """
     if NTFY_FAILURES > 0:
         return 503, {"status": "degraded", "reason": "message notifications failing"}
     if LAST_DELIVERY["ok"] is False:
         return 503, {"status": "degraded", "reason": "last message delivery failed"}
+    if BRAIN_HEALTH.get(ACTIVE_BRAIN, {}).get("reachable") is False:
+        return 503, {"status": "degraded", "reason": "model backend unreachable"}
     return 200, {"status": "ok"}
 
 
 async def health_snapshot() -> tuple[dict, bool]:
     """The DETAILED health picture, for the owner dashboard only — always for
-    the ACTIVE brain, so a broken brain switch is visible immediately."""
+    the ACTIVE brain, so a broken brain switch is visible immediately.
+
+    Reads the background refresher's cache and calls nothing: `checked_at` says
+    how old the answer is, and `model_backend` is "pending" until the first
+    probe has come back. A pending brain counts as fine — it is an answer the
+    bridge has not got yet, not an answer that says the line is sick.
+    """
     brain = BRAINS[ACTIVE_BRAIN]
-    headers = {}
-    key = brain_key(brain)
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    probe_error = ""
-    try:
-        async with aiohttp.ClientSession() as http:
-            async with http.get(f"{brain.base_url}/models", headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                model_ok = resp.status == 200
-                if not model_ok:
-                    probe_error = f"HTTP {resp.status}"
-            if model_ok:
-                # Whether this backend can report token usage is settled here,
-                # once per brain, and never in the middle of a live call.
-                try:
-                    probe_error = await probe_stream_options(http, brain) or probe_error
-                except Exception as e:
-                    log.warning("brain %s usage probe could not run (%s: %s) — "
-                                "it will be asked again at the next health check",
-                                brain.key, type(e).__name__, e)
-    except Exception as e:
-        # "UNREACHABLE" with the reason thrown away leaves the operator
-        # guessing between an expired key, DNS, a timeout and TLS (M-7).
-        model_ok = False
-        probe_error = f"{type(e).__name__}: {e}"[:120]
-    if probe_error:
-        log.warning("brain %s health probe failed: %s", ACTIVE_BRAIN, probe_error)
+    state = BRAIN_HEALTH.get(brain.key) or _blank_brain_health()
+    reachable = state["reachable"]
+    model_status = ("pending" if reachable is None
+                    else ("ok" if reachable else "UNREACHABLE"))
     body = {
         "bridge": "ok",
-        "model_backend": "ok" if model_ok else "UNREACHABLE",
-        "probe_error": probe_error,
+        "model_backend": model_status,
+        "probe_error": state["probe_error"],
+        "probe_checked_at": state["checked_at"],
         "brain": brain.key,
         "model": brain.model,
         "profiles": sorted(PROFILES),
@@ -3704,18 +3921,19 @@ async def health_snapshot() -> tuple[dict, bool]:
         "last_delivery": dict(LAST_DELIVERY),
         "recent_events": list(RECENT_EVENTS)[-20:],
     }
-    return body, model_ok
+    return body, reachable is not False
 
 
 async def health(_: web.Request) -> web.Response:
     """Public health check. The body says only whether the line is up; the
     status code is what the external tripwire pages on — so a brain the bridge
-    cannot reach still degrades it, exactly as before the body was trimmed."""
+    cannot reach still degrades it, exactly as before the body was trimmed.
+
+    Answers entirely from memory. A public URL that could start a billable
+    model request was a way for a stranger with a refresh key to spend the
+    owner's money.
+    """
     status, body = public_health()
-    if status == 200:
-        _, model_ok = await health_snapshot()
-        if not model_ok:
-            status, body = 503, {"status": "degraded", "reason": "model backend unreachable"}
     return web.json_response(body, status=status)
 
 
@@ -3761,7 +3979,8 @@ async def _serve() -> None:
     else:
         log.info("admin dashboard: off (ADMIN_TOKEN unset)")
 
-    housekeeping = asyncio.create_task(retention_task())
+    housekeeping = [asyncio.create_task(retention_task()),
+                    asyncio.create_task(health_refresh_task())]
     # systemd stops this unit with SIGTERM and a terminal with SIGINT. Both mean
     # the same thing here: finish what is in flight, then go.
     stop = asyncio.Event()
@@ -3780,7 +3999,8 @@ async def _serve() -> None:
             log.warning("this platform cannot catch %s — a stop will not wait "
                         "for messages still being delivered", sig.name)
     await stop.wait()
-    housekeeping.cancel()
+    for task in housekeeping:
+        task.cancel()
     await shutdown(stopped_by or "stop requested")
 
 

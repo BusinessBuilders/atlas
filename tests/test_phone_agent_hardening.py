@@ -55,6 +55,9 @@ class FakeBrain:
         self.usage: dict | None = None
         # Backends that have never heard of stream_options answer HTTP 400.
         self.reject_stream_options = False
+        # Every reachability probe of this backend, counted: /health must never
+        # cause one.
+        self.model_hits = 0
         self.stream_bodies: list[dict] = []
         self.summary_bodies: list[dict] = []
         self.base_url = ""
@@ -74,6 +77,7 @@ class FakeBrain:
             await self._runner.cleanup()
 
     async def _models(self, _: web.Request) -> web.Response:
+        self.model_hits += 1
         return web.json_response({"data": []}, status=self.models_status)
 
     async def _chat(self, request: web.Request) -> web.StreamResponse:
@@ -337,7 +341,7 @@ async def test_a_keypress_is_at_least_seen(tmp_path, monkeypatch):
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
         await run_call(line, [setup_frame(), {"type": "dtmf", "digit": "5"}])
 
-        assert "[keypress: ••5]" in line.brain.summarizer_transcript
+        assert "[keypress: •]" in line.brain.summarizer_transcript
         assert line.pad.exists()          # a keypress-only call still delivers
 
 
@@ -447,6 +451,9 @@ async def test_health_snapshot_says_why_the_brain_is_unreachable(tmp_path, monke
             model=brain.model, api_key_env="", extra_body={},
         )
         with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+            # The snapshot reads the background refresher's cache; this is the
+            # refresher's one pass, run by hand.
+            await svc.refresh_brain_health()
             body, model_ok = await svc.health_snapshot()
 
         assert model_ok is False
@@ -837,6 +844,7 @@ async def test_public_health_still_degrades_when_the_brain_is_dead(tmp_path, mon
     turn it red."""
     async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
         line.brain.models_status = 500
+        await line.svc.refresh_brain_health()
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{line.base}/health") as resp:
                 assert resp.status == 503
@@ -863,11 +871,13 @@ async def test_the_owner_status_tool_reads_the_trimmed_health(tmp_path, monkeypa
             await handler(SimpleNamespace(arguments={}, result_callback=capture))
             return captured
 
+        await line.svc.refresh_brain_health()
         healthy = await ask()
         assert healthy["ok"] is True
         assert healthy["line"] == "up"
 
         line.brain.models_status = 500
+        await line.svc.refresh_brain_health()
         degraded = await ask()
         assert degraded["ok"] is True
         assert degraded["line"].startswith("DEGRADED")
@@ -1006,6 +1016,8 @@ async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
         svc = line.svc
         gate = asyncio.Event()
 
+        monkeypatch.setattr(svc, "KEYPRESS_RUN_SECONDS", 0.05)
+
         async def slow(ws, history, http, system_prompt, model, brain, *,
                        turn_state, my_turn, metrics=None):
             try:
@@ -1032,7 +1044,7 @@ async def test_a_keypress_during_a_reply_takes_its_turn(tmp_path, monkeypatch):
 
         transcript = line.brain.summarizer_transcript
         assert "Caller: hello" in transcript
-        assert "Caller: [keypress: ••5]" in transcript
+        assert "Caller: [keypress: •]" in transcript
         assert "REPLY TO TURN 1" not in transcript        # the stale one
         assert "REPLY TO TURN 2" in transcript            # the keypress's own
 

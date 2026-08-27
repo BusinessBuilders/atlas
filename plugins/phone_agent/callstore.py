@@ -274,18 +274,35 @@ class CallStore:
             )
 
     def add_turn(self, call_sid: str, n: int, role: str, text: str,
-                 ttft_ms=None) -> None:
+                 ttft_ms=None) -> int:
         """One thing that was said (or keyed). `ttft_ms` is the wait before the
-        agent's first word — None for anything the caller said."""
+        agent's first word — None for anything the caller said. Returns the row
+        id, which is how a turn still being typed (a run of keypresses) is
+        rewritten in place instead of becoming one row per digit."""
         if role not in TURN_ROLES:
             raise ValueError(f"unknown turn role {role!r} (expected one of {TURN_ROLES})")
         with self._lock, self.conn:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO turns (call_sid, n, role, text, ts, ttft_ms) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (str(call_sid), int(n), role, str(text), time.time(),
                  None if ttft_ms is None else int(ttft_ms)),
             )
+            return _row_id(cur)
+
+    def set_turn_text(self, turn_id: int, text: str) -> None:
+        """Rewrite one turn's text.
+
+        The caller keying a card number sends one dtmf event per digit, and one
+        row per digit would put the whole number back together for anyone
+        reading the transcript. The bridge keeps ONE turn for the run and
+        rewrites it as the digits arrive, so the row only ever holds the mask.
+        """
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE turns SET text = ? WHERE id = ?", (str(text), int(turn_id)))
+            if cur.rowcount == 0:
+                raise KeyError(f"no turn with id {turn_id!r}")
 
     def end_call(self, call_sid: str, outcome: str, decision_reason: str,
                  caller_turns: int, overpromise_flags, prompt_tokens=None,
