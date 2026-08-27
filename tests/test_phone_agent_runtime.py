@@ -1228,3 +1228,167 @@ async def test_the_journal_never_holds_a_whole_caller_number(tmp_path, monkeypat
         # the store still holds the real number — retention and delete_caller
         # are what removes it, not a log line that never had it
         assert one_call(line.svc)["from_number"] == caller
+
+
+# ============================== task 6 hygiene: the four rulings from review ==
+# Each of these is a way the line could have gone quiet without anyone noticing.
+
+async def test_a_business_on_its_own_backend_is_never_silently_down(
+        tmp_path, monkeypatch):
+    """The refresher probes every referenced brain, but a failure on one that
+    is not the ACTIVE brain used to be a log line and nothing else: the
+    dashboard stayed green and the tripwire never fired, while that business's
+    calls hit an error on every turn."""
+    theirs = FakeBrain()
+    await theirs.start()
+    try:
+        async with phone_line(tmp_path, monkeypatch, ntfy=False,
+                              cfg_extra=_other_profile()) as line:
+            svc = line.svc
+            svc.BRAINS["theirs"] = svc.Brain(
+                key="theirs", label="theirs", base_url=theirs.base_url,
+                model="their-model", api_key_env="", extra_body={})
+            svc.PROFILES["other"]["brain"] = "theirs"
+            svc.RECENT_EVENTS.clear()
+
+            theirs.models_status = 500
+            await svc.refresh_brain_health(now=0.0)
+
+            failures = [e for e in svc.RECENT_EVENTS if e["kind"] == "brain_unreachable"]
+            assert failures and failures[0]["level"] == "error"
+            assert "theirs" in failures[0]["detail"]
+
+            status, body = svc.public_health()
+            assert status == 503
+            assert "theirs" in body["reason"], body
+
+            # and it comes back green when the backend does
+            theirs.models_status = 200
+            await svc.refresh_brain_health(now=100000.0)
+            assert svc.public_health()[0] == 200
+    finally:
+        await theirs.stop()
+
+
+async def test_the_active_brain_going_down_still_reads_as_the_line_being_down(
+        tmp_path, monkeypatch):
+    """The control for the test above: nothing about naming other brains may
+    change what the tripwire sees when the whole line's brain is gone."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+        line.brain.models_status = 500
+        await svc.refresh_brain_health(now=0.0)
+
+        status, body = svc.public_health()
+        assert status == 503 and body["reason"] == "model backend unreachable"
+        assert "brain_unreachable" in kinds(svc)
+
+
+def test_the_event_ring_is_safe_to_write_from_a_thread(tmp_path, monkeypatch):
+    """record_event is called from the retention thread as well as the event
+    loop, and the ring is scanned before it is appended to. Without a lock that
+    scan raises "deque mutated during iteration" — inside the code whose job is
+    to report failures, which then kills the thread that called it."""
+    import threading
+
+    svc = _import_service(tmp_path, monkeypatch)
+    svc.RECENT_EVENTS.clear()
+    assert hasattr(svc._RING_LOCK, "acquire"), "the ring has no lock"
+    failures: list = []
+
+    def hammer(tag: int) -> None:
+        try:
+            for i in range(300):
+                svc._ring_append("warning", f"kind_{tag}_{i % 11}", "detail", None)
+        except Exception as e:                      # pragma: no cover - the bug
+            failures.append(e)
+
+    threads = [threading.Thread(target=hammer, args=(t,)) for t in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert failures == [], failures
+    # 8 threads x 11 kinds, all collapsed inside the same minute — and not one
+    # of the 2,400 events lost to a half-applied update
+    assert len(svc.RECENT_EVENTS) == 88
+    assert sum(entry["count"] for entry in svc.RECENT_EVENTS) == 8 * 300
+
+
+async def test_the_retention_loop_survives_a_sweep_that_raises(tmp_path, monkeypatch):
+    """purge_all_profiles records its own per-profile failures, but anything
+    that escapes it — a record_event raising in the thread, a store that has
+    gone — used to end the task, and retention silently stopped for as long as
+    the process ran."""
+    svc = _import_service(tmp_path, monkeypatch)
+    svc.RECENT_EVENTS.clear()
+    monkeypatch.setattr(svc, "RETENTION_FIRST_RUN_SECONDS", 0.02)
+    monkeypatch.setattr(svc, "RETENTION_INTERVAL_SECONDS", 0.02)
+    runs: list = []
+
+    def exploding() -> dict:
+        runs.append(1)
+        raise RuntimeError("deque mutated during iteration")
+
+    monkeypatch.setattr(svc, "purge_all_profiles", exploding)
+
+    task = asyncio.create_task(svc.retention_task())
+    try:
+        await asyncio.sleep(0.25)
+        assert len(runs) >= 2, "the loop stopped at the first failure"
+        assert not task.done(), "the retention task died"
+        failures = [e for e in svc.RECENT_EVENTS if e["kind"] == "retention_failed"]
+        assert failures and failures[0]["level"] == "error"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+LONG_REJECTION = (
+    "Your request could not be completed. This deployment is running a "
+    "compatibility layer that accepts a subset of the OpenAI chat API, and one "
+    "of the fields you sent is not part of it: stream_options"
+)
+
+
+async def test_a_wordy_rejection_still_gets_the_retry(tmp_path, monkeypatch):
+    """The retry decision used to be made on a 120-character summary of the
+    error, so a backend that explains itself first and names the field last
+    never got retried — the caller heard the apology line on every turn."""
+    assert LONG_REJECTION.index("stream_options") > 120
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        line.brain.reject_stream_options = True
+        line.brain.stream_options_error = LONG_REJECTION
+
+        result = await drive(line, [setup_frame(), prompt_frame("hello")])
+
+        assert result.spoken == line.brain.reply         # the retry worked
+        assert line.svc.ACTIVE_BRAIN in line.svc.BRAINS_WITHOUT_STREAM_OPTIONS
+        assert "stream_options_unsupported" in kinds(line.svc)
+
+
+
+async def test_reachability_is_probed_every_sweep_while_the_usage_question_is_open(
+        tmp_path, monkeypatch):
+    """The two questions have two answers and two costs: "is this backend
+    there" is a free GET that belongs on every sweep, and "does it accept
+    stream_options" is a billable POST that backs off. One shared backoff meant
+    a backend that could not answer the second question stopped being watched
+    for six hours."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        svc = line.svc
+        line.brain.chat_status = 500          # the usage question stays open
+
+        await svc.refresh_brain_health(now=0.0)
+        assert svc.ACTIVE_BRAIN not in svc._STREAM_OPTIONS_PROBED
+        assert line.brain.model_hits == 1
+
+        await svc.refresh_brain_health(now=1.0)
+        await svc.refresh_brain_health(now=2.0)
+
+        assert line.brain.model_hits == 3, "the reachability probe was backed off too"
+        assert svc.BRAIN_HEALTH[svc.ACTIVE_BRAIN]["reachable"] is True
+        # …while the billable one is asked far less often
+        assert line.brain.chat_hits == 1

@@ -81,3 +81,9 @@ eve-app/android/.gradle/
 logs/
 voiceloop.smoke.log
 approval_api.e2e.log
+
+# Rendered phone fallback TwiML — generated per number from a customer's own
+# businesses.toml, and it carries that business's forward-to number. Render it
+# locally (plugins/phone_agent/twilio_config.py --render) and copy it to the
+# VPS; never commit one.
+deploy/phone/rendered/

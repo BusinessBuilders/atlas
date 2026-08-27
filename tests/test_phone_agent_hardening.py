@@ -54,10 +54,15 @@ class FakeBrain:
         # an OpenAI-compatible server answers stream_options.include_usage.
         self.usage: dict | None = None
         # Backends that have never heard of stream_options answer HTTP 400.
+        # Some of them explain themselves at length before naming the field.
         self.reject_stream_options = False
+        self.stream_options_error = "unknown parameter: stream_options"
         # Every reachability probe of this backend, counted: /health must never
         # cause one.
         self.model_hits = 0
+        # Every chat-completions request, counted — including the ones this
+        # backend refuses, which never reach stream_bodies.
+        self.chat_hits = 0
         self.stream_bodies: list[dict] = []
         self.summary_bodies: list[dict] = []
         self.base_url = ""
@@ -82,6 +87,7 @@ class FakeBrain:
 
     async def _chat(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
+        self.chat_hits += 1
         if self.chat_status != 200:
             # a verbose provider error page, the kind L-1 says must not be
             # pasted whole into the journal
@@ -89,8 +95,7 @@ class FakeBrain:
                                 text="<html>upstream provider error page " + "x" * 500 + "</html>")
         if self.reject_stream_options and "stream_options" in body:
             return web.json_response(
-                {"error": {"message": "unknown parameter: stream_options"}},
-                status=400)
+                {"error": {"message": self.stream_options_error}}, status=400)
         if body.get("stream"):
             self.stream_bodies.append(body)
             resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
@@ -175,6 +180,10 @@ async def phone_line(tmp_path, monkeypatch, *, extra_env=None, cfg_extra="",
     app = web.Application()
     app.router.add_post("/voice/incoming", svc.voice_incoming)
     app.router.add_post("/voice/action", svc.voice_action)
+    app.router.add_post("/voice/status", svc.voice_status)
+    app.router.add_post("/sms/incoming", svc.sms_incoming)
+    app.router.add_post("/voice/whisper", svc.voice_whisper)
+    app.router.add_get("/voice/whisper", svc.voice_whisper)
     app.router.add_get("/voice/relay", svc.voice_relay)
     app.router.add_get("/health", svc.health)
     runner = web.AppRunner(app, access_log=None)
@@ -459,11 +468,15 @@ async def test_health_snapshot_says_why_the_brain_is_unreachable(tmp_path, monke
         assert model_ok is False
         assert body["model_backend"] == "UNREACHABLE"
         assert body["probe_error"]
-        assert "health probe failed" in caplog.text
+        # whatever the reason is, the operator reads it in the journal
+        assert body["probe_error"][:40] in caplog.text
         # the detailed snapshot is what the dashboard shows the owner
         assert body["ntfy_failures"] == 0
         assert body["last_delivery"]["ok"] is None
-        assert body["recent_events"] == []
+        # …and a failed probe is an EVENT now, not only a log line: it is what
+        # puts an unreachable backend on the dashboard and in the store (task 6
+        # review — a business on its own brain must never be silently down)
+        assert [e["kind"] for e in body["recent_events"]] == ["brain_unreachable"]
 
 
 async def test_health_snapshot_carries_the_recent_events(tmp_path, monkeypatch):

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The phone line's FALLBACK answer, served by nginx on the public VPS.
+
+  Twilio fetches this when the normal voice webhook fails or times out — the
+  bridge machine is off, the SSH tunnel is down, the house has no power. Without
+  it the caller hears Twilio's own "an application error has occurred" and the
+  call ends; with it they hear one sentence and are put through to a person.
+
+  It lives on the VPS ON PURPOSE. A fallback served by the machine that just
+  died is not a fallback.
+
+  GENERATED FILE. Do not edit it on the server. It is rendered per number by
+  the render mode of plugins/phone_agent/twilio_config.py, from this template
+  plus that business's name and forward number, into deploy/phone/rendered/.
+  To change what a caller hears, edit the business's profile (or this
+  template) and render it again.
+-->
+<Response>
+  <Say>{{SAY}}</Say>
+  {{ACTION}}
+</Response>

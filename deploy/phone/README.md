@@ -17,6 +17,10 @@ page says it should, stop and say so — do not improvise on the phone line.**
 | `install.sh` | Builds the Python environment and installs the three systemd units. Never starts or stops anything. |
 | `alert.sh` | Sends the "the phone line has failed" push notification. Run by systemd, not by you. |
 | `tunnel-guard.sh` | Clears a dead SSH tunnel off the VPS before reconnecting. The fix for the nightly 502s. |
+| `fallback.xml.template` | The answer a caller hears when this machine cannot take the call. Rendered per number (see below), served by nginx on the VPS. |
+| `nginx-phone-fallback.conf` | The nginx blocks that serve that file. Paste them into the VPS's existing server block. |
+| `rendered/` | Where the rendered fallback files land. Not in git — each one carries a business's forward-to number. |
+| `../../plugins/phone_agent/twilio_config.py` | Shows and sets the four Twilio webhook URLs for every mapped number, and renders the fallback files. |
 | `../systemd/atlas-phone-bridge.service` | The bridge itself — the thing Twilio talks to. |
 | `../systemd/atlas-phone-tunnel.service` | The SSH tunnel that carries the VPS's port 8890 to this machine. |
 | `../systemd/atlas-phone-alert@.service` | The pager. Fires automatically when either of the other two fails. |
@@ -126,14 +130,47 @@ config check. It is better to find that out here than mid-call.
 **3. The public front door.** The Twilio number's voice webhook must point at
 `PUBLIC_BASE/voice/incoming`, and the VPS must serve a fallback answer when
 this machine is unreachable, so a caller hears a sentence instead of silence.
-Do both **before** the switch:
+Do both **before** the switch, and do the fallback file first — pointing Twilio
+at a URL that 404s is worse than leaving it unset.
 
-- `plugins/phone_agent/twilio_config.py --show` prints what Twilio currently
-  has; `--apply` sets it to match your config. Read the `--show` output before
-  applying it.
-- Install `deploy/phone/nginx-phone-fallback.conf` and its rendered
-  `fallback.xml` on the VPS, run `nginx -t`, reload nginx, then fetch the
-  fallback URL and confirm it returns TwiML (XML starting with `<Response>`).
+```bash
+cd ~/atlas-phone-deploy
+# a. write the fallback answer for every number in your businesses.toml
+.venv/bin/python plugins/phone_agent/twilio_config.py --render
+# b. read what Twilio holds now, next to what it should hold. Changes nothing.
+.venv/bin/python plugins/phone_agent/twilio_config.py --show
+```
+
+`--render` writes `deploy/phone/rendered/fallback-<digits>.xml`, one per
+number: a sentence and a `<Dial>` to that business's forward number, or a
+sentence and a hang-up when it has none. Copy it to the VPS and serve it:
+
+```bash
+scp deploy/phone/rendered/fallback-15088863046.xml \
+    <the VPS>:/var/www/atlas-phone/fallback.xml
+# on the VPS, as root: paste deploy/phone/nginx-phone-fallback.conf into the
+# server block that already proxies /phone/, then
+nginx -t && systemctl reload nginx
+```
+
+Prove it from your own machine before going near Twilio:
+
+```bash
+curl -i https://ai.business-builder.online/phone/fallback.xml
+```
+
+Expected: `HTTP/1.1 200`, `Content-Type: text/xml`, and a body containing
+`<Response>`. Anything else — 404, HTML, a redirect — means the file is not
+being served and the fallback would not work. Fix that first.
+
+Then, and only then:
+
+```bash
+.venv/bin/python plugins/phone_agent/twilio_config.py --apply
+```
+
+`--apply` writes only the fields that differ, and prints each one. It never
+touches a setting it does not manage.
 
 **4. Switch.**
 
