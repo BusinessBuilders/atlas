@@ -302,3 +302,35 @@ async def test_a_current_reply_does_enter_the_history(tmp_path, monkeypatch):
         await run_call(line, [setup_frame(), prompt_frame("hello")], drain=False)
 
         assert "Receptionist: FRESH REPLY" in line.brain.summarizer_transcript
+
+
+# ------------------------ M-3: unknown events, and the keypress that was --
+#                                        being dropped without a trace
+
+async def test_a_keypress_is_at_least_seen(tmp_path, monkeypatch):
+    """There are no menus yet, but a caller whose speech will not transcribe
+    presses keys. Those events used to vanish with nothing in the log."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        await run_call(line, [setup_frame(), {"type": "dtmf", "digit": "5"}])
+
+        assert "[keypress: 5]" in line.brain.summarizer_transcript
+        assert line.pad.exists()          # a keypress-only call still delivers
+
+
+async def test_unhandled_relay_event_is_loud(tmp_path, monkeypatch):
+    """When Twilio adds or renames an event the bridge must say so, not
+    ignore the new feature forever."""
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        await run_call(line, [
+            setup_frame(),
+            {"type": "somethingTwilioAddedLater"},
+            prompt_frame("hello"),
+        ])
+
+        events = [e for e in line.svc.RECENT_EVENTS if e["kind"] == "unhandled_relay_event"]
+        assert events, "an unknown relay event was silently discarded"
+        assert "somethingTwilioAddedLater" in events[0]["detail"]
+        assert events[0]["level"] == "warning"
+        assert events[0]["call_sid"] == CALL_SID
+        # and the call carried on normally
+        assert "hello" in line.brain.summarizer_transcript

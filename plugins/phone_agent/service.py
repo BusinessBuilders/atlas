@@ -1443,8 +1443,29 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                         if reply_task and not reply_task.done():
                             reply_task.cancel()
 
+                    elif etype == "dtmf":
+                        # No keypad menus yet — but a caller whose speech will
+                        # not transcribe presses keys, and those events used to
+                        # vanish without a trace (M-3). Record it as a caller
+                        # turn so the owner at least sees it on the pad.
+                        digit = str(event.get("digit") or event.get("digits") or "").strip()
+                        if not digit:
+                            record_event("warning", "dtmf_without_digit",
+                                         "keypress event carried no digit", call_sid)
+                        else:
+                            log.info("caller keypress (%s): %s", call_sid, digit)
+                            history.append({"role": "user", "content": f"[keypress: {digit}]"})
+                            del history[:-MAX_HISTORY_TURNS * 2]
+
                     elif etype == "error":
                         log.error("Twilio relay error (%s): %s", call_sid, event.get("description"))
+
+                    else:
+                        # A renamed or brand-new Twilio event must never be
+                        # ignored in silence — that hides a missing feature.
+                        log.warning("unhandled relay event %r CallSid=%s", etype, call_sid)
+                        record_event("warning", "unhandled_relay_event",
+                                     f"event type {etype!r}", call_sid)
                 except Exception as e:
                     # One bad frame must never cost the caller their message:
                     # this used to propagate out of the loop, past the delivery
