@@ -989,6 +989,17 @@ def speech_seconds(text: str) -> float:
 SUMMARIZER_TIMEOUT_SECONDS = 25
 _pad_lock = asyncio.Lock()
 
+# Delivery health. The owner hears about new messages from the push, so a
+# broken push is a broken product even though every call still "works" — both
+# of these feed public_health(), which the external tripwire turns into a page.
+NTFY_FAILURES = 0               # consecutive failed pushes; 0 = last one landed
+LAST_DELIVERY: dict = {"ts": None, "call_sid": None, "ok": None, "error": ""}
+
+
+def _note_delivery(call_sid: str, *, ok: bool, error: str) -> None:
+    LAST_DELIVERY.update({"ts": time.time(), "call_sid": call_sid,
+                          "ok": ok, "error": error})
+
 SUMMARIZER_PROMPT = (
     "You read the transcript of a phone call answered on the {business_name} business "
     "line. Extract the message for {owner_name} as 2 to 6 short plain lines: the "
@@ -1068,12 +1079,25 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
         when=when, business_name=profile["business_name"], caller_id=caller_id,
         note=note, call_sid=call_sid, turns=caller_turns,
     )
-    async with _pad_lock:
-        new_pad = not os.path.exists(MESSAGES_FILE)
-        with open(MESSAGES_FILE, "a", encoding="utf-8") as f:
-            if new_pad:
-                f.write("# Phone messages — Atlas phone agent\n")
-            f.write(entry)
+    global NTFY_FAILURES
+    try:
+        async with _pad_lock:
+            new_pad = not os.path.exists(MESSAGES_FILE)
+            with open(MESSAGES_FILE, "a", encoding="utf-8") as f:
+                if new_pad:
+                    f.write("# Phone messages — Atlas phone agent\n")
+                f.write(entry)
+    except Exception as e:
+        # The caller was told the owner would get back to them. A pad write we
+        # cannot do must reach the owner some other way, and until it does the
+        # line reports itself sick (H-1).
+        log.exception("message pad WRITE FAILED (%s) -> %s", call_sid, MESSAGES_FILE)
+        record_event("error", "pad_write_failed", f"{type(e).__name__}: {e}", call_sid)
+        _note_delivery(call_sid, ok=False, error=f"pad write: {type(e).__name__}")
+        await _escalate_undelivered(http, call_sid=call_sid, profile=profile,
+                                    note=note, entry=entry)
+        return
+    _note_delivery(call_sid, ok=True, error="")
     log.info("message pad: entry written for CallSid=%s -> %s", call_sid, MESSAGES_FILE)
 
     if NTFY_URL:
@@ -1085,9 +1109,58 @@ async def deliver_call_message(http: aiohttp.ClientSession, *, call_sid: str,
             ) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"ntfy returned HTTP {resp.status}")
+            NTFY_FAILURES = 0
             log.info("message pad: ntfy push sent (%s)", call_sid)
-        except Exception:
-            log.exception("ntfy push FAILED (%s) — the pad entry is still saved", call_sid)
+        except Exception as e:
+            # The pad entry survives, but the owner learns about messages FROM
+            # the push. A dead push channel means messages piling up in a file
+            # nobody is watching — degrade /health until one succeeds (H-2).
+            NTFY_FAILURES += 1
+            log.error("ntfy push FAILED (%s), %d in a row — the pad entry is saved but "
+                      "the owner has not been told: %s: %s",
+                      call_sid, NTFY_FAILURES, type(e).__name__, e)
+            record_event("error", "ntfy_push_failed",
+                         f"{NTFY_FAILURES} consecutive: {type(e).__name__}: {e}", call_sid)
+
+
+async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
+                                profile: dict, note: str, entry: str) -> None:
+    """Last resort when the message pad could not be written: push the raw note
+    to the owner at urgent priority and keep a copy beside the pad.
+
+    Deliberately does NOT touch NTFY_FAILURES — this is the escape hatch, not
+    the routine channel, and a success here must never clear the counter that
+    says routine pushes are broken.
+    """
+    fallback_path = MESSAGES_FILE + ".fallback"
+    try:
+        with open(fallback_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        log.error("message pad UNWRITABLE — the message was saved to %s instead",
+                  fallback_path)
+    except Exception as e:
+        log.exception("fallback message file FAILED too (%s) -> %s", call_sid, fallback_path)
+        record_event("error", "fallback_write_failed", f"{type(e).__name__}: {e}", call_sid)
+
+    if not NTFY_URL:
+        record_event("error", "undelivered_no_push_channel",
+                     "message pad unwritable and no ntfy configured — the message "
+                     "exists only in the fallback file", call_sid)
+        return
+    try:
+        async with http.post(
+            f"{NTFY_URL}/{NTFY_TOPIC}", data=note.encode(),
+            headers={"Title": f"UNDELIVERED phone message - {profile['business_name']} line",
+                     "Priority": "urgent"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"ntfy returned HTTP {resp.status}")
+        log.error("message pad UNWRITABLE — urgent push sent instead (%s)", call_sid)
+    except Exception as e:
+        log.exception("urgent push FAILED (%s) — the message reached NOTHING but the "
+                      "fallback file", call_sid)
+        record_event("error", "urgent_push_failed", f"{type(e).__name__}: {e}", call_sid)
 
 # ------------------------------------------------- twilio signature check --
 
@@ -1486,45 +1559,87 @@ async def voice_relay(request: web.Request) -> web.WebSocketResponse:
                         profile=profile, history=history, model=model, brain=brain,
                         overpromise_terms=overpromise_terms,
                     )
-                except Exception:
+                except Exception as e:
                     log.exception(
                         "message delivery FAILED (%s) — transcript remains in the journal",
                         call_sid,
                     )
+                    record_event("error", "delivery_failed",
+                                 f"{type(e).__name__}: {e}", call_sid)
+                    _note_delivery(call_sid, ok=False, error=f"{type(e).__name__}: {e}"[:120])
     return ws
 
 
+def public_health() -> tuple[int, dict]:
+    """(status, body) for the PUBLIC health endpoint — a status code and
+    nothing else.
+
+    This URL is reachable from the whole internet, because the external
+    tripwire probes it from outside; it used to answer with the profile keys
+    (i.e. the customer list), the model vendor, the model name and the number
+    count (H-9). The detailed picture lives in health_snapshot(), for the
+    tailnet-only dashboard.
+
+    Degraded means: a message was taken and could not be delivered, or the
+    owner's push channel is down. Both are silent failures otherwise — the
+    calls keep working and nobody learns the messages are not arriving.
+    """
+    if NTFY_FAILURES > 0:
+        return 503, {"status": "degraded", "reason": "message notifications failing"}
+    if LAST_DELIVERY["ok"] is False:
+        return 503, {"status": "degraded", "reason": "last message delivery failed"}
+    return 200, {"status": "ok"}
+
+
 async def health_snapshot() -> tuple[dict, bool]:
-    """Health facts shared by /health and the dashboard — always for the
-    ACTIVE brain, so a broken brain switch is visible immediately."""
+    """The DETAILED health picture, for the owner dashboard only — always for
+    the ACTIVE brain, so a broken brain switch is visible immediately."""
     brain = BRAINS[ACTIVE_BRAIN]
     headers = {}
     key = brain_key(brain)
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    probe_error = ""
     try:
         async with aiohttp.ClientSession() as http:
             async with http.get(f"{brain.base_url}/models", headers=headers,
                                 timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 model_ok = resp.status == 200
-    except Exception:
+                if not model_ok:
+                    probe_error = f"HTTP {resp.status}"
+    except Exception as e:
+        # "UNREACHABLE" with the reason thrown away leaves the operator
+        # guessing between an expired key, DNS, a timeout and TLS (M-7).
         model_ok = False
+        probe_error = f"{type(e).__name__}: {e}"[:120]
+    if probe_error:
+        log.warning("brain %s health probe failed: %s", ACTIVE_BRAIN, probe_error)
     body = {
         "bridge": "ok",
         "model_backend": "ok" if model_ok else "UNREACHABLE",
+        "probe_error": probe_error,
         "brain": brain.key,
         "model": brain.model,
         "profiles": sorted(PROFILES),
         "numbers": len(NUMBERS),
         "ntfy": "on" if NTFY_URL else "off",
+        "ntfy_failures": NTFY_FAILURES,
+        "last_delivery": dict(LAST_DELIVERY),
+        "recent_events": list(RECENT_EVENTS)[-20:],
     }
     return body, model_ok
 
 
 async def health(_: web.Request) -> web.Response:
-    """Health check: verifies the model backend is actually reachable."""
-    body, model_ok = await health_snapshot()
-    return web.json_response(body, status=200 if model_ok else 503)
+    """Public health check. The body says only whether the line is up; the
+    status code is what the external tripwire pages on — so a brain the bridge
+    cannot reach still degrades it, exactly as before the body was trimmed."""
+    status, body = public_health()
+    if status == 200:
+        _, model_ok = await health_snapshot()
+        if not model_ok:
+            status, body = 503, {"status": "degraded", "reason": "model backend unreachable"}
+    return web.json_response(body, status=status)
 
 
 async def _serve() -> None:

@@ -10,6 +10,7 @@
 # M-10, L-1, L-3, L-6 — docs/superpowers/specs/2026-08-27-phone-agent-code-audit.md
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -334,3 +335,111 @@ async def test_unhandled_relay_event_is_loud(tmp_path, monkeypatch):
         assert events[0]["call_sid"] == CALL_SID
         # and the call carried on normally
         assert "hello" in line.brain.summarizer_transcript
+
+
+# ---------------- H-1 / H-2: a message that cannot be delivered must reach --
+#                             the owner another way, or the line reports sick
+
+async def test_pad_write_failure_escalates_to_an_urgent_push(tmp_path, monkeypatch):
+    """The caller was told the owner would get back to them. If the pad write
+    fails, that promise must not die in a journal line nobody reads."""
+    blocked = tmp_path / "pad.md"
+    blocked.mkdir()                       # a directory: appending to it raises
+    async with phone_line(tmp_path, monkeypatch, messages_file=str(blocked)) as line:
+        await run_call(line, [setup_frame(), prompt_frame("please have Jo call me")])
+
+        assert line.ntfy.pushes, "nothing was pushed when the pad write failed"
+        urgent = line.ntfy.pushes[-1]
+        assert urgent["headers"].get("Priority") == "urgent"
+        assert line.brain.note in urgent["body"]
+
+        fallback = tmp_path / "pad.md.fallback"
+        assert fallback.exists(), "no fallback copy of the undelivered message"
+        assert line.brain.note in fallback.read_text(encoding="utf-8")
+
+        assert line.svc.public_health()[0] == 503
+        kinds = [e["kind"] for e in line.svc.RECENT_EVENTS]
+        assert "pad_write_failed" in kinds
+
+
+async def test_a_failing_push_degrades_health_until_it_recovers(tmp_path, monkeypatch):
+    """ntfy is the only channel the owner watches. When it is down, messages
+    pile into a markdown file nobody is looking at — the line must say so."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        assert line.svc.public_health() == (200, {"status": "ok"})
+
+        line.ntfy.status = 500
+        await run_call(line, [setup_frame(), prompt_frame("hello")])
+        assert line.svc.NTFY_FAILURES == 1
+        status, body = line.svc.public_health()
+        assert status == 503 and body["status"] == "degraded"
+        assert line.pad.exists()                       # the pad entry still landed
+
+        line.ntfy.status = 200
+        await run_call(line, [setup_frame(), prompt_frame("hello again")],
+                       call_sid="CAtest00000000002")
+        assert line.svc.NTFY_FAILURES == 0
+        assert line.svc.public_health() == (200, {"status": "ok"})
+
+
+# ------------------------------------- H-9 / M-7: split the health endpoint --
+
+async def test_public_health_says_only_whether_the_line_is_up(tmp_path, monkeypatch):
+    """It is reachable from the whole internet: the customer list, the model
+    vendor and the number count are nobody else's business."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{line.base}/health") as resp:
+                assert resp.status == 200
+                raw = await resp.text()
+                body = json.loads(raw)
+        assert body == {"status": "ok"}
+        for leak in ("acme", "test-model", "profiles", "numbers", "brain", "ntfy"):
+            assert leak not in raw
+
+
+async def test_public_health_reports_degraded_when_delivery_broke(tmp_path, monkeypatch):
+    """The external tripwire only reads the status code — 503 is what pages."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        line.ntfy.status = 500
+        await run_call(line, [setup_frame(), prompt_frame("hello")])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{line.base}/health") as resp:
+                assert resp.status == 503
+                body = await resp.json()
+        assert body["status"] == "degraded"
+        assert set(body) == {"status", "reason"}
+        assert "acme" not in body["reason"]
+
+
+async def test_health_snapshot_says_why_the_brain_is_unreachable(tmp_path, monkeypatch, caplog):
+    """'UNREACHABLE' with the reason discarded means the operator has to guess
+    whether it is an expired key, DNS, a timeout or TLS."""
+    async with phone_line(tmp_path, monkeypatch) as line:
+        svc = line.svc
+        brain = svc.BRAINS[svc.ACTIVE_BRAIN]
+        svc.BRAINS[svc.ACTIVE_BRAIN] = svc.Brain(
+            key=brain.key, label=brain.label, base_url="http://127.0.0.1:1/v1",
+            model=brain.model, api_key_env="", extra_body={},
+        )
+        with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+            body, model_ok = await svc.health_snapshot()
+
+        assert model_ok is False
+        assert body["model_backend"] == "UNREACHABLE"
+        assert body["probe_error"]
+        assert "health probe failed" in caplog.text
+        # the detailed snapshot is what the dashboard shows the owner
+        assert body["ntfy_failures"] == 0
+        assert body["last_delivery"]["ok"] is None
+        assert body["recent_events"] == []
+
+
+async def test_health_snapshot_carries_the_recent_events(tmp_path, monkeypatch):
+    async with phone_line(tmp_path, monkeypatch, ntfy=False) as line:
+        await run_call(line, [setup_frame(), {"type": "mystery"},
+                              prompt_frame("hello")])
+        body, _ = await line.svc.health_snapshot()
+        assert [e["kind"] for e in body["recent_events"]] == ["unhandled_relay_event"]
+        assert body["last_delivery"]["ok"] is True
+        assert body["last_delivery"]["call_sid"] == CALL_SID
