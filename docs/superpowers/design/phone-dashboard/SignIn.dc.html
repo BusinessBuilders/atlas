@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Funnel+Display:wght@300..800&display=swap');
+body { margin:0; background:#0a0a0a; color:#f5e6c8; font-family:'Bricolage Grotesque','Inter Tight',system-ui,sans-serif; font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased; }
+a { color:#4a9bc4; } a:hover { color:#f5e6c8; }
+* { box-sizing:border-box; }
+.display { font-family:'Funnel Display','Bricolage Grotesque',sans-serif; font-weight:700; letter-spacing:-0.01em; }
+.eyebrow { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.14em; color:#a89c80; }
+.muted { color:#c8b896; } .subtle { color:#a89c80; }
+.card { background:#1c1812; border:1px solid rgba(245,230,200,.14); border-radius:8px; padding:20px; }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:.12em; padding:12px 20px; border-radius:4px; border:2px solid transparent; cursor:pointer; text-decoration:none; min-height:44px; font-family:inherit; }
+.btn-primary { background:#e85d1a; color:#0a0a0a; box-shadow:0 4px 0 #c23b22; }
+.btn-ghost { background:transparent; color:#f5e6c8; border-color:#f5e6c8; }
+.btn-quiet { background:transparent; color:#c8b896; border-color:rgba(245,230,200,.35); }
+.tag { display:inline-flex; align-items:center; gap:6px; font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.14em; padding:5px 12px; border-radius:999px; white-space:nowrap; }
+.tag-orange { background:#e85d1a; color:#0a0a0a; } .tag-teal { background:#1f6486; color:#fbf1d8; } .tag-gold { background:#d4a847; color:#0a0a0a; }
+.tag-ghost { background:transparent; border:1px solid rgba(245,230,200,.35); color:#c8b896; }
+.tag-ok { background:rgba(107,163,104,.18); color:#a8dba4; border:1px solid rgba(107,163,104,.45); }
+.tag-warn { background:rgba(212,168,71,.16); color:#e6bf6a; border:1px solid rgba(212,168,71,.45); }
+.tag-bad { background:rgba(194,59,34,.18); color:#f5a07e; border:1px solid rgba(194,59,34,.5); }
+.input { width:100%; background:#14110d; border:1px solid rgba(245,230,200,.38); border-radius:4px; padding:12px 14px; color:#f5e6c8; font:inherit; min-height:44px; }
+textarea.input { min-height:120px; resize:vertical; }
+.label { display:block; font-size:13px; font-weight:600; color:#c8b896; margin-bottom:6px; }
+.hint { font-size:13px; color:#a89c80; margin-top:6px; }
+.rule { border:0; border-top:1px solid rgba(245,230,200,.12); margin:0; }
+.nav a { display:flex; align-items:center; gap:12px; padding:11px 14px; border-radius:6px; color:#c8b896; text-decoration:none; font-weight:600; font-size:15px; min-height:44px; }
+.nav a.active { background:rgba(232,93,26,.14); color:#f5e6c8; box-shadow:inset 3px 0 0 #e85d1a; }
+.nav a.sub { padding-left:46px; font-size:14px; font-weight:500; min-height:44px; }
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.14em; color:#a89c80; padding:10px 12px; border-bottom:1px solid rgba(245,230,200,.14); }
+td { padding:14px 12px; border-bottom:1px solid rgba(245,230,200,.08); vertical-align:middle; }
+tr.row:hover td { background:rgba(245,230,200,.03); }
+.bar { background:#2a7fa8; border-radius:3px 3px 0 0; width:100%; }
+.bar.warn { background:#d4a847; }
+.bubble { max-width:70%; padding:12px 16px; border-radius:12px; line-height:1.45; }
+.bubble.caller { background:#2a2218; border:1px solid rgba(245,230,200,.12); border-bottom-left-radius:4px; }
+.bubble.agent { background:rgba(42,127,168,.18); border:1px solid rgba(74,155,196,.35); border-bottom-right-radius:4px; }
+.toggle { width:44px; height:26px; border-radius:999px; background:#e85d1a; position:relative; flex:none; }
+.toggle i { position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:50%; background:#0a0a0a; }
+.toggle.off { background:#4a4234; } .toggle.off i { right:auto; left:3px; background:#c8b896; }
+.check { width:22px; height:22px; border-radius:4px; border:2px solid rgba(245,230,200,.45); flex:none; }
+.check.on { background:#e85d1a; border-color:#e85d1a; }
+.filter { display:inline-flex; align-items:center; gap:8px; min-height:44px; padding:0 16px; border-radius:999px; border:1px solid rgba(245,230,200,.35); color:#c8b896; font-weight:600; font-size:13px; text-decoration:none; }
+.filter.on { background:#e85d1a; color:#0a0a0a; border-color:#e85d1a; }
+.row44 { display:flex; align-items:center; gap:10px; min-height:44px; }
+</style>
+</helmet>
+<div style="width:1440px; min-height:900px; background:#0a0a0a; display:flex; align-items:center; justify-content:center; background-image: radial-gradient(ellipse at 50% 0%, rgba(232,93,26,.10), transparent 55%);">
+  <div style="width:440px; display:flex; flex-direction:column; gap:28px; align-items:center;">
+    <img src="bb-logo.png" alt="Business Builder" style="width:260px; height:auto; display:block;">
+    <div class="card" style="width:100%; padding:32px; display:flex; flex-direction:column; gap:20px;">
+      <div style="display:flex; flex-direction:column; gap:4px;">
+        <span class="eyebrow" style="color:#e85d1a; letter-spacing:.2em;">Phone Agent</span>
+        <h1 class="display" style="margin:0; font-size:26px;">Sign in to your phone line</h1>
+        <p class="muted" style="margin:0; font-size:14px;">See every call, read every message, and change how your line answers.</p>
+      </div>
+      <div>
+        <label class="label" for="code">Access code</label>
+        <input id="code" class="input" type="password" value="••••••••••••••••" autocomplete="current-password">
+        <div class="hint">The code from your setup email.</div>
+      </div>
+      <button class="btn btn-primary" style="width:100%;">Sign in</button>
+      <div class="subtle" style="font-size:13px; text-align:center;">Lost your code? Email <a href="#">donovan@business-builder.online</a></div>
+    </div>
+    <div class="subtle" style="font-size:12px;">Answered by Business Builders · Private to your business</div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

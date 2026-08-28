@@ -1,0 +1,110 @@
+{
+  "artboards": [
+    {
+      "file": "SignIn.dc.html",
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "SignIn"
+    },
+    {
+      "file": "Main.dc.html",
+      "x": 1560,
+      "y": 0,
+      "w": 1440,
+      "h": 1060,
+      "title": "Overview"
+    },
+    {
+      "file": "Calls.dc.html",
+      "x": 3120,
+      "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "Calls"
+    },
+    {
+      "file": "CallDetail.dc.html",
+      "x": 4680,
+      "y": 0,
+      "w": 1440,
+      "h": 1040,
+      "title": "CallDetail"
+    },
+    {
+      "file": "Settings.dc.html",
+      "x": 0,
+      "y": 1260,
+      "w": 1440,
+      "h": 1280,
+      "title": "Settings"
+    },
+    {
+      "file": "Hours.dc.html",
+      "x": 1560,
+      "y": 1260,
+      "w": 1440,
+      "h": 1040,
+      "title": "Hours"
+    },
+    {
+      "file": "Brain.dc.html",
+      "x": 3120,
+      "y": 1260,
+      "w": 1440,
+      "h": 960,
+      "title": "Brain"
+    },
+    {
+      "file": "Messages.dc.html",
+      "x": 4680,
+      "y": 1260,
+      "w": 1440,
+      "h": 1000,
+      "title": "Messages"
+    },
+    {
+      "file": "OverviewMobile.dc.html",
+      "x": 0,
+      "y": 2740,
+      "w": 390,
+      "h": 844,
+      "title": "Overview \u00b7 phone"
+    },
+    {
+      "file": "MessagesMobile.dc.html",
+      "x": 510,
+      "y": 2740,
+      "w": 390,
+      "h": 844,
+      "title": "Messages \u00b7 phone"
+    }
+  ],
+  "annotations": [
+    {
+      "id": "brief",
+      "x": 0,
+      "y": -170,
+      "w": 520,
+      "text": "Phone Agent owner dashboard \u2014 Business Builders brand.\nBuilt from the BB token sheet (warm black, cream, sign-orange, brick shadow, Bricolage Grotesque + Funnel Display).\nAll callers, numbers (555) and figures are SAMPLE data. The red 'test model' banner reflects the line's real state today."
+    },
+    {
+      "id": "row2",
+      "x": 0,
+      "y": 1150,
+      "w": 420,
+      "text": "Settings screens: each section saves on its own and never loses what you typed. Hours decide after-hours behaviour; Brain shows a production-use badge on every model."
+    },
+    {
+      "id": "row3",
+      "x": 0,
+      "y": 2630,
+      "w": 420,
+      "text": "Phone layout: bottom tabs, one-thumb actions (call back, mark done)."
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Funnel+Display:wght@300..800&display=swap');
+body { margin:0; background:#0a0a0a; color:#f5e6c8; font-family:'Bricolage Grotesque','Inter Tight',system-ui,sans-serif; font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased; }
+a { color:#4a9bc4; } a:hover { color:#f5e6c8; }
+* { box-sizing:border-box; }
+.display { font-family:'Funnel Display','Bricolage Grotesque',sans-serif; font-weight:700; letter-spacing:-0.01em; }
+.eyebrow { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.14em; color:#a89c80; }
+.muted { color:#c8b896; } .subtle { color:#a89c80; }
+.card { background:#1c1812; border:1px solid rgba(245,230,200,.14); border-radius:8px; padding:20px; }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:.12em; padding:12px 20px; border-radius:4px; border:2px solid transparent; cursor:pointer; text-decoration:none; min-height:44px; font-family:inherit; }
+.btn-primary { background:#e85d1a; color:#0a0a0a; box-shadow:0 4px 0 #c23b22; }
+.btn-ghost { background:transparent; color:#f5e6c8; border-color:#f5e6c8; }
+.btn-quiet { background:transparent; color:#c8b896; border-color:rgba(245,230,200,.35); }
+.tag { display:inline-flex; align-items:center; gap:6px; font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.14em; padding:5px 12px; border-radius:999px; white-space:nowrap; }
+.tag-orange { background:#e85d1a; color:#0a0a0a; } .tag-teal { background:#1f6486; color:#fbf1d8; } .tag-gold { background:#d4a847; color:#0a0a0a; }
+.tag-ghost { background:transparent; border:1px solid rgba(245,230,200,.35); color:#c8b896; }
+.tag-ok { background:rgba(107,163,104,.18); color:#a8dba4; border:1px solid rgba(107,163,104,.45); }
+.tag-warn { background:rgba(212,168,71,.16); color:#e6bf6a; border:1px solid rgba(212,168,71,.45); }
+.tag-bad { background:rgba(194,59,34,.18); color:#f5a07e; border:1px solid rgba(194,59,34,.5); }
+.input { width:100%; background:#14110d; border:1px solid rgba(245,230,200,.38); border-radius:4px; padding:12px 14px; color:#f5e6c8; font:inherit; min-height:44px; }
+textarea.input { min-height:120px; resize:vertical; }
+.label { display:block; font-size:13px; font-weight:600; color:#c8b896; margin-bottom:6px; }
+.hint { font-size:13px; color:#a89c80; margin-top:6px; }
+.rule { border:0; border-top:1px solid rgba(245,230,200,.12); margin:0; }
+.nav a { display:flex; align-items:center; gap:12px; padding:11px 14px; border-radius:6px; color:#c8b896; text-decoration:none; font-weight:600; font-size:15px; min-height:44px; }
+.nav a.active { background:rgba(232,93,26,.14); color:#f5e6c8; box-shadow:inset 3px 0 0 #e85d1a; }
+.nav a.sub { padding-left:46px; font-size:14px; font-weight:500; min-height:44px; }
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.14em; color:#a89c80; padding:10px 12px; border-bottom:1px solid rgba(245,230,200,.14); }
+td { padding:14px 12px; border-bottom:1px solid rgba(245,230,200,.08); vertical-align:middle; }
+tr.row:hover td { background:rgba(245,230,200,.03); }
+.bar { background:#2a7fa8; border-radius:3px 3px 0 0; width:100%; }
+.bar.warn { background:#d4a847; }
+.bubble { max-width:70%; padding:12px 16px; border-radius:12px; line-height:1.45; }
+.bubble.caller { background:#2a2218; border:1px solid rgba(245,230,200,.12); border-bottom-left-radius:4px; }
+.bubble.agent { background:rgba(42,127,168,.18); border:1px solid rgba(74,155,196,.35); border-bottom-right-radius:4px; }
+.toggle { width:44px; height:26px; border-radius:999px; background:#e85d1a; position:relative; flex:none; }
+.toggle i { position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:50%; background:#0a0a0a; }
+.toggle.off { background:#4a4234; } .toggle.off i { right:auto; left:3px; background:#c8b896; }
+.check { width:22px; height:22px; border-radius:4px; border:2px solid rgba(245,230,200,.45); flex:none; }
+.check.on { background:#e85d1a; border-color:#e85d1a; }
+.filter { display:inline-flex; align-items:center; gap:8px; min-height:44px; padding:0 16px; border-radius:999px; border:1px solid rgba(245,230,200,.35); color:#c8b896; font-weight:600; font-size:13px; text-decoration:none; }
+.filter.on { background:#e85d1a; color:#0a0a0a; border-color:#e85d1a; }
+.row44 { display:flex; align-items:center; gap:10px; min-height:44px; }
+</style>
+</helmet>
+<div style="width:1440px; min-height:1040px; background:#0a0a0a; display:flex; align-items:stretch;">
+  
+<aside style="width:240px; flex:none; background:#14110d; border-right:1px solid rgba(245,230,200,.12); display:flex; flex-direction:column; padding:20px 16px; gap:8px;">
+  <div style="display:flex; flex-direction:column; gap:6px; padding:4px 10px 18px;">
+    <img src="bb-logo-navbar.png" alt="Business Builder" style="width:132px; height:auto; display:block;">
+    <div class="eyebrow" style="color:#e85d1a; letter-spacing:.2em;">Phone Agent</div>
+  </div>
+  <nav class="nav" style="display:flex; flex-direction:column; gap:4px;"><a href="#"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Overview</span></a><a href="#"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z"/></svg><span>Calls</span></a><a href="#"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/></svg><span>Messages</span><span class="tag tag-orange" style="margin-left:auto; padding:2px 9px;">2</span></a><a href="#"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg><span>Settings</span></a><a href="#" class="sub"><span>Business</span></a><a href="#" class="sub active"><span>Hours</span></a><a href="#" class="sub"><span>Numbers</span></a><a href="#" class="sub"><span>Notifications</span></a><a href="#" class="sub"><span>Brain</span></a><a href="#" class="sub"><span>Activity</span></a></nav>
+  <div style="margin-top:auto; display:flex; flex-direction:column; gap:10px; padding-top:16px; border-top:1px solid rgba(245,230,200,.12);">
+    <div style="display:flex; align-items:center; gap:10px; padding:8px 10px;">
+      <div style="width:34px; height:34px; border-radius:6px; background:#2a2218; display:flex; align-items:center; justify-content:center; font-weight:700; color:#e85d1a; font-family:'Funnel Display',sans-serif;">BB</div>
+      <div style="display:flex; flex-direction:column; line-height:1.2;">
+        <span style="font-weight:600;">Business Builders</span>
+        <span class="subtle" style="font-size:12px;">(508) 886-3046</span>
+      </div>
+    </div>
+    <a href="#" class="nav" style="display:flex; align-items:center; gap:10px; color:#c8b896; text-decoration:none; padding:8px 10px; font-size:14px;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span>Sign out</span></a>
+  </div>
+</aside>
+  <main style="flex:1 1 auto; min-width:0; padding:32px 40px 48px; display:flex; flex-direction:column; gap:24px;">
+    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:24px;">
+  <div><h1 class="display" style="margin:0; font-size:28px; line-height:1.15;">Hours & availability</h1><div class="muted" style="margin-top:4px;">Your line answers 24/7 — this decides what it does after hours</div></div>
+  <div style="display:flex; gap:12px; align-items:center;"><span class="tag tag-ok">Live</span></div>
+</div>
+<div style="display:grid; grid-template-columns: minmax(0, 1fr) 360px; gap:20px; align-items:start;">
+  <div class="card" style="display:flex; flex-direction:column; gap:16px; padding:24px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:16px;">
+      <span class="display" style="font-size:18px;">Weekly hours</span>
+      <div style="display:flex; align-items:center; gap:10px;"><span class="label" style="margin:0;">Time zone</span><span class="input" style="width:260px; display:inline-flex; align-items:center;">Eastern — New York</span></div>
+    </div>
+    <div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Monday</span><span class="row44"><span class="toggle"><i></i></span></span><input class="input" value="9:00 AM"><span class="subtle" style="text-align:center;">to</span><input class="input" value="5:00 PM"></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Tuesday</span><span class="row44"><span class="toggle"><i></i></span></span><input class="input" value="9:00 AM"><span class="subtle" style="text-align:center;">to</span><input class="input" value="5:00 PM"></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Wednesday</span><span class="row44"><span class="toggle"><i></i></span></span><input class="input" value="9:00 AM"><span class="subtle" style="text-align:center;">to</span><input class="input" value="5:00 PM"></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Thursday</span><span class="row44"><span class="toggle"><i></i></span></span><input class="input" value="9:00 AM"><span class="subtle" style="text-align:center;">to</span><input class="input" value="5:00 PM"></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Friday</span><span class="row44"><span class="toggle"><i></i></span></span><input class="input" value="9:00 AM"><span class="subtle" style="text-align:center;">to</span><input class="input" value="4:00 PM"></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Saturday</span><span class="row44"><span class="toggle off"><i></i></span></span><span class="subtle">Closed</span><span class="subtle" style="text-align:center;"></span><span></span></div><div style="display:grid; grid-template-columns: 140px 70px minmax(0,1fr) 24px minmax(0,1fr); gap:14px; align-items:center; padding:10px 0; border-bottom:1px solid rgba(245,230,200,.08);"><span style="font-weight:600; min-height:44px; display:flex; align-items:center;">Sunday</span><span class="row44"><span class="toggle off"><i></i></span></span><span class="subtle">Closed</span><span class="subtle" style="text-align:center;"></span><span></span></div></div>
+    <div style="display:flex; justify-content:flex-end;"><a href="#" class="btn btn-primary" style="padding:10px 18px;">Save hours</a></div>
+  </div>
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card" style="display:flex; flex-direction:column; gap:12px;">
+      <span class="eyebrow">After hours</span>
+      <label class="row44" style="align-items:flex-start; font-size:14px; gap:12px;"><span class="check on" style="border-radius:50%;"></span><span><span style="font-weight:600;">Take a message</span><br><span class="subtle">Atlas explains you're closed and takes the details.</span></span></label>
+      <label class="row44" style="align-items:flex-start; font-size:14px; gap:12px;"><span class="check" style="border-radius:50%;"></span><span><span style="font-weight:600;">Still offer a transfer</span><br><span class="subtle">Rings (774) 555-0100 even after hours.</span></span></label>
+      <label class="row44" style="align-items:flex-start; font-size:14px; gap:12px;"><span class="check" style="border-radius:50%;"></span><span><span style="font-weight:600;">Answer the same way</span><br><span class="subtle">No difference day or night.</span></span></label>
+      <div><label class="label">Closed greeting</label><textarea class="input" style="min-height:96px;">Thanks for calling Business Builders. We're closed right now, but I can take a message and William will call you back.</textarea></div>
+    </div>
+    <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+      <span class="eyebrow">Holidays</span>
+      <div style="display:flex; justify-content:space-between; font-size:14px;"><span>Thanksgiving · Nov 26</span><a href="#" class="subtle">Remove</a></div>
+      <div style="display:flex; justify-content:space-between; font-size:14px;"><span>Christmas · Dec 24–26</span><a href="#" class="subtle">Remove</a></div>
+      <a href="#" class="btn btn-quiet" style="padding:8px 14px; align-self:flex-start; min-height:44px;">+ Add a closure</a>
+    </div>
+  </div>
+</div>
+  </main>
+</div>
+</x-dc>
+</body>
+</html>
