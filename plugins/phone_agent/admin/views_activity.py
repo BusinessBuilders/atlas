@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import re
 import tomllib
@@ -53,9 +54,11 @@ CONTEXT_LINES = 3
 _HEADER = re.compile(
     r"^[ +-]\s*\[(profiles|deleted_profiles)\.([A-Za-z0-9_-]+)\]\s*$")
 _ANY_TABLE = re.compile(r"^[ +-]\s*\[")
-# TOML's two multi-line string fences. Their presence anywhere in a diff means
-# a line that looks like a table header might be somebody's prose — see
-# `attribution_is_certain`.
+# TOML's two multi-line string fences. A string written across several lines
+# is the one TOML construct that lets a line reading exactly like
+# `[profiles.other]` be somebody's prose, and every such string starts with one
+# of these — so the lines carrying one are the only lines
+# `attribution_is_certain` has to put to the parser a second time.
 _FENCES = ('"' * 3, "'" * 3)
 
 # What a scoped reader is told about a change this module cannot safely take
@@ -66,25 +69,73 @@ UNCERTAIN_SUMMARY = ("Settings on this line changed (the line owner can see "
 UNKNOWN_ACTOR = "somebody who manages this line"
 
 
-def attribution_is_certain(diff: str) -> bool:
+def _every_string_ends_on_its_line(source: str) -> bool:
+    """Is `source` TOML in which no string runs past the line it starts on?
+
+    Decided by the parser, never by counting quotes. The whole file has to
+    parse, and so does the file cut off at the end of every line that carries
+    a fence: a fence that opened a string still open at the end of its own
+    line leaves that cut unterminated. Three quotes INSIDE a one-line string —
+    a tenant's `it's '''fine'''`, a literal `'ends with \"\"\"'`, the emitter's
+    `\\"\\"\\"` — parse cleanly at the cut and open nothing. (An array written
+    across lines with a fence inside it fails the same cut. That is
+    over-cautious, in the safe direction, and the emitter never writes one.)
+    """
+    try:
+        tomllib.loads(source)
+    except tomllib.TOMLDecodeError:
+        return False
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if any(fence in line for fence in _FENCES):
+            try:
+                tomllib.loads("\n".join(lines[:index + 1]))
+            except tomllib.TOMLDecodeError:
+                return False
+    return True
+
+
+def attribution_is_certain(diff: str, *, rebuild) -> bool:
     """Can this diff be split up by business at all?
 
-    False as soon as `\"\"\"` or `'''` appears ANYWHERE in it, on either side or
-    in context. Inside a multi-line TOML string a line reading exactly like
-    `[profiles.other]` is somebody's prose, and no amount of tracking makes
-    that decidable from a diff: the two sides are two different files, a fence
-    opened on one side may never close on the other, and one missed header
-    means a business's settings are attributed to its neighbour. So this does
-    not try. A diff with a fence in it is not split at all — a scoped reader
-    gets one dull sentence saying something changed.
+    `_walk` gives every line to the nearest `[profiles.x]` header above it,
+    which is exact only if every line of BOTH versions is one complete TOML
+    line. The one thing that breaks that is a string written across several
+    lines: inside it, a line reading exactly like `[profiles.other]` is
+    somebody's prose, and a walker that believes it hands the neighbour's
+    settings to the wrong business — the direction that shows one customer
+    another's settings. No amount of tracking makes that decidable from the
+    diff itself, because its two sides are two different files. So the two
+    versions are rebuilt from it with `rebuild` (the service's
+    `config_from_diff`) and each is put to the TOML parser: certain iff both
+    parse and no string in either runs past the line it starts on. A side
+    that will not parse — a file edited by hand, a truncated record — or a
+    diff that cannot be rebuilt at all is uncertain. Every doubt fails
+    closed: an uncertain diff is not split up, and a scoped reader gets one
+    dull sentence saying something changed.
 
-    The cost is nothing in practice: `emit_business_toml` escapes newlines and
-    only ever writes single-line basic strings, so every diff recorded after
-    the first dashboard save is certain. Only a config still carrying a
-    hand-written multi-line value can be uncertain, and only until it is saved.
+    The rule is about the LINES of the file, never the characters of a value,
+    and that is the point. `emit_business_toml` writes every value on one
+    line — `'` as it is, `"` as `\\"`, a line break as `\\n` — so a tenant who
+    types three apostrophes into a greeting, or two facts, or two paragraphs
+    of instructions, gets a file whose every string ends on its own line.
+    Certain. A file the emitter wrote is always certain; only a version
+    written by hand with a real multi-line value is not, and only until it
+    has been saved from the dashboard once. A tenant's text cannot make their
+    line's history unreadable to its owners.
     """
     text = str(diff or "")
-    return not any(fence in text for fence in _FENCES)
+    for side in ("before", "after"):
+        try:
+            source = rebuild(text, side=side)
+        except Exception:
+            log.exception("activity: could not rebuild the %s side of a "
+                          "recorded settings change, so it is not split up",
+                          side)
+            return False
+        if not _every_string_ends_on_its_line(source):
+            return False
+    return True
 
 
 def _walk(diff: str):
@@ -106,10 +157,10 @@ def _walk(diff: str):
       * **Any other table ends the current one**, indented or not.
 
     It does NOT try to work out whether a header is really prose inside a
-    multi-line string. That question is settled before this runs, for the whole
-    diff at once, by `attribution_is_certain` — because a walker that gets it
-    wrong gets it wrong in the direction that shows one customer another's
-    settings.
+    multi-line string. That question is settled for the whole diff at once by
+    `attribution_is_certain`, which puts both rebuilt versions to the TOML
+    parser — because a walker that gets it wrong gets it wrong in the
+    direction that shows one customer another's settings.
     """
     current = ""
     for line in str(diff).splitlines():
@@ -135,10 +186,19 @@ class Reading:
     A row on the Activity screen needs the body, the businesses it touched,
     whether it touched anything shared, and the lines to draw. Working each of
     those out from the raw text meant walking the same diff seven times per
-    row; this walks it once.
+    row; this walks it once. `certain` — two rebuilds and two parses — is
+    answered the first time it is asked and kept; the owner of the whole line
+    never asks.
     """
-    certain: bool
+    text: str
     walked: tuple
+    rebuild: object = dataclasses.field(repr=False, compare=False)
+
+    @functools.cached_property
+    def certain(self) -> bool:
+        # A frozen dataclass still has a __dict__, which is where
+        # cached_property keeps the answer.
+        return attribution_is_certain(self.text, rebuild=self.rebuild)
 
     @property
     def body(self) -> list:
@@ -155,30 +215,36 @@ class Reading:
     @property
     def touches_shared(self) -> bool:
         """Something outside any one business changed — the numbers, the
-        models, the branding, the logins. Only meaningful when `certain`."""
+        models, the branding, the logins. FALSE when the diff cannot be split
+        up: "shared" is an attribution like any other."""
+        if not self.certain:
+            return False
         return any(line[:1] in "+-" for key, line in self.walked if not key)
 
 
-def read_diff(diff) -> Reading:
+def read_diff(diff, *, rebuild) -> Reading:
+    """`rebuild` is the service's `config_from_diff`, reached through `Deps`
+    on a request path and passed by name everywhere: no question about a
+    diff can be asked without the reader that rebuilds its two sides."""
     text = str(diff or "")
-    return Reading(certain=attribution_is_certain(text),
-                   walked=tuple(_walk(text)))
+    return Reading(text=text, walked=tuple(_walk(text)), rebuild=rebuild)
 
 
 def _diff_body(diff: str) -> list:
     """Every content line of a diff, hunk and file headers dropped."""
-    return read_diff(diff).body
+    return [line for _key, line in _walk(str(diff or ""))]
 
 
-def sections_touched(diff: str) -> set:
+def sections_touched(diff: str, *, rebuild) -> set:
     """Which businesses this change altered, or nothing when it cannot be
     told."""
-    return read_diff(diff).touched
+    return read_diff(diff, rebuild=rebuild).touched
 
 
-def line_wide(diff: str) -> bool:
-    """True when it altered something outside any one business."""
-    return read_diff(diff).touches_shared
+def line_wide(diff: str, *, rebuild) -> bool:
+    """True when it altered something outside any one business — and False,
+    not a guess, when the diff cannot be split up."""
+    return read_diff(diff, rebuild=rebuild).touches_shared
 
 
 # What is said in place of the lines a scoped owner may not read. The change is
@@ -232,8 +298,8 @@ def _visible(reading: Reading, keys=None) -> list:
     return shown
 
 
-def visible_diff(diff: str, keys=None) -> list:
-    return _visible(read_diff(diff), keys)
+def visible_diff(diff: str, keys=None, *, rebuild) -> list:
+    return _visible(read_diff(diff, rebuild=rebuild), keys)
 
 
 def _named(names: list) -> str:
@@ -280,7 +346,8 @@ def decorate_change(deps, change: dict, session=None, reading=None) -> dict:
     something changed, and nothing derived from a guess.
     """
     if reading is None:
-        reading = read_diff(change.get("diff") or "")
+        reading = read_diff(change.get("diff") or "",
+                            rebuild=deps.config_from_diff)
     scoped = session is not None and not session.sees_whole_line
     keys = tuple(session.profile_keys) if scoped else None
     change["lines"] = _visible(reading, keys)
@@ -291,9 +358,12 @@ def decorate_change(deps, change: dict, session=None, reading=None) -> dict:
     if not scoped:
         change["actor_label"] = actor or "somebody on this line"
         return change
-    # A login name is a fact about who else manages this line.
+    # A login name is a fact about who else manages this line. The label is
+    # what the template shows; the name itself comes off the row as well, so
+    # keeping it from this reader is not one template edit away.
     change["actor_label"] = ("you" if actor and actor == session.owner_key
                              else UNKNOWN_ACTOR)
+    change.pop("actor", None)
     if not reading.certain:
         change["summary"] = UNCERTAIN_SUMMARY
         change["actor_label"] = UNKNOWN_ACTOR
@@ -324,7 +394,8 @@ def changes_for(deps, session) -> tuple:
     mine = set(session.profile_keys)
     kept = []
     for change in rows or []:
-        reading = read_diff(change.get("diff") or "")
+        reading = read_diff(change.get("diff") or "",
+                            rebuild=deps.config_from_diff)
         if not session.sees_whole_line and reading.certain:
             # A diff names other customers' numbers, greetings and push
             # targets. An owner of one business reads only what touched theirs.

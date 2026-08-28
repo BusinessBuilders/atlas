@@ -1401,10 +1401,12 @@ def test_the_diff_filter_is_pure_and_keeps_the_owners_own_lines(hand_written):
     diff = hand_written.config_diff(before, after)
 
     # unfiltered, the neighbour IS in there — which is what had to be filtered
-    everything = admin.views_activity.visible_diff(diff, None)
+    everything = admin.views_activity.visible_diff(
+        diff, None, rebuild=hand_written.config_from_diff)
     assert any("other-co-secret-topic" in line["text"] for line in everything)
 
-    mine = admin.views_activity.visible_diff(diff, ("acme",))
+    mine = admin.views_activity.visible_diff(
+        diff, ("acme",), rebuild=hand_written.config_from_diff)
     text = " ".join(line["text"] for line in mine)
     assert "Good morning." in text and "Acme Co" in text
     assert "other-co-secret-topic" not in text
@@ -1717,13 +1719,15 @@ def test_a_second_hunk_belongs_to_no_business_until_a_header_says_so(
     assert "[profiles.acme]" in short
     assert "[profiles.other]" not in short      # the second hunk has no header
 
-    mine = admin.views_activity.visible_diff(short, ("acme",))
+    mine = admin.views_activity.visible_diff(
+        short, ("acme",), rebuild=hand_written.config_from_diff)
     text = " ".join(line["text"] for line in mine)
     assert "Acme Repairs" in text                       # their own change
     assert "other-co-secret-topic" not in text          # not the neighbour's
     assert "changed-topic" not in text
 
-    everything = admin.views_activity.visible_diff(short, None)
+    everything = admin.views_activity.visible_diff(
+        short, None, rebuild=hand_written.config_from_diff)
     assert any("changed-topic" in line["text"] for line in everything)
 
 
@@ -1747,8 +1751,10 @@ LITERAL_FENCE = "'" * 3
 # Probe (a): a literal (single-quoted) TOML string whose CONTENT ends in a
 # triple quote. The emitter rewrites it on the new side with each quote
 # escaped, so the fence appears an odd number of times and only on the old
-# side — which is what desynchronised the tracker this replaced, leaving every
-# later header unrecognised and the neighbour's lines attributed to Acme.
+# side. That desynchronised the quote-tracker of two rounds ago, and made the
+# substring scan of one round ago call the diff unsplittable — but every
+# string on BOTH sides ends on the line it starts on, so the parser reads it
+# and the walker splits it exactly.
 ODD_FENCE_DIFF = "\n".join([
     "--- businesses.toml (before)",
     "+++ businesses.toml (after)",
@@ -1765,8 +1771,9 @@ ODD_FENCE_DIFF = "\n".join([
 ])
 
 # Probe (b): a multi-line literal body that CONTAINS a line reading exactly
-# like a table header. Nothing tracked these at all, so the fake header moved
-# attribution and Acme's own change landed under the business next door.
+# like a table header. The fake header moves attribution and Acme's own
+# change lands under the business next door — the one shape that really
+# cannot be split, and the parser is what says so.
 FENCE_BODY_DIFF = "\n".join([
     "@@ -1,9 +1,9 @@",
     " [profiles.acme]",
@@ -1780,24 +1787,34 @@ FENCE_BODY_DIFF = "\n".join([
 ])
 
 
-def test_a_diff_with_a_multi_line_string_cannot_be_split_up_at_all():
+def test_a_diff_with_a_multi_line_string_cannot_be_split_up_at_all(line):
     """Inside a multi-line TOML value, a line reading like `[profiles.other]`
     is somebody's prose — and a diff cannot tell. So it is not split: a scoped
     reader gets nothing derived from a guess."""
     admin = load_admin()
+    rebuild = line.config_from_diff
     certain = admin.views_activity.attribution_is_certain
 
-    for probe in (ODD_FENCE_DIFF, FENCE_BODY_DIFF):
-        assert certain(probe) is False
-        # nothing downstream may act on an attribution nobody can make
-        assert admin.views_activity.sections_touched(probe) == set()
-        assert admin.views_activity.visible_diff(probe, ("acme",)) == []
-        assert admin.views_activity.visible_diff(probe, ("other",)) == []
-        # the account that manages the line still sees the whole thing
-        whole = admin.views_activity.visible_diff(probe, None)
-        assert any("other-co-secret-topic" in row["text"] for row in whole)
+    # The mechanism, pinned: the old side is valid TOML, and the PARSER says
+    # its `extra_instructions` runs across lines and carries the fake header.
+    # No quote-counting is involved in the decision.
+    old = tomllib.loads(rebuild(FENCE_BODY_DIFF, side="before"))
+    assert "[profiles.other]\n" in old["profiles"]["acme"]["extra_instructions"]
+    assert "other" not in old["profiles"]
+    assert certain(FENCE_BODY_DIFF, rebuild=rebuild) is False
+    # nothing downstream may act on an attribution nobody can make
+    assert admin.views_activity.sections_touched(
+        FENCE_BODY_DIFF, rebuild=rebuild) == set()
+    assert admin.views_activity.visible_diff(
+        FENCE_BODY_DIFF, ("acme",), rebuild=rebuild) == []
+    assert admin.views_activity.visible_diff(
+        FENCE_BODY_DIFF, ("other",), rebuild=rebuild) == []
+    # the account that manages the line still sees the whole thing
+    whole = admin.views_activity.visible_diff(FENCE_BODY_DIFF, None,
+                                              rebuild=rebuild)
+    assert any("other-co-secret-topic" in row["text"] for row in whole)
 
-    # a diff the emitter wrote has no fence in it, so it is split as before
+    # a diff the emitter wrote has no multi-line value in it, so it is split
     plain = "\n".join([
         "@@ -1,5 +1,5 @@",
         " [profiles.acme]",
@@ -1806,18 +1823,48 @@ def test_a_diff_with_a_multi_line_string_cannot_be_split_up_at_all():
         " [profiles.other]",
         ' ntfy_topic = "other-co-secret-topic"',
     ])
-    assert certain(plain) is True
-    assert admin.views_activity.sections_touched(plain) == {"acme"}
-    mine = admin.views_activity.visible_diff(plain, ("acme",))
+    assert certain(plain, rebuild=rebuild) is True
+    assert admin.views_activity.sections_touched(plain, rebuild=rebuild) == {"acme"}
+    mine = admin.views_activity.visible_diff(plain, ("acme",), rebuild=rebuild)
     text = " ".join(row["text"] for row in mine)
     assert "hello" in text and "other-co-secret-topic" not in text
 
 
+def test_a_fence_inside_a_one_line_string_is_not_a_multi_line_string(line):
+    """Three quotes INSIDE a one-line string — the literal `'ends with \"\"\"'`
+    on the old side, the emitter's `"ends with \\"\\"\\""` on the new — open
+    nothing. Both sides parse, the value has no line break in it, and the
+    walker's split is exact. A quote count made this diff unreadable to its
+    own owner; the parser reads it."""
+    admin = load_admin()
+    rebuild = line.config_from_diff
+    for side in ("before", "after"):
+        parsed = tomllib.loads(rebuild(ODD_FENCE_DIFF, side=side))
+        assert parsed["profiles"]["acme"]["notes"] == 'ends with """'
+        assert "\n" not in parsed["profiles"]["acme"]["notes"]
+
+    assert admin.views_activity.attribution_is_certain(
+        ODD_FENCE_DIFF, rebuild=rebuild) is True
+    assert admin.views_activity.sections_touched(
+        ODD_FENCE_DIFF, rebuild=rebuild) == {"acme"}
+    mine = admin.views_activity.visible_diff(ODD_FENCE_DIFF, ("acme",),
+                                             rebuild=rebuild)
+    text = " ".join(row["text"] for row in mine)
+    assert "ends with" in text and "hello" in text
+    assert "other-co-secret-topic" not in text
+    # nothing of the neighbour's changed, so their view has no lines in it
+    theirs = admin.views_activity.visible_diff(ODD_FENCE_DIFF, ("other",),
+                                               rebuild=rebuild)
+    assert all(row["kind"] == "gap" for row in theirs)
+    assert not any("ends with" in row["text"] for row in theirs)
+
+
 async def test_a_scoped_owner_gets_one_dull_sentence_for_an_unsplittable_diff(
         two):
-    """Both probe shapes, through the real screen: none of the neighbour's
-    topic, key or name reaches a scoped owner, and the row still appears so
-    they are not told a change never happened."""
+    """Both probe shapes, through the real screen. The multi-line body is not
+    split: none of the neighbour's topic, key or name reaches a scoped owner,
+    and the row still appears so they are not told a change never happened.
+    The one-line fence IS split, and the owner reads her own lines from it."""
     for probe in (ODD_FENCE_DIFF, FENCE_BODY_DIFF):
         two.STORE.record_config_change(
             actor="the_other_manager", summary="Removed the business Other Co",
@@ -1830,39 +1877,43 @@ async def test_a_scoped_owner_gets_one_dull_sentence_for_an_unsplittable_diff(
         await _signed_in(dash)
         whole = _text(await (await dash.client.get("/activity")).text())
 
-    # the reader who owns one business learns only that something changed
+    # the multi-line body: the reader learns only that something changed
     assert scoped.count(
-        "Settings on this line changed (the line owner can see the details)") == 2
+        "Settings on this line changed (the line owner can see the details)") == 1
     assert "somebody who manages this line" in scoped
+    # the one-line fence: her own change, in her own words, with her own lines
+    assert scoped.count("Settings changed for Acme Co") == 1
+    assert "ends with" in scoped
+    assert scoped.count("What changed") == 1
     for secret in ("other-co-secret-topic", "[profiles.other]", "Other Co",
-                   "Removed the business", "the_other_manager", "ends with"):
+                   "Removed the business", "the_other_manager"):
         assert secret not in scoped, secret
-    # no diff panel at all, and nothing to put back
-    assert "What changed" not in scoped
+    # nothing to put back, either way
     assert "restore=" not in scoped
 
     # the account that manages the line sees every one of them
-    assert "Removed the business Other Co" in whole
+    assert whole.count("Removed the business Other Co") == 2
     assert "other-co-secret-topic" in whole
     assert "the_other_manager" in whole
 
 
-def test_believing_a_header_inside_a_quoted_body_moves_the_wrong_lines():
+def test_believing_a_header_inside_a_quoted_body_moves_the_wrong_lines(line):
     """Why the certainty rule is not paranoia: with the fence body believed,
     Acme's own change lands under the business next door — which is a leak in
     whichever direction the reader happens to own."""
     admin = load_admin()
     walked = list(admin.views_activity._walk(FENCE_BODY_DIFF))
-    changed = {key for key, line in walked if line[:1] in "+-"}
+    changed = {key for key, line_ in walked if line_[:1] in "+-"}
 
     # the walker on its own really is fooled — the greeting change reads as
     # `other`'s, not Acme's
     assert changed == {"other"}
     # which is exactly why nothing is allowed to use it here
-    assert admin.views_activity.sections_touched(FENCE_BODY_DIFF) == set()
+    assert admin.views_activity.sections_touched(
+        FENCE_BODY_DIFF, rebuild=line.config_from_diff) == set()
 
 
-def test_an_indented_table_header_still_ends_the_business_before_it():
+def test_an_indented_table_header_still_ends_the_business_before_it(line):
     admin = load_admin()
     diff = "\n".join([
         "@@ -1,4 +1,4 @@",
@@ -1873,8 +1924,197 @@ def test_an_indented_table_header_still_ends_the_business_before_it():
         '+"+15550009999" = "acme"',
     ])
     # the indented table is not acme's, so the number line belongs to nobody
-    assert admin.views_activity.sections_touched(diff) == {"acme"}
-    assert admin.views_activity.line_wide(diff) is True
+    assert admin.views_activity.sections_touched(
+        diff, rebuild=line.config_from_diff) == {"acme"}
+    assert admin.views_activity.line_wide(
+        diff, rebuild=line.config_from_diff) is True
+
+
+# ============ a tenant's text cannot make the line's history unreadable =====
+
+async def test_three_apostrophes_in_a_greeting_do_not_poison_the_line(two):
+    """The emitter escapes `"` and line breaks but writes `'` as it is, so a
+    tenant who types ''' gets it into the file verbatim — on ONE line, inside
+    a basic string, valid TOML. That is not a multi-line string. Read as one,
+    every later change on the line was unreadable to its own owners for ever,
+    because every recorded diff carries the whole file."""
+    two.apply_config(
+        dataclasses.replace(two.CONFIG, profiles=dict(
+            two.CONFIG.profiles,
+            acme=dict(two.CONFIG.profiles["acme"],
+                      greeting="it's '''fine'''"))),
+        "jo", "Changed the greeting callers hear for Acme Co")
+    two.apply_config(
+        dataclasses.replace(two.CONFIG, profiles=dict(
+            two.CONFIG.profiles,
+            other=dict(two.CONFIG.profiles["other"],
+                       greeting="Other Co, secret greeting"))),
+        "line", "Changed the greeting callers hear for Other Co")
+
+    # the premise: the apostrophes are in the file as typed, and it is TOML
+    on_disk = _config_text(two)
+    assert "greeting = \"it's '''fine'''\"" in on_disk
+    assert tomllib.loads(on_disk)["profiles"]["acme"]["greeting"] == "it's '''fine'''"
+
+    admin = load_admin()
+    rebuild = two.config_from_diff
+    later, earlier = two.STORE.list_config_changes()[:2]
+    assert "'''" in later["diff"]                   # it carries the whole file
+    certain = admin.views_activity.attribution_is_certain
+    assert certain(earlier["diff"], rebuild=rebuild) is True
+    assert certain(later["diff"], rebuild=rebuild) is True
+    assert admin.views_activity.sections_touched(
+        later["diff"], rebuild=rebuild) == {"other"}
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+
+    # her own change is there, as hers, with its lines
+    assert scoped.count("Settings changed for Acme Co") == 1
+    assert "by you" in scoped
+    assert "it's '''fine'''" in scoped
+    # and the neighbour's save is filtered out, not shown as a dull row
+    assert admin.views_activity.UNCERTAIN_SUMMARY not in scoped
+    assert "secret greeting" not in scoped
+    assert "Other Co" not in scoped
+
+
+def test_line_breaks_inside_a_value_do_not_poison_the_line(two):
+    """Facts are rows joined with a line break and instructions are paragraphs;
+    the emitter writes both as `\\n` on ONE line. A value that contains a line
+    break is not a string written across lines — the rule is about the lines
+    of the file, never the characters of a value — or every business with
+    two facts would be unreadable to its owner for ever."""
+    two.apply_config(
+        dataclasses.replace(two.CONFIG, profiles=dict(
+            two.CONFIG.profiles,
+            acme=dict(two.CONFIG.profiles["acme"],
+                      facts="Email: office@acme.test\nHours: 9-5",
+                      extra_instructions="Be brief.\n\nNever quote a price."))),
+        "jo", "Changed the facts for Acme Co")
+
+    on_disk = _config_text(two)
+    assert 'facts = "Email: office@acme.test\\nHours: 9-5"' in on_disk
+    assert "\n" in tomllib.loads(on_disk)["profiles"]["acme"]["facts"]
+
+    admin = load_admin()
+    diff = two.STORE.list_config_changes()[0]["diff"]
+    assert admin.views_activity.attribution_is_certain(
+        diff, rebuild=two.config_from_diff) is True
+    assert admin.views_activity.sections_touched(
+        diff, rebuild=two.config_from_diff) == {"acme"}
+
+
+def test_escaped_triple_quotes_written_by_the_emitter_are_certain(two):
+    """`\"\"\"` typed into a greeting comes out as `\\"\\"\\"` on one line."""
+    two.apply_config(
+        dataclasses.replace(two.CONFIG, profiles=dict(
+            two.CONFIG.profiles,
+            acme=dict(two.CONFIG.profiles["acme"], greeting='say """hi"""'))),
+        "jo", "Changed the greeting callers hear for Acme Co")
+
+    on_disk = _config_text(two)
+    assert 'greeting = "say \\"\\"\\"hi\\"\\"\\""' in on_disk
+    admin = load_admin()
+    diff = two.STORE.list_config_changes()[0]["diff"]
+    assert '\\"\\"\\"' in diff
+    assert admin.views_activity.attribution_is_certain(
+        diff, rebuild=two.config_from_diff) is True
+    assert admin.views_activity.sections_touched(
+        diff, rebuild=two.config_from_diff) == {"acme"}
+
+
+def test_a_diff_with_a_side_that_is_not_toml_is_uncertain(two):
+    """A file edited by hand until it no longer parses can still be the
+    "before" of a save. Nothing can say where its lines belong, so nothing
+    is guessed — in either direction."""
+    admin = load_admin()
+    rebuild = two.config_from_diff
+    good = _config_text(two)
+    for broken in (good.replace('greeting = "hi"', 'greeting = "hi'),
+                   good.replace("[profiles.acme]", "[profiles.acme")):
+        old_side_broken = two.config_diff(broken, good)
+        with pytest.raises(tomllib.TOMLDecodeError):
+            tomllib.loads(rebuild(old_side_broken, side="before"))
+        tomllib.loads(rebuild(old_side_broken, side="after"))
+        assert admin.views_activity.attribution_is_certain(
+            old_side_broken, rebuild=rebuild) is False
+        assert admin.views_activity.sections_touched(
+            old_side_broken, rebuild=rebuild) == set()
+
+        new_side_broken = two.config_diff(good, broken)
+        assert admin.views_activity.attribution_is_certain(
+            new_side_broken, rebuild=rebuild) is False
+
+
+def test_a_diff_that_cannot_be_rebuilt_is_uncertain_and_says_so(two, caplog):
+    admin = load_admin()
+
+    def cannot(diff, *, side):
+        raise RuntimeError("no reader today")
+
+    plain = "\n".join([
+        "@@ -1,2 +1,2 @@", " [profiles.acme]",
+        '-greeting = "hi"', '+greeting = "hello"',
+    ])
+    with caplog.at_level("WARNING", logger="atlas-phone"):
+        assert admin.views_activity.attribution_is_certain(
+            plain, rebuild=cannot) is False
+    assert "could not rebuild" in caplog.text
+
+
+def test_line_wide_says_nothing_when_the_diff_cannot_be_split_up(line):
+    """`line_wide` is public, and a public helper does not guess: "shared" is
+    an attribution like any other."""
+    admin = load_admin()
+    diff = "\n".join([
+        "@@ -1,7 +1,8 @@",
+        " [numbers]",
+        ' "+15550001111" = "acme"',
+        '+"+15550009999" = "acme"',
+        " [profiles.acme]",
+        f" extra_instructions = {LITERAL_FENCE}",
+        " [profiles.other]",
+        f" {LITERAL_FENCE}",
+    ])
+    # the walker on its own would call the added number line-wide
+    assert any(row[:1] == "+" and not key
+               for key, row in admin.views_activity._walk(diff))
+    assert admin.views_activity.attribution_is_certain(
+        diff, rebuild=line.config_from_diff) is False
+    assert admin.views_activity.line_wide(
+        diff, rebuild=line.config_from_diff) is False
+
+
+def test_a_scoped_reader_is_not_handed_the_actor_column(two):
+    """The template shows `actor_label`; the login name itself is popped off
+    the row as well, so keeping it from this reader is not one template edit
+    away."""
+    import types
+
+    admin = load_admin()
+    deps = types.SimpleNamespace(get_state=lambda: (two.NUMBERS, two.PROFILES),
+                                 config_from_diff=two.config_from_diff)
+    jo = admin.auth_module.Session(id="s", owner_key="jo",
+                                   profile_keys=("acme",), sees_whole_line=False)
+    plain = "\n".join([
+        "@@ -1,2 +1,2 @@", " [profiles.acme]",
+        '-greeting = "hi"', '+greeting = "hello"',
+    ])
+
+    def recorded(diff):
+        return {"id": 1, "ts": 0.0, "actor": "the_other_manager",
+                "summary": "Changed the settings", "diff": diff,
+                "applied": 1, "reason": ""}
+
+    for diff in (plain, FENCE_BODY_DIFF):
+        row = admin.views_activity.decorate_change(deps, recorded(diff), jo)
+        assert "actor" not in row and "diff" not in row
+        assert row["actor_label"] == "somebody who manages this line"
+
+    whole = admin.views_activity.decorate_change(deps, recorded(plain), None)
+    assert whole["actor"] == "the_other_manager"
 
 
 # ================ what a scoped owner is TOLD a change was ==================
