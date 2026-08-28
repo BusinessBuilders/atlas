@@ -283,6 +283,78 @@ async def test_five_wrong_codes_lock_the_address_out(line, caplog):
     assert caplog.text.count("dashboard sign-in FAILED") == 5
 
 
+async def test_rotating_the_forwarded_header_does_not_buy_extra_guesses(line):
+    """The lockout counted whatever `X-Forwarded-For` said, first element
+    first — so a guesser who put a fresh made-up address in that header got a
+    fresh bucket of five guesses every time, and the lockout counted to five
+    forever without ever locking anything.
+
+    `tailscale serve` (Go's httputil.ReverseProxy) APPENDS the address it saw
+    to whatever the client sent, so the LAST element is the proxy's own
+    observation and the only element the client cannot choose. This is a
+    guesser sending a different address on every attempt, through that proxy.
+    """
+    async with dashboard(line) as dash:
+        codes = []
+        for attempt in range(6):
+            response = await dash.client.post(
+                "/sign-in", {"code": "no"},
+                headers={"X-Forwarded-For": f"203.0.113.{attempt}, 127.0.0.1"})
+            codes.append(response.status)
+
+    assert codes == [401, 401, 401, 401, 429, 429]
+
+
+def test_a_forwarded_header_is_only_believed_from_the_local_proxy(line):
+    """The dashboard listens on loopback and is published by a proxy on this
+    same machine. A request whose PEER is not loopback did not come through
+    that proxy, so its `X-Forwarded-For` is a string a stranger typed."""
+    auth = load_admin().auth
+
+    class Request:
+        def __init__(self, remote, forwarded=None):
+            self.remote = remote
+            self.headers = {} if forwarded is None else {
+                "X-Forwarded-For": forwarded}
+
+    gate = auth.Auth(store=line.STORE, get_owners=lambda: line.OWNERS,
+                     get_state=lambda: (line.NUMBERS, line.PROFILES))
+
+    # through the proxy: the address the PROXY saw, which it appended last
+    assert gate.client_ip(Request("127.0.0.1", "9.9.9.9, 100.64.0.7")) == "100.64.0.7"
+    assert gate.client_ip(Request("::1", "9.9.9.9, 100.64.0.7")) == "100.64.0.7"
+    assert gate.client_ip(Request("127.0.0.1")) == "127.0.0.1"
+    # not through the proxy: the header is ignored entirely
+    assert gate.client_ip(Request("198.51.100.7", "9.9.9.9")) == "198.51.100.7"
+    assert gate.client_ip(Request("198.51.100.7", "9.9.9.9, 8.8.8.8")) == "198.51.100.7"
+    assert gate.client_ip(Request(None)) == "unknown"
+
+
+async def test_a_flood_from_many_addresses_locks_the_form_for_everyone(line,
+                                                                       caplog):
+    """A per-address lockout alone is only a speed limit per address. Twenty
+    wrong codes in fifteen minutes from ANYWHERE closes the form for a minute,
+    so a guesser spread across addresses runs into the same wall."""
+    async with dashboard(line) as dash:
+        with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+            for attempt in range(21):
+                await dash.client.post(
+                    "/sign-in", {"code": "no"},
+                    headers={"X-Forwarded-For": f"198.51.100.{attempt}"})
+            # an address that has never guessed, and the RIGHT code
+            fresh = await dash.client.post(
+                "/sign-in", {"code": "no"},
+                headers={"X-Forwarded-For": "192.0.2.200"})
+            right = await dash.client.post("/sign-in", {"code": "line-code"})
+
+    assert fresh.status == 429
+    assert right.status == 429
+    assert int(right.headers["Retry-After"]) <= 60
+    assert "dashboard sign-in LOCKED for every address" in caplog.text
+    kinds = [e["kind"] for e in dash.store.list_events([], include_unscoped=True)]
+    assert "dashboard_signin_locked" in kinds
+
+
 async def test_a_good_sign_in_clears_the_failures(line):
     async with dashboard(line) as dash:
         for _ in range(3):
