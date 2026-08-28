@@ -35,6 +35,7 @@ ALERT_WORDS = {
     "brain_missing": "A business points at a model that is not set up",
     "config_backup_failed": "A settings backup could not be written",
     "dashboard_signin_failed": "Someone tried to sign in with the wrong access code",
+    "dashboard_signin_locked": "Sign-in was closed for a minute after too many wrong access codes",
     "delivery_failed": "A message could not be delivered",
     "delivery_failure_acknowledged": "You marked a failed message alert as seen",
     "delivery_interrupted": "A message delivery was cut short",
@@ -91,7 +92,36 @@ def _oldest_waiting(messages) -> float | None:
     return min(waiting) if waiting else None
 
 
-def gather(deps, session, *, now=None) -> dict:
+def delivery_is_this_owners(deps, session, delivery: dict) -> bool:
+    """Whether the bridge's last failed message alert belongs to THIS owner.
+
+    `LAST_DELIVERY` is one slot for the whole bridge — a shared line has one of
+    them, not one per business — so the call it names has to be resolved back
+    to a business before anybody is shown it. Two reasons this matters and is
+    not tidiness: the error text can name another business's push target (its
+    host, its topic), and the Acknowledge button clears the tripwire for
+    whoever the failure really belonged to.
+
+    An owner of the whole line sees every failure, including one whose call
+    cannot be resolved — a message that failed to reach somebody has to be
+    visible to SOMEONE. A scoped owner is shown only what is provably theirs.
+    """
+    if delivery.get("ok") is not False:
+        return False
+    if session.sees_whole_line:
+        return True
+    call_sid = str(delivery.get("call_sid") or "").strip()
+    if not call_sid:
+        return False
+    call, _reason = _read("your call log", deps.store.get_call, call_sid)
+    if not call:
+        # Unknown call, or a store that would not answer (logged with its
+        # traceback by _read). Either way it is not provably this owner's.
+        return False
+    return str(call.get("profile_key") or "") in set(session.profile_keys)
+
+
+def gather(deps, session, *, now=None, delivery=None) -> dict:
     """Every store read the Overview needs, in one blocking call.
 
     Called through asyncio.to_thread: these are SQLite reads on the same event
@@ -131,6 +161,8 @@ def gather(deps, session, *, now=None) -> dict:
         "last_call_at": (newest[0]["started_at"] if newest else None),
         "calls_error": newest_error,
         "notify_failure": (notify[0] if notify else None),
+        "delivery_is_mine": delivery_is_this_owners(deps, session,
+                                                    dict(delivery or {})),
     }
 
 
@@ -212,7 +244,8 @@ async def overview(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
     health, _model_ok = await deps.get_health()
-    data = await asyncio.to_thread(gather, deps, session)
+    delivery = dict(health.get("last_delivery") or {})
+    data = await asyncio.to_thread(gather, deps, session, delivery=delivery)
     numbers = scoped_numbers(deps, session)
     brain = active_brain(deps)
     band = status.line_status(
@@ -222,7 +255,6 @@ async def overview(request: web.Request) -> web.Response:
     stats = data["stats"] or {}
     per_day = stats.get("per_day") or []
     week_total = sum(int(d["calls"]) for d in per_day)
-    delivery = dict(health.get("last_delivery") or {})
     return render.page(
         request, deps, "overview.html", session=session,
         band=band, health=health, data=data, numbers=numbers,
@@ -231,7 +263,9 @@ async def overview(request: web.Request) -> web.Response:
         test_only_brain=(brain if brain is not None and status.is_test_only(brain)
                          else None),
         can_switch_brain=session.sees_whole_line,
-        delivery=delivery, delivery_failed=delivery.get("ok") is False,
+        # The banner is shown only to an owner the failure belongs to: it can
+        # name another business's push target, and its button clears their flag.
+        delivery=delivery, delivery_failed=data["delivery_is_mine"],
         checked_at=health.get("probe_checked_at"),
         first_run=(data["last_call_at"] is None and not data["calls_error"]),
         acknowledged=bool(request.query.get("acknowledged")),
@@ -265,7 +299,8 @@ async def health_detail(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
     health, _model_ok = await deps.get_health()
-    data = await asyncio.to_thread(gather, deps, session)
+    delivery = dict(health.get("last_delivery") or {})
+    data = await asyncio.to_thread(gather, deps, session, delivery=delivery)
     numbers = scoped_numbers(deps, session)
     band = status.line_status(
         health=health, numbers=numbers, profiles=session.profile_keys,
@@ -282,6 +317,11 @@ async def health_detail(request: web.Request) -> web.Response:
         body.pop("model", None)
         body.pop("probe_error", None)     # can name the backend's own host
         body.pop("recent_events", None)
+        if not data["delivery_is_mine"]:
+            # The same sentence the banner hides: it can name another
+            # business's push target. Hiding it on the page and handing it over
+            # here would be a fix in appearance only.
+            body.pop("last_delivery", None)
     body["line_status"] = {
         "level": band.level, "headline": band.headline,
         "checks": [{"name": c.name, "level": c.level, "detail": c.detail}
@@ -296,6 +336,10 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
     The public health endpoint stays 503 until the next successful delivery or
     until this is clicked — an owner who has read the message on this screen
     has taken it from here, and the tripwire should stop paging.
+
+    Only the owner it belongs to may click it. On a shared line this one flag
+    holds the whole line's tripwire, so another business clearing it would stop
+    the paging for a message THEY have not read and cannot see.
     """
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
@@ -304,6 +348,18 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
     if reason:
         return render.page(request, deps, "refused.html", session=session,
                            status=403, reason=reason)
+    health, _model_ok = await deps.get_health()
+    delivery = dict(health.get("last_delivery") or {})
+    mine = await asyncio.to_thread(delivery_is_this_owners, deps, session,
+                                   delivery)
+    if delivery.get("ok") is False and not mine:
+        log.warning("dashboard: %s tried to clear a failed message alert that "
+                    "belongs to another business on this line",
+                    session.owner_key)
+        return render.page(
+            request, deps, "refused.html", session=session, status=403,
+            reason=("That failed message alert belongs to another business on "
+                    "this line, so it is not yours to mark as seen."))
     acknowledged = await asyncio.to_thread(deps.acknowledge_delivery_failure,
                                            session.owner_key)
     # Only say "marked as seen" when there was something to mark: the alert may

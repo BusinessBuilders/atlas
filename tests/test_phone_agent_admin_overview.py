@@ -23,7 +23,8 @@ import time
 import tomllib
 
 import pytest
-from test_phone_agent_admin_auth import dashboard, health_ok, load_admin
+from test_phone_agent_admin_auth import (ONE_BUSINESS, OTHER_BUSINESS,
+                                         dashboard, health_ok, load_admin)
 from test_phone_agent_plugin import _import_service
 
 DAY = 86400.0
@@ -479,6 +480,102 @@ async def test_marking_nothing_as_seen_does_not_claim_it_did(line):
                                           {"csrf": token})
         assert response.status == 303
         assert response.headers["Location"] == "/"
+
+
+def _two_business_line(tmp_path, monkeypatch):
+    """One line, two businesses, and an owner who holds only the first."""
+    monkeypatch.setenv("PHONE_OWNER_JO_TOKEN", "jo-code")
+    return _import_service(tmp_path, monkeypatch,
+                           extra_env={"ADMIN_TOKEN": "line-code"},
+                           cfg_extra=OTHER_BUSINESS + ONE_BUSINESS)
+
+
+def _failed_delivery_for(svc, profile: str, *, error: str) -> str:
+    """A message alert that failed, on a call belonging to one business."""
+    sid = f"CA00000000000000000000000000{profile[:5]:_<5}"
+    svc.STORE.start_call(sid, profile, "+15550001234", "+15550001111", "b", "m")
+    svc.STORE.end_call(sid, "message_taken", "", 1, [])
+    svc._note_delivery(sid, ok=False, error=error)
+    return sid
+
+
+async def test_another_businesss_failed_delivery_is_not_this_owners_to_see(
+        tmp_path, monkeypatch):
+    """LAST_DELIVERY is one slot for the whole bridge. The banner printed it to
+    everybody — so an owner on a shared line read an error naming another
+    business's push target, and could clear their tripwire for them."""
+    svc = _two_business_line(tmp_path, monkeypatch)
+    _failed_delivery_for(svc, "other", error="TimeoutError: ntfy.other-co.example")
+
+    async with dashboard(svc, health=svc.health_snapshot) as dash:
+        await dash.client.sign_in("jo-code")           # owns "acme" only
+        page = await (await dash.client.get("/")).text()
+
+    assert "could not be delivered" not in page
+    assert "Mark as seen" not in page
+    assert "other-co.example" not in page
+
+
+async def test_the_health_json_does_not_hand_over_the_same_error_either(
+        tmp_path, monkeypatch):
+    """Hiding the banner and leaving the same sentence one URL away would be a
+    fix in appearance only — /health/detail carries the same field."""
+    svc = _two_business_line(tmp_path, monkeypatch)
+    _failed_delivery_for(svc, "other", error="TimeoutError: ntfy.other-co.example")
+
+    async with dashboard(svc, health=svc.health_snapshot) as dash:
+        await dash.client.sign_in("jo-code")
+        scoped = await (await dash.client.get("/health/detail")).json()
+        raw = await (await dash.client.get("/health/detail")).text()
+        await dash.client.post("/sign-out",
+                               {"csrf": await dash.client.csrf()})
+        await dash.client.sign_in("line-code")
+        whole_line = await (await dash.client.get("/health/detail")).json()
+
+    assert "last_delivery" not in scoped
+    assert "other-co.example" not in raw
+    # the owner of the whole line still gets the whole picture
+    assert whole_line["last_delivery"]["ok"] is False
+    assert "other-co.example" in whole_line["last_delivery"]["error"]
+
+
+async def test_an_owner_cannot_clear_another_businesss_failed_delivery(
+        tmp_path, monkeypatch):
+    svc = _two_business_line(tmp_path, monkeypatch)
+    _failed_delivery_for(svc, "other", error="TimeoutError")
+    assert svc.public_health()[0] == 503
+
+    async with dashboard(svc, health=svc.health_snapshot) as dash:
+        await dash.client.sign_in("jo-code")
+        token = await dash.client.csrf()
+        response = await dash.client.post("/acknowledge-delivery",
+                                          {"csrf": token})
+        assert response.status == 403
+        assert "another business" in await response.text()
+
+    assert svc.LAST_DELIVERY["ok"] is False            # still failing
+    assert svc.public_health()[0] == 503
+    kinds = [e["kind"] for e in svc.STORE.list_events([], include_unscoped=True)]
+    assert "delivery_failure_acknowledged" not in kinds
+
+
+async def test_the_owner_of_the_business_it_belongs_to_clears_it(
+        tmp_path, monkeypatch):
+    svc = _two_business_line(tmp_path, monkeypatch)
+    _failed_delivery_for(svc, "acme", error="TimeoutError")
+
+    async with dashboard(svc, health=svc.health_snapshot) as dash:
+        await dash.client.sign_in("jo-code")
+        page = await (await dash.client.get("/")).text()
+        assert "could not be delivered" in page
+        token = await dash.client.csrf()
+        response = await dash.client.post("/acknowledge-delivery",
+                                          {"csrf": token})
+        assert response.status == 303
+        assert response.headers["Location"] == "/?acknowledged=1"
+
+    assert svc.LAST_DELIVERY["ok"] is True
+    assert svc.public_health()[0] == 200
 
 
 async def test_acknowledging_needs_the_csrf_token(line):
