@@ -124,6 +124,12 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 #                                 # optional; empty = the MESSAGES_FILE env var
 # ntfy_url = ""                   # optional pair; empty = the NTFY_URL and
 # ntfy_topic = ""                 # NTFY_TOPIC env vars. Set both or neither.
+#                                 # On a line with MORE THAN ONE business, give
+#                                 # every business its own ntfy_topic: the env
+#                                 # default is the line owner's own address, and
+#                                 # businesses left on it all push to that one
+#                                 # topic — whoever is subscribed to it reads
+#                                 # everybody's messages.
 # max_call_seconds = 600          # default 600: the agent wraps up and ends
 #                                 # the call after this long.
 # caller_turn_budget_per_hour = 60    # default 60, per caller ID
@@ -197,6 +203,12 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # finish on the brain they started with. Validation is fail-closed: a brain
 # naming an env var that is unset, an extra_body that is not a JSON object, or
 # a setting this bridge does not read, is rejected and nothing changes.
+#
+# A model whose plan forbids answering real customers — a coding plan, a free
+# tier, an evaluation key — MUST carry the words "test only" in its label, e.g.
+# label = "GLM-5.2 — test only". That label is the only thing that draws the red
+# banner across the dashboard while such a backend is answering; labelled
+# anything else, it answers real customers under a green Overview.
 #
 # [brains.local_qwen]
 # label = "Local qwen (private, free)"     # optional; shown on the dashboard

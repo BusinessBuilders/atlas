@@ -233,6 +233,12 @@ dependencies cannot be installed.
 | `PHONE_DATA_DIR=…` | Optional. Only if the call store should not live in `~/.local/share/atlas-phone`. |
 | `ADMIN_PORT=…` | Optional. Only if 8891 is taken. |
 
+**If an access code ever leaks, this is how you change it:** put a new one in
+this file and restart the bridge. The restart is the important half — it signs
+everybody out, so every browser that was already signed in with the old code
+has to sign in again with the new one. Changing the code without restarting
+leaves the old sessions alive for another two weeks.
+
 Check the file is still yours alone, and that both files are there:
 
 ```bash
@@ -256,6 +262,17 @@ from an older build, the ones that matter are:
   you added in step 2, and `profiles` lists what they may see (`["*"]` for
   everything).
 - `[branding]` if the dashboard should carry your own name, logo and colours.
+- **Any model whose plan forbids answering real customers must have the words
+  `test only` in its label** — `label = "GLM-5.2 — test only"`. That label is
+  what draws the red banner across the top of the dashboard, and it is the only
+  thing that draws it: a backend on a coding or free plan, labelled anything
+  else, answers real customers under a green Overview. This line answered real
+  callers on exactly such a plan for weeks with nothing on screen to say so —
+  the label is what makes it visible.
+- On a line with more than one business, give **every** business its own
+  `ntfy_topic`. The line-wide `NTFY_URL`/`NTFY_TOPIC` from step 2 is the
+  reseller's own address: businesses left on it all push to the same topic, so
+  whoever is subscribed to it reads everybody's messages.
 - The two notices are on by default and need nothing from you. If a business
   must have one off, it also needs `ack_disclosure_waived = true`, which is
   refused at start-up if it is missing.
@@ -283,11 +300,19 @@ cd ~/atlas-phone-deploy
 .venv/bin/python plugins/phone_agent/migrate_pad.py \
     --pad ~/atlas-phone-messages.md \
     --db ~/.local/share/atlas-phone/calls.db \
-    --profile <the business key> --dry-run     # then again without --dry-run
+    --profile <the business key> --mark-done --dry-run   # then without --dry-run
 ```
 
 It prints counts only, never caller details, and running it twice imports
 nothing the second time.
+
+`--mark-done` brings the old messages in as **already answered**. Without it
+every one of them arrives as a message waiting, and the first Overview the
+owner ever opens greets them with "21 messages waiting · oldest 5 weeks ago"
+about calls somebody dealt with last month. Nothing is hidden either way: the
+imported messages are all on the Messages screen under Done, with their notes
+and their calls. Leave `--mark-done` off only if the pad really does hold
+messages nobody has answered yet.
 
 **Run it with the bridge stopped.** On a first cutover that is automatic — the
 new bridge has not been started yet and the old code does not use this database
@@ -502,15 +527,25 @@ Expected: `active` twice.
 
 **e. The dashboard.** Open the https address you publish it at, sign in with
 one owner's access code, and check the Overview's status band. Expected: five
-checks, and no red.
+checks, and no red among them.
 
-One amber check is expected until the first real call arrives: the phone-network
-one reads the time of the newest call in your call log, so it says either "No
-calls yet, so the phone network connection has not been confirmed" on a line
-whose log is empty, or "No calls in the last 24 hours, so the phone network
-connection has not been confirmed today" once there are older calls in it.
-Either wording is the same thing — nobody has rung the number today — and step
-h is what clears it.
+The band itself is expected to be **amber**, headed "Your line has not been
+confirmed yet", until the first real call arrives: the phone-network check
+reads the time of the newest call in your call log, and its sentence appears in
+the band's summary — either "No calls yet, so the phone network connection has
+not been confirmed" on a line whose log is empty, or "No calls in the last 24
+hours, so the phone network connection has not been confirmed today" once there
+are older calls in it. Either wording is the same thing — nobody has rung the
+number today — and step h is what clears it.
+
+**On this install there is also a red banner above the band**, reading "Your
+line is running on a test model that isn't licensed for business use." That is
+correct and expected: the live backend is `glm_52_test`, a coding plan that
+does not permit answering real customers, and its label says `test only` (step
+3). It clears when the line is moved to a model whose plan allows it. If that
+banner is **missing** on this install, the label is wrong — go back to step 3,
+because that banner is the only thing on screen that says the line is answering
+customers on a prohibited plan.
 
 **f. The outside monitor — set one up now if there is not one.** Something off
 this machine has to poll `PUBLIC_BASE/health` and page a human on any non-200.

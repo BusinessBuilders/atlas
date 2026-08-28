@@ -84,6 +84,13 @@ until you acknowledge it. A message never disappears quietly. That is the one
 promise the assistant makes to callers, so it is the one the software defends
 hardest.
 
+**On a line with more than one business, give every business its own push
+topic** (Notifications → Push to your phone). A business with none falls back to
+the line's own address, which belongs to whoever runs the line — and every
+business left on it pushes to that same topic, so one subscription hears them
+all. The Notifications screen tells a business owner they are on the line's
+address; it does not show them what that address is, because it is not theirs.
+
 ### The caller decides — not the AI
 
 The assistant can ask to transfer the call or to hang up, but neither happens
@@ -339,6 +346,13 @@ only the businesses listed; every read on every screen is scoped to that list.
 The legacy `ADMIN_TOKEN` still works and behaves as an owner of everything,
 shown as **Line owner**.
 
+**If an access code leaks, change it and restart the line.** The restart is
+half the fix: it signs everybody out, so a browser that was already signed in
+on the old code has to sign in again on the new one. Change the code without
+restarting and those sessions stay alive for another fourteen idle days. (An
+owner who only wants to end their own sessions has **Sign out everywhere** in
+the header of every screen, which needs no restart.)
+
 `[branding]` puts a reseller's name, product name, logo, support email, colours
 and fonts over the whole dashboard. Nothing in the templates names a colour, a
 font or a company; with no branding table the dashboard uses its own neutral
@@ -380,6 +394,14 @@ merges *under* the request's own keys, so a preset can never override `model`,
 **Privacy follows the brain.** On a local backend, no caller's words leave the
 machine. Point the active brain at a hosted API and every caller turn is sent
 to that vendor.
+
+**A backend that is not licensed for real customers must say so in its label.**
+Put the words `test only` in it — `label = "GLM-5.2 — test only"` — for any
+model on a coding plan, a free tier or an evaluation key. Those two words are
+what draw the red banner across the Overview and the Brain screen while that
+backend is answering, and they are the only thing that draws it: the same model
+labelled "GLM-5.2" answers real customers under a green Overview, which is
+exactly the condition this line ran in, unnoticed, for weeks.
 
 ## What is written down, and for how long
 
@@ -625,6 +647,18 @@ business.
     *Unblock: the per-turn figures are already on every call's page. Read them
     across a week of real calls, then tune the prompt length, the model or the
     backend — in that order.*
+11. **Dashboard times are the machine's clock, not the business's.** The push
+    notification and the message file are stamped in the business's own
+    `timezone`; every time on the dashboard — call times, "calls today", the
+    date filters, the exported spreadsheet — is stamped in the timezone of the
+    machine the line runs on. On a line where they are the same zone (this
+    install) nothing looks wrong and nothing is. Put the line on a machine in
+    another state and the owner sees a push stamped 14:05 and a dashboard row
+    for the same call at 16:05, and "calls today" rolls over at the wrong
+    midnight. *Unblock: give `render.fmt_local` a zone argument taken from the
+    row's business (`hours.profile_zone`), thread it through the templates that
+    print a time, and bucket the "today"/"this week" counts by the business's
+    zone instead of the machine's.*
 
 ## Checking the code yourself
 
