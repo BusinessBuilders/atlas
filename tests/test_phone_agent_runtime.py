@@ -527,59 +527,6 @@ def test_delivery_targets_fall_back_to_the_environment(tmp_path, monkeypatch):
     assert (own.ntfy_url, own.ntfy_topic) == ("https://own.example", "own-topic")
 
 
-async def test_the_dashboard_says_when_a_business_keeps_its_own_pad(
-        tmp_path, monkeypatch):
-    """The pad panel reads ONE file. A business with its own pad would look
-    like a business with no messages."""
-    import importlib.util
-
-    from test_phone_agent_plugin import PLUGINS_DIR
-
-    svc = _import_service(tmp_path, monkeypatch,
-                          cfg_extra=_other_profile(pad=str(tmp_path / "other-pad.md")))
-    spec = importlib.util.spec_from_file_location(
-        "phone_agent_admin_pad_notice", PLUGINS_DIR / "phone_agent" / "admin.py")
-    assert spec is not None and spec.loader is not None
-    admin = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(admin)
-
-    async def snapshot():
-        return {"bridge": "ok", "model_backend": "ok", "model": "m",
-                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
-
-    app = admin.build_admin_app(
-        token="sesame", health_snapshot=snapshot,
-        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
-        get_brains=lambda: ({}, ""),
-        get_branding=lambda: svc.BRANDING,
-        get_owners=lambda: svc.OWNERS,
-        get_prompts=lambda: svc.SYSTEM_PROMPTS,
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
-        messages_file=str(tmp_path / "messages.md"),
-        known_keys=svc._PROFILE_KNOWN_KEYS,
-        store=svc.STORE,
-    )
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", 0).start()
-    base = f"http://127.0.0.1:{runner.addresses[0][1]}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{base}/login", data={"token": "sesame"},
-                                    allow_redirects=False) as resp:
-                assert resp.status == 303
-            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
-            async with session.get(base + "/") as resp:
-                page = await resp.text()
-    finally:
-        await runner.cleanup()
-
-    assert "Showing the default pad only" in page
-    assert "1 business(es) keep their own pad" in page
-    assert "other" in page.split("Showing the default pad only")[1][:200]
-
-
 async def test_a_business_can_run_on_its_own_brain(tmp_path, monkeypatch):
     backup = FakeBrain()
     backup.reply = "This is the other brain speaking."

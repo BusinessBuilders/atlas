@@ -230,31 +230,39 @@ environment variable holding their token (never the token itself) and
 `[branding]` carries a reseller's `vendor_name`, `product_name`, `logo_path`,
 `support_email`, `colors` and `fonts`.
 
-**What is true today:** both tables are validated at boot, on `--check` and on
-every dashboard save, and both are preserved byte-for-byte through a save — an
-owner login written into the config cannot be lost by pressing Save. What
-*reads* them is the `admin/` dashboard package being built on this branch;
-until that is installed, `admin.py` still authenticates against the single
-`ADMIN_TOKEN` and renders its own plain styling, so an `[owners.jo]` section
-does not yet let Jo sign in and a `[branding]` section does not yet change what
-the page looks like. `ADMIN_TOKEN` keeps working either way: when it is set it
-appears as the implicit owner `_admin` with `["*"]`, which is what the new
-dashboard will accept on day one.
+Both tables are validated at boot, on `--check` and on every dashboard save,
+and both are preserved byte-for-byte through a save — an owner login written
+into the config cannot be lost by pressing Save. The dashboard reads them:
+`[owners.jo]` lets Jo sign in and see only her businesses, and `[branding]`
+decides the name, logo, colours and fonts on every page. `ADMIN_TOKEN` still
+works: when it is set it appears as the implicit owner `_admin` with `["*"]`.
 
 ## Owner dashboard
 
-Set `ADMIN_TOKEN` in the env file and the bridge also serves a control
-panel on `127.0.0.1:ADMIN_PORT` (default 8891) — expose it to the owner
-**tailnet-only** (e.g. `tailscale serve --bg --https=8447
-http://127.0.0.1:8891`), never on the public path Twilio uses. It edits
-the number→business mapping and every profile field (greeting, services,
-facts, extra prompt instructions, forward number), picks the active brain
-when more than one is defined, shows the exact live prompt per business,
-tails the message pad, and lists the last ten real calls from the call store
-with their transcripts (test calls excluded, caller numbers masked).
-Saves go through the same fail-closed validation as boot — a bad edit is
-rejected with the reason and changes nothing — and good saves hot-apply
-with no restart; in-flight calls keep the settings they started with.
+Whenever the line has at least one login, the bridge serves the owner
+dashboard (`plugins/phone_agent/admin/`) on `127.0.0.1:ADMIN_PORT` (default
+8891). Publish it to the owner **tailnet-only over https** (e.g. `tailscale
+serve --bg --https=8447 http://127.0.0.1:8891`), never on the public path
+Twilio uses — the session cookie is `Secure`, so an https address is what the
+owner needs to sign in.
+
+Screens today: **Sign in** (access code, five wrong tries locks the address
+out for a minute), **Overview** (a line-status band composed from five checks
+— answering, the model, the phone network in the last 24 h, numbers pointing
+at a business, message alerts delivering — plus today's numbers, a 7-day
+chart, what needs attention, and the latest messages), and **Brain** (the
+model that answers, with a confirm step, a production-use badge and a refusal
+to switch to a model that did not answer its last check unless the owner
+overrides it).
+
+Every read is scoped to the businesses that login owns, every mutating form
+carries a per-session token, sessions live server-side so "sign out" really
+ends them, and a brain switch goes through the same fail-closed validation as
+boot — a bad change is refused with the reason and nothing moves.
+
+The Calls, Messages, Settings, Hours, Numbers, Notifications and Activity
+screens are not in this build; they land with the tasks that build them, and
+the navigation only lists screens that exist.
 
 ## Operating
 

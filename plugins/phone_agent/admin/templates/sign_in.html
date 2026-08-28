@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block body %}
+<div class="signin-page">
+  <div class="signin-column">
+    {% if has_logo %}
+    <img class="signin-logo" src="/static/logo" alt="{{ vendor_name }}">
+    {% else %}
+    <span class="wordmark signin-wordmark">{{ vendor_name }}</span>
+    {% endif %}
+    <div class="card signin-card">
+      <div class="stack-4">
+        <span class="eyebrow accent">{{ product_name }}</span>
+        <h1 class="display display-l">Sign in to your phone line</h1>
+        <p class="muted flush">See every call, read every message, and change how
+          your line answers.</p>
+      </div>
+      {# aria-live: a wrong code has to be announced, not just drawn. #}
+      <div class="live" role="status" aria-live="assertive">
+        {% if error %}
+        <p class="notice notice-bad">{{ error }}</p>
+        {% endif %}
+      </div>
+      <form method="post" action="/sign-in" class="stack-12">
+        <div>
+          <label class="label" for="code">Access code</label>
+          <input class="input" id="code" name="code" type="password"
+                 autocomplete="current-password" required
+                 aria-describedby="code-hint"
+                 {% if not error %}autofocus{% endif %}>
+          <p id="code-hint" class="hint">The code from your setup email.</p>
+        </div>
+        <button class="btn btn-primary btn-block" type="submit"
+                {% if locked %}disabled{% endif %}>Sign in</button>
+      </form>
+      {% if support_email %}
+      <p class="subtle centered flush">Lost your code? Email
+        <a href="mailto:{{ support_email }}">{{ support_email }}</a></p>
+      {% endif %}
+    </div>
+    <p class="subtle centered flush">Answered by {{ vendor_name }} · Private to your business</p>
+  </div>
+</div>
+{% endblock %}

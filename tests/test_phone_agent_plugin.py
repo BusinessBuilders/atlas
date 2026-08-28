@@ -161,16 +161,23 @@ def test_service_config_validation_is_fail_closed(tmp_path):
 
 # ---- service module unit tests (persona sandbox + end-call scrubbing) ------
 
-def _import_service(tmp_path, monkeypatch, extra_env=None, cfg_extra=""):
-    """Import service.py in-process with a stub env and a valid config."""
+def _import_service(tmp_path, monkeypatch, extra_env=None, cfg_extra="",
+                    cfg_text=None):
+    """Import service.py in-process with a stub env and a valid config.
+
+    `cfg_extra` is appended to the standard one-business config; `cfg_text`
+    replaces it outright, for the tests that need a top-level key (TOML puts
+    those above the first [table], so they cannot be appended).
+    """
     import importlib.util
 
     cfg = tmp_path / "businesses.toml"
     cfg.write_text(
-        '[numbers]\n"+15550001111" = "acme"\n\n'
-        "[profiles.acme]\nbusiness_name = \"Acme Co\"\nservices = \"widget repair\"\n"
-        "owner_name = \"Jo\"\ngreeting = \"hi\"\n"
-        "facts = \"Email: office@acme.test\\nHours: 9-5\"\n" + cfg_extra,
+        cfg_text if cfg_text is not None else (
+            '[numbers]\n"+15550001111" = "acme"\n\n'
+            "[profiles.acme]\nbusiness_name = \"Acme Co\"\nservices = \"widget repair\"\n"
+            "owner_name = \"Jo\"\ngreeting = \"hi\"\n"
+            "facts = \"Email: office@acme.test\\nHours: 9-5\"\n" + cfg_extra),
         encoding="utf-8",
     )
     # ADMIN_TOKEN too: it is the legacy dashboard login, and one left in the
@@ -677,80 +684,29 @@ def test_no_marker_reason(tmp_path, monkeypatch):
     )
 
 
-def test_admin_app_auth_and_save(tmp_path, monkeypatch):
-    """The dashboard: no token -> login page; wrong token -> rejected; right
-    token -> dashboard; a bad save is rejected and changes nothing."""
-    import importlib.util
+async def test_the_dashboard_signs_an_owner_in_and_opens_on_the_overview(
+        tmp_path, monkeypatch):
+    """The plumbing this file owns: the bridge builds the dashboard from the
+    service's own state, an owner signs in with their access code, and the
+    Overview renders their business. The screens themselves are pinned in
+    tests/test_phone_agent_admin_*.py."""
+    from test_phone_agent_admin_auth import dashboard
 
-    import aiohttp
-    from aiohttp import web
+    svc = _import_service(tmp_path, monkeypatch,
+                          extra_env={"ADMIN_TOKEN": "sesame"})
 
-    svc = _import_service(tmp_path, monkeypatch)
-    spec = importlib.util.spec_from_file_location(
-        "phone_agent_admin_under_test", PLUGINS_DIR / "phone_agent" / "admin.py"
-    )
-    assert spec is not None and spec.loader is not None
-    admin = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(admin)
+    async with dashboard(svc) as dash:
+        anonymous = await dash.client.get("/", allow_redirects=False)
+        assert anonymous.status == 302
+        assert "Acme Co" not in await anonymous.text()   # nothing leaks pre-auth
 
-    async def snapshot():
-        return {"bridge": "ok", "model_backend": "ok", "model": "m",
-                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
+        await dash.client.sign_in("sesame")
+        overview = await dash.client.get("/")
+        page = await overview.text()
 
-    app = admin.build_admin_app(
-        token="sesame", health_snapshot=snapshot,
-        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
-        get_brains=lambda: ({}, ""),
-        get_branding=lambda: svc.BRANDING,
-        get_owners=lambda: svc.OWNERS,
-        get_prompts=lambda: svc.SYSTEM_PROMPTS,
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
-        messages_file=str(tmp_path / "messages.md"),
-        known_keys=svc._PROFILE_KNOWN_KEYS,
-        store=svc.STORE,
-    )
-
-    async def drive():
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
-        await site.start()
-        port = runner.addresses[0][1]
-        base = f"http://127.0.0.1:{port}"
-        results = {}
-        async with aiohttp.ClientSession() as s:
-            async with s.get(base + "/") as r:
-                results["anon"] = await r.text()
-            async with s.post(base + "/login", data={"token": "wrong"}) as r:
-                results["bad_login"] = await r.text()
-            async with s.post(base + "/login", data={"token": "sesame"},
-                              allow_redirects=False) as r:
-                results["login_status"] = r.status
-                cookie = r.cookies.get(admin.COOKIE)
-                assert cookie is not None
-            s.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
-            async with s.get(base + "/") as r:
-                results["dash"] = await r.text()
-            async with s.post(base + "/save",
-                              data={"numbers_text": "+15550001111 = ghost"}) as r:
-                results["bad_save"] = await r.text()
-        await runner.cleanup()
-        return results
-
-    results = asyncio.run(drive())
-    assert "Admin token" in results["anon"]          # login gate
-    assert "acme" not in results["anon"]             # nothing leaks pre-auth
-    assert "Wrong token" in results["bad_login"]
-    assert results["login_status"] == 303
-    assert "profile: acme" in results["dash"]
-    # phrase gates are dashboard-editable as MULTILINE fields (ARCH-8: a
-    # single-line input would silently collapse the newline list on save)
-    assert "name='acme::transfer_phrases'" in results["dash"]
-    assert "name='acme::end_phrases'" in results["dash"]
-    assert results["dash"].count("<textarea") >= 5  # facts, extra, 2 phrase fields, numbers
-    assert "Not applied" in results["bad_save"]
-    assert svc.NUMBERS == {"+15550001111": "acme"}   # unchanged by bad save
+    assert overview.status == 200
+    assert "Acme Co" in page                             # the real business
+    assert "Overview" in page
 
 
 def test_message_entry_format(tmp_path, monkeypatch):

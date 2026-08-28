@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Brain{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Brain</h1>
+    <p class="muted flush">The model that answers every call. Switching applies
+      to the next call — calls already in progress finish on the model they
+      started with.</p>
+  </div>
+</div>
+
+<div class="live" role="status" aria-live="polite">
+  {% if switched %}
+  <p class="notice notice-ok">Switched. The next caller is answered by {{ switched }}.</p>
+  {% endif %}
+</div>
+
+{% if error %}
+<p class="notice notice-bad" role="alert">{{ error }}</p>
+{% endif %}
+
+{% if active_card and active_card.test_only %}
+<div class="banner banner-bad" role="alert">
+  <span class="banner-icon">{{ icon("warn", 22) }}</span>
+  <div class="banner-words">
+    <span class="strong">The model answering now is marked test only.</span>
+    <span class="muted">Its provider's terms do not allow answering real
+      customers. Pick a model approved for business use below.</span>
+  </div>
+</div>
+{% endif %}
+
+<div class="grid-3">
+  {% for card in cards %}
+  <div class="card brain-card{{ ' brain-current' if card.active else '' }}">
+    <div class="card-head">
+      <h2 class="display display-m flush">{{ card.label }}</h2>
+      {% if card.active %}<span class="tag tag-accent">Answering now</span>{% endif %}
+    </div>
+    <dl class="facts">
+      <dt class="subtle">Model</dt><dd>{{ card.model }}</dd>
+      <dt class="subtle">Runs</dt><dd>{{ card.runs }}</dd>
+      <dt class="subtle">Last check</dt>
+      <dd class="state-{{ card.health.level }}">{{ card.health.text }}{% if card.health.checked_at %} · {{ card.health.checked_at | fmt_ago }}{% endif %}</dd>
+    </dl>
+    {% if card.test_only %}
+    <span class="tag tag-bad self-start">Test only — not licensed for production</span>
+    {% else %}
+    <span class="tag tag-ok self-start">Approved for business use</span>
+    {% endif %}
+    {% if card.active %}
+    <span class="btn btn-quiet btn-block push-down" aria-disabled="true">Current</span>
+    {% else %}
+    <a class="btn btn-ghost btn-block push-down" href="/brain?switch={{ card.key }}">Use this model…</a>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+{% if confirming %}
+{# Server-rendered open dialog: the confirm step works with or without
+   JavaScript, which the page's CSP would not let us add inline anyway. #}
+<dialog class="confirm" open aria-labelledby="confirm-title">
+  <form method="post" action="/brain" class="stack-16">
+    <h2 class="display display-m flush" id="confirm-title">Switch to {{ confirming.label }}?</h2>
+    <p class="muted flush">Every call from now on is answered by
+      <span class="strong">{{ confirming.model }}</span>, running
+      {{ confirming.runs | lower }}. This applies to the next call — a call in
+      progress finishes on the model it started with.</p>
+    {% if confirming.test_only %}
+    <p class="notice notice-bad">This model is marked test only. Its provider's
+      terms do not allow it to answer real customers.</p>
+    {% endif %}
+    {% if confirming.health.reachable is false %}
+    <div class="checkline">
+      <input type="checkbox" id="override" name="override" value="on" required>
+      <label class="label flush" for="override">Switch anyway, even though this
+        model did not answer when it was last checked.</label>
+    </div>
+    {% endif %}
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="brain" value="{{ confirming.key }}">
+    <div class="row-gap">
+      <button class="btn btn-primary" type="submit">Switch the model</button>
+      <a class="btn btn-quiet" href="/brain" autofocus>Cancel</a>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% endblock %}

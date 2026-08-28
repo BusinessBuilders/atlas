@@ -418,6 +418,55 @@ def test_log_notify_records_both_outcomes(store):
     assert rows[0]["target"] == "ntfy"
 
 
+def test_list_events_is_newest_first_inside_the_window(store):
+    now = time.time()
+    store.add_event("acme", None, "warning", "old_one", "eight days ago")
+    store.add_event("acme", None, "error", "recent_one", "an hour ago")
+    with _sql(store.path) as conn:
+        conn.execute("UPDATE events SET ts = ? WHERE kind = 'old_one'", (now - 8 * DAY,))
+        conn.execute("UPDATE events SET ts = ? WHERE kind = 'recent_one'", (now - 3600,))
+
+    seven_days = store.list_events(["acme"], since=now - 7 * DAY)
+    assert [e["kind"] for e in seven_days] == ["recent_one"]
+    assert [e["kind"] for e in store.list_events(["acme"])] == ["recent_one", "old_one"]
+
+
+def test_list_events_filters_by_level_and_scope(store):
+    store.add_event("acme", None, "info", "quiet", "nothing to see")
+    store.add_event("acme", None, "error", "loud", "something broke")
+    store.add_event("other", None, "error", "not_yours", "another business")
+
+    alerts = store.list_events(["acme"], levels=("warning", "error"))
+    assert [e["kind"] for e in alerts] == ["loud"]
+    assert store.list_events([], levels=("error",)) == []
+
+
+def test_list_events_shows_line_wide_rows_only_to_the_whole_line_owner(store):
+    """A failed sign-in and a rejected websocket belong to no business. An
+    owner of ONE business must not read them — they name numbers and profiles
+    that are somebody else's."""
+    store.add_event(None, None, "warning", "dashboard_signin_failed", "from 10.0.0.9")
+    store.add_event("acme", None, "warning", "blocked", "a blocked caller rang")
+
+    one_business = store.list_events(["acme"])
+    assert [e["kind"] for e in one_business] == ["blocked"]
+    whole_line = store.list_events(["acme"], include_unscoped=True)
+    assert {e["kind"] for e in whole_line} == {"blocked", "dashboard_signin_failed"}
+
+
+def test_list_notify_can_name_the_failing_target(store):
+    _add_call(store, call_sid="CAnotifyread")
+    store.log_notify("acme", "ntfy", True, call_sid="CAnotifyread")
+    store.log_notify("acme", "ntfy topic phone-acme", False,
+                     error="TimeoutError", call_sid="CAnotifyread")
+
+    [failure] = store.list_notify(["acme"], ok=False)
+    assert failure["target"] == "ntfy topic phone-acme"
+    assert failure["error"] == "TimeoutError"
+    assert len(store.list_notify(["acme"])) == 2
+    assert store.list_notify(["someone_else"], ok=False) == []
+
+
 # ------------------------------------------------------------------ stats --
 
 def _local_noon() -> float:
@@ -1221,103 +1270,8 @@ async def test_the_failure_note_does_not_send_the_owner_to_the_journal(tmp_path,
 
 
 # ============================================================================
-# The dashboard's "Recent calls" panel — read from the store, not a log grep.
+# The summarizer's prompt.
 # ============================================================================
-
-async def _admin_page(tmp_path, svc, patch=None) -> str:
-    """Serve the real dashboard on loopback and fetch the real page."""
-    import aiohttp
-    from aiohttp import web
-
-    admin = _load("admin")
-    if patch is not None:
-        patch(admin)
-
-    async def snapshot():
-        return {"bridge": "ok", "model_backend": "ok", "model": "m", "brain": "b",
-                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
-
-    app = admin.build_admin_app(
-        token="sesame", health_snapshot=snapshot,
-        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
-        get_brains=lambda: ({}, ""),
-        get_branding=lambda: svc.BRANDING,
-        get_owners=lambda: svc.OWNERS,
-        get_prompts=lambda: svc.SYSTEM_PROMPTS,
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
-        messages_file=str(tmp_path / "no-messages-yet.md"),
-        known_keys=svc._PROFILE_KNOWN_KEYS,
-        store=svc.STORE,
-    )
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", 0).start()
-    port = runner.addresses[0][1]
-    try:
-        async with aiohttp.ClientSession() as session:
-            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
-            async with session.get(f"http://127.0.0.1:{port}/") as resp:
-                # 200 is part of every assertion here: a panel that raises must
-                # not turn the owner's dashboard into a 500 page.
-                assert resp.status == 200, await resp.text()
-                return await resp.text()
-    finally:
-        await runner.cleanup()
-
-
-async def test_recent_calls_panel_shows_the_stored_call(tmp_path, monkeypatch):
-    """The panel used to grep journald for two log formats the bridge stopped
-    writing, so a line answering calls all day printed "(no calls in the
-    recent journal)" — a dashboard stating something false."""
-    from test_phone_agent_plugin import _import_service
-
-    svc = _import_service(tmp_path, monkeypatch)
-    store = svc.STORE
-    store.start_call(REAL_CALL_SID, "acme", REAL_CALLER, "+15550001111",
-                     "local_qwen", "test-model")
-    store.add_turn(REAL_CALL_SID, 1, "caller", "my sink is leaking")
-    store.add_turn(REAL_CALL_SID, 1, "agent", "I can take a message for Jo")
-    store.end_call(REAL_CALL_SID, "message_taken", "", 1, [])
-    store.add_message(REAL_CALL_SID, "acme", "Dana", REAL_CALLER, None,
-                      "leaking sink", "Dana\nleaking sink")
-
-    page = await _admin_page(tmp_path, svc)
-
-    assert "my sink is leaking" in page                  # the transcript is there
-    assert "I can take a message for Jo" in page
-    assert "Caller:" in page and "Atlas:" in page
-    assert "message_taken" in page and "message: new" in page
-    assert "journal" not in page.lower()                 # no stale promise
-    assert "No calls recorded yet." not in page
-    assert REAL_CALLER not in page                       # the number is masked
-    assert "1111" in page                                # …still recognisable
-
-
-async def test_recent_calls_panel_is_honest_when_there_are_no_calls(tmp_path,
-                                                                    monkeypatch):
-    from test_phone_agent_plugin import _import_service
-
-    svc = _import_service(tmp_path, monkeypatch)
-    page = await _admin_page(tmp_path, svc)
-    assert "No calls recorded yet." in page
-    assert "journal" not in page.lower()
-
-
-async def test_recent_calls_panel_hides_test_calls(tmp_path, monkeypatch):
-    """A demo call must not look like business on the owner's own screen."""
-    from test_phone_agent_plugin import _import_service
-
-    svc = _import_service(tmp_path, monkeypatch)
-    svc.STORE.start_call("CAtest_demo", "acme", "+15550001234", "+15550001111",
-                         "b", "m", is_test=True)
-    svc.STORE.add_turn("CAtest_demo", 1, "caller", "this is only a demo call")
-    svc.STORE.end_call("CAtest_demo", "message_taken", "", 1, [])
-
-    page = await _admin_page(tmp_path, svc)
-    assert "this is only a demo call" not in page
-    assert "No calls recorded yet." in page
-
 
 def test_the_summarizer_is_asked_for_labelled_lines(tmp_path, monkeypatch):
     """The parser's happy path is a labelled note, so the prompt has to ask
@@ -1331,25 +1285,6 @@ def test_the_summarizer_is_asked_for_labelled_lines(tmp_path, monkeypatch):
     assert "unknown" in prompt
     assert "No message" in prompt                     # the no-info escape survives
     assert svc.TRANSCRIPT_FENCE_OPEN in prompt        # and the injection fence
-
-
-async def test_a_broken_store_does_not_take_the_dashboard_down(tmp_path, monkeypatch):
-    """The recent-calls panel is one card on a page whose main job is editing
-    the config. A store read that raised used to 500 the whole dashboard —
-    including the page that tells the owner why a save was rejected."""
-    from test_phone_agent_plugin import _import_service
-
-    svc = _import_service(tmp_path, monkeypatch)
-
-    def boom(*args, **kwargs):
-        raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(svc.STORE, "list_calls", boom)
-    page = await _admin_page(tmp_path, svc)
-
-    assert "Could not read recent calls: OperationalError: database is locked" in page
-    assert "profile: acme" in page                    # the config form still renders
-    assert "name='acme::greeting'" in page
 
 
 # ============================================================================
@@ -1401,23 +1336,3 @@ async def test_the_caller_id_alone_is_still_a_nothing_call(tmp_path, monkeypatch
         assert call["outcome"] == "no_info_given"
         assert store.list_messages(["acme"]) == []
         assert store.stats(["acme"])["messages_waiting"] == 0
-
-
-async def test_an_unreadable_pad_does_not_take_the_dashboard_down(tmp_path, monkeypatch):
-    """Same failure class as the calls panel: the pad read caught only
-    FileNotFoundError, so a permission problem 500'd the page that tells the
-    owner why their config save was rejected."""
-    from test_phone_agent_plugin import _import_service
-
-    svc = _import_service(tmp_path, monkeypatch)
-
-    def denied(*args, **kwargs):
-        raise PermissionError(13, "Permission denied")
-
-    page = await _admin_page(
-        tmp_path, svc,
-        patch=lambda admin: monkeypatch.setattr(admin, "open", denied, raising=False),
-    )
-    assert "Could not read the message pad: PermissionError:" in page
-    assert "profile: acme" in page                        # the config form survives
-    assert "name='acme::greeting'" in page

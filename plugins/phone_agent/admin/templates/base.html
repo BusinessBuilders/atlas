@@ -1,0 +1,82 @@
+{% from "_icons.html" import icon %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ product_name }}{% endblock %} · {{ vendor_name }}</title>
+<link rel="icon" href="/static/icon.svg?v={{ asset_version }}" type="image/svg+xml">
+{# htmx ships its own indicator CSS as an inline <style>, which this page's
+   Content-Security-Policy refuses. The same two rules live in app.css instead.
+   Configured by meta tag because an inline <script> is refused too. #}
+<meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+{% if fonts_url %}
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="{{ fonts_url }}">
+{% endif %}
+<link rel="stylesheet" href="/static/brand.css?v={{ asset_version }}">
+<link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
+{# htmx keeps the line-status band current without reloading the page. #}
+<script src="/static/htmx.min.js?v={{ asset_version }}" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to the page content</a>
+{% block body %}
+<div class="shell">
+  <aside class="rail" aria-label="Sections">
+    <div class="rail-brand">
+      {% if has_logo %}
+      <img class="rail-logo" src="/static/logo" alt="{{ vendor_name }}">
+      {% else %}
+      <span class="wordmark">{{ vendor_name }}</span>
+      {% endif %}
+      <span class="eyebrow accent">{{ product_name }}</span>
+    </div>
+    <nav class="nav">
+      {% for item in nav %}
+        {% if item.url %}
+      <a class="nav-item{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{{ ' aria-current=page' | safe if path == item.url else '' }}>{{ icon(item.icon) }}<span>{{ item.label }}</span></a>
+        {% else %}
+      <span class="nav-item nav-group">{{ icon(item.icon) }}<span>{{ item.label }}</span></span>
+        {% endif %}
+        {% for child in item.children %}
+      <a class="nav-item nav-sub{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{{ ' aria-current=page' | safe if path == child.url else '' }}><span>{{ child.label }}</span></a>
+        {% endfor %}
+      {% endfor %}
+    </nav>
+    <div class="rail-foot">
+      {% if session %}
+      <div class="rail-owner">
+        <span class="strong">{{ vendor_name }}</span>
+        <span class="subtle">{{ session.profile_keys | length }} business{{ '' if session.profile_keys | length == 1 else 'es' }}</span>
+      </div>
+      <form method="post" action="/sign-out">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="linkish" type="submit">{{ icon("logout", 18) }}<span>Sign out</span></button>
+      </form>
+      <form method="post" action="/sign-out-all">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="linkish quiet" type="submit"><span>Sign out everywhere</span></button>
+      </form>
+      {% endif %}
+    </div>
+  </aside>
+  <main class="main" id="main">
+    {% block main %}{% endblock %}
+  </main>
+</div>
+{% if nav %}
+<nav class="tabbar" aria-label="Sections">
+  {% for item in nav %}
+    {% if item.url %}
+  <a class="tab{{ ' active' if path == item.url else '' }}" href="{{ item.url }}">{{ icon(item.icon, 22) }}<span>{{ item.label }}</span></a>
+    {% endif %}
+    {% for child in item.children %}
+  <a class="tab{{ ' active' if path == child.url else '' }}" href="{{ child.url }}">{{ icon(child.icon, 22) }}<span>{{ child.label }}</span></a>
+    {% endfor %}
+  {% endfor %}
+</nav>
+{% endif %}
+{% endblock %}
+</body>
+</html>

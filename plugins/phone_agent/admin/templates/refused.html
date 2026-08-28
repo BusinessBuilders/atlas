@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Not carried out{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">That didn't go through</h1>
+  </div>
+</div>
+<div class="card stack-12" role="alert">
+  <p class="flush">{{ reason }}</p>
+  <p class="muted flush">Nothing on your line was changed.</p>
+  <a class="btn btn-ghost self-start" href="/">Back to the overview</a>
+</div>
+{% endblock %}

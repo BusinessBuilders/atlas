@@ -7,7 +7,12 @@
 # produced for real and the assertion is what the caller's message did next.
 #
 # Audit findings covered: C-4, H-1, H-2, H-8, H-9, M-2, M-3, M-4, M-6, M-7,
-# M-10, L-1, L-3, L-6 — docs/superpowers/specs/2026-08-27-phone-agent-code-audit.md
+# M-10, L-1, L-3 — docs/superpowers/specs/2026-08-27-phone-agent-code-audit.md
+#
+# L-6 (a phone number typed twice on the dashboard silently kept the last one)
+# is not here any more: the free-text number box it applied to went with the
+# interim dashboard, and the config file cannot hold the same number twice.
+# The rule comes back with the Numbers screen, whose own tests cover it.
 import asyncio
 import json
 import logging
@@ -797,58 +802,6 @@ def test_speech_seconds_warns_when_the_hangup_wait_binds(tmp_path, monkeypatch, 
     assert "clipped" in caplog.text
 
 
-# -------------------------------- L-6: duplicate numbers on the dashboard --
-
-async def test_duplicate_numbers_in_the_dashboard_are_refused(tmp_path, monkeypatch):
-    """Two lines for the same number silently kept the last one — the owner
-    would think they had routed a number they had not."""
-    import importlib.util
-
-    from test_phone_agent_plugin import PLUGINS_DIR
-
-    svc = _import_service(tmp_path, monkeypatch)
-    spec = importlib.util.spec_from_file_location(
-        "phone_agent_admin_hardening", PLUGINS_DIR / "phone_agent" / "admin.py")
-    admin = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(admin)
-
-    async def snapshot():
-        return {"bridge": "ok", "model_backend": "ok", "model": "m",
-                "profiles": ["acme"], "numbers": 1, "ntfy": "off"}, True
-
-    app = admin.build_admin_app(
-        token="sesame", health_snapshot=snapshot,
-        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
-        get_brains=lambda: ({}, ""),
-        get_branding=lambda: svc.BRANDING,
-        get_owners=lambda: svc.OWNERS,
-        get_prompts=lambda: svc.SYSTEM_PROMPTS,
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
-        messages_file=str(tmp_path / "messages.md"),
-        known_keys=svc._PROFILE_KNOWN_KEYS,
-        store=svc.STORE,
-    )
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", 0).start()
-    port = runner.addresses[0][1]
-    try:
-        async with aiohttp.ClientSession() as session:
-            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
-            async with session.post(
-                f"http://127.0.0.1:{port}/save",
-                data={"numbers_text": "+15550001111 = acme\n+15550001111 = acme"},
-            ) as resp:
-                text = await resp.text()
-    finally:
-        await runner.cleanup()
-
-    assert "Not applied" in text
-    assert "more than once" in text
-    assert svc.NUMBERS == {"+15550001111": "acme"}
-
-
 # ---- the two consumers of /health must both still work after the H-9 trim --
 
 async def test_public_health_still_degrades_when_the_brain_is_dead(tmp_path, monkeypatch):
@@ -916,66 +869,11 @@ async def test_a_failed_summary_still_writes_a_pad_entry_that_says_so(tmp_path, 
 
 
 # =========================================================================
-# Review round 2 — six required fixes
+# Review round 2 — six required fixes. Fix 1 (a hand-added nested table must
+# be explained, never a bare 500) is now pinned in two places: the emitter's
+# refusal above, and the dashboard showing that refusal to the owner in
+# tests/test_phone_agent_admin_overview.py.
 # =========================================================================
-
-# ---- 1. a nested table must not turn a dashboard save into a bare 500 ----
-
-async def _drive_admin_save(svc, tmp_path, form: dict) -> str:
-    import importlib.util
-
-    from test_phone_agent_plugin import PLUGINS_DIR
-
-    spec = importlib.util.spec_from_file_location(
-        "phone_agent_admin_round2", PLUGINS_DIR / "phone_agent" / "admin.py")
-    admin = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(admin)
-
-    async def snapshot():
-        return {"bridge": "ok", "model_backend": "ok", "model": "m",
-                "profiles": sorted(svc.PROFILES), "numbers": 1, "ntfy": "off"}, True
-
-    app = admin.build_admin_app(
-        token="sesame", health_snapshot=snapshot,
-        get_state=lambda: (svc.NUMBERS, svc.PROFILES),
-        get_brains=lambda: ({}, ""),
-        get_branding=lambda: svc.BRANDING,
-        get_owners=lambda: svc.OWNERS,
-        get_prompts=lambda: svc.SYSTEM_PROMPTS,
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
-        messages_file=str(tmp_path / "messages.md"),
-        known_keys=svc._PROFILE_KNOWN_KEYS,
-        store=svc.STORE,
-    )
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", 0).start()
-    port = runner.addresses[0][1]
-    try:
-        async with aiohttp.ClientSession() as session:
-            session.cookie_jar.update_cookies({admin.COOKIE: "sesame"})
-            async with session.post(f"http://127.0.0.1:{port}/save", data=form) as resp:
-                assert resp.status == 200, f"the dashboard answered HTTP {resp.status}"
-                return await resp.text()
-    finally:
-        await runner.cleanup()
-
-
-async def test_a_nested_table_is_explained_not_a_500(tmp_path, monkeypatch):
-    """The emitter refuses a table it does not know rather than mangling it
-    (M-6). The owner must read that sentence on the page, not an aiohttp error
-    screen. (`hours` is a table the schema DOES know and writes inline.)"""
-    svc = _import_service(
-        tmp_path, monkeypatch,
-        cfg_extra='\n[profiles.acme.departments]\nsales = "+15550002222"\n')
-    text = await _drive_admin_save(svc, tmp_path, {"numbers_text": "+15550001111 = acme"})
-
-    assert "Not applied" in text
-    assert "nested table" in text
-    assert "profiles.acme.departments" in text
-    assert svc.NUMBERS == {"+15550001111": "acme"}       # nothing changed
-
 
 # ---- 2. keypad digits are PII: never in the journal --------------------
 

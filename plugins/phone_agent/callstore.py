@@ -523,6 +523,81 @@ class CallStore:
                  1 if ok else 0, error),
             )
 
+    def _scope_clause(self, profile_keys, include_unscoped: bool):
+        """(sql fragment, params) restricting a query to the businesses one
+        dashboard login owns.
+
+        Some rows belong to no business at all — a rejected websocket, a failed
+        sign-in, a config save. `include_unscoped` decides whether the reader is
+        shown them: an owner of the whole line is, an owner of one business is
+        NOT, because those rows can name another customer's number or profile.
+        Returns None when the scope selects nothing, so the caller can answer
+        with an empty list instead of a query that means "every row".
+        """
+        keys = [str(k) for k in profile_keys]
+        parts, params = [], []
+        if keys:
+            parts.append("profile_key IN (%s)" % ",".join("?" * len(keys)))
+            params += keys
+        if include_unscoped:
+            parts.append("profile_key IS NULL")
+        if not parts:
+            return None
+        return "(" + " OR ".join(parts) + ")", params
+
+    def list_events(self, profile_keys, *, since=None, levels=None, limit=50,
+                    include_unscoped=False) -> list:
+        """The operational events one owner may read, newest first.
+
+        The dashboard's in-memory ring holds the last few minutes and dies with
+        the process; this is what answers "when did this start" a week later,
+        which is the whole reason the alerts list reads it and not the ring.
+        """
+        scope = self._scope_clause(profile_keys, include_unscoped)
+        if scope is None:
+            return []
+        where, params = [scope[0]], list(scope[1])
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(float(since))
+        if levels is not None:
+            wanted = [str(level) for level in levels]
+            if not wanted:
+                return []
+            where.append("level IN (%s)" % ",".join("?" * len(wanted)))
+            params += wanted
+        params.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM events WHERE " + " AND ".join(where)
+                + " ORDER BY ts DESC, id DESC LIMIT ?", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_notify(self, profile_keys, *, ok=None, since=None, limit=20,
+                    include_unscoped=False) -> list:
+        """Attempts to tell the owner about a message, newest first.
+
+        `ok=False` is the question the dashboard actually asks: WHICH target is
+        failing. "Notifications are failing" with no target names nothing the
+        owner can go and fix.
+        """
+        scope = self._scope_clause(profile_keys, include_unscoped)
+        if scope is None:
+            return []
+        where, params = [scope[0]], list(scope[1])
+        if ok is not None:
+            where.append("ok = ?")
+            params.append(1 if ok else 0)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(float(since))
+        params.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM notify_log WHERE " + " AND ".join(where)
+                + " ORDER BY ts DESC, id DESC LIMIT ?", params).fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------- stats --
 
     def stats(self, profile_keys, days: int = 7, *, now=None) -> dict:

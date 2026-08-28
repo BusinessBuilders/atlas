@@ -81,12 +81,15 @@ Config file (systemd loads it via EnvironmentFile): ~/.config/atlas-phone/env
                        cannot be opened, the bridge refuses to start — a line
                        that answers calls and records nothing is worse than a
                        line that is down.
-  ADMIN_TOKEN          optional; when set, the owner dashboard (admin.py)
-                       runs on 127.0.0.1:ADMIN_PORT (default 8891) — edit
-                       businesses/prompts, read messages and transcripts,
-                       hot-apply config. Expose it TAILNET-ONLY via
+  ADMIN_TOKEN          optional; the legacy single dashboard login, which
+                       appears as the owner `_admin` with access to every
+                       business. Named per-owner logins live in
+                       [owners.*] in businesses.toml instead.
+  ADMIN_PORT           optional, default 8891. The owner dashboard
+                       (plugins/phone_agent/admin/) runs on
+                       127.0.0.1:ADMIN_PORT whenever this line has at least
+                       one login. Publish it TAILNET-ONLY over https via
                        tailscale serve; never on the public funnel path.
-  ADMIN_PORT           optional, default 8891.
 
 Business config (~/.config/atlas-phone/businesses.toml):
   [numbers]
@@ -429,10 +432,10 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 if bool(NTFY_URL) != bool(NTFY_TOPIC):
     log.error("NTFY_URL and NTFY_TOPIC must be set together (or neither) — refusing to start")
     sys.exit(1)
-# Dashboard: local-only admin UI, enabled by setting ADMIN_TOKEN. Exposed to
-# the owner via a tailnet-only tailscale serve mapping — NEVER on the public
-# funnel path that Twilio uses.
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+# The owner dashboard: a local-only web app that runs whenever this line has at
+# least one login — an [owners.*] section, or the legacy ADMIN_TOKEN. Published
+# to the owner over a tailnet-only `tailscale serve` https mapping, NEVER on the
+# public funnel path that Twilio uses.
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8891").strip() or "8891")
 
 # ------------------------------------------------------------ call store ---
@@ -2355,6 +2358,25 @@ LAST_DELIVERY: dict = {"ts": None, "call_sid": None, "ok": None, "error": ""}
 def _note_delivery(call_sid: str, *, ok: bool, error: str) -> None:
     LAST_DELIVERY.update({"ts": time.time(), "call_sid": call_sid,
                           "ok": ok, "error": error})
+
+
+def acknowledge_delivery_failure(actor: str) -> bool:
+    """An owner has read the failed delivery on the dashboard and taken it from
+    here. Returns True when there was something to acknowledge.
+
+    A message that could not be delivered holds /health at 503 until the NEXT
+    message gets through — which on a quiet line could be days of a red
+    tripwire for something the owner has already dealt with. This is the only
+    other way out, and it is deliberately an owner's explicit click, recorded
+    with their name on it: nothing in this process clears the flag by itself.
+    """
+    if LAST_DELIVERY["ok"] is not False:
+        return False
+    LAST_DELIVERY["ok"] = True
+    record_event("warning", "delivery_failure_acknowledged",
+                 f"a failed message delivery was marked as seen by {actor}",
+                 LAST_DELIVERY.get("call_sid"))
+    return True
 
 # The live call is well defended (no tools, deterministic gates), but the
 # post-call path was not: a caller who speaks instructions could dictate what
@@ -4430,20 +4452,18 @@ async def _serve() -> None:
     log.info("atlas-phone-bridge listening on 127.0.0.1:%d (public: %s)",
              BRIDGE_PORT, PUBLIC_BASE)
 
-    if ADMIN_TOKEN:
+    if OWNERS:
         import admin
         admin_app = admin.build_admin_app(
-            token=ADMIN_TOKEN,
-            health_snapshot=health_snapshot,
             get_state=lambda: (NUMBERS, PROFILES),
             get_brains=lambda: (BRAINS, ACTIVE_BRAIN),
             get_branding=lambda: BRANDING,
             get_owners=lambda: OWNERS,
-            get_prompts=lambda: SYSTEM_PROMPTS,
+            get_health=health_snapshot,
+            get_brain_health=lambda: BRAIN_HEALTH,
             apply_config_text=apply_config_text,
             emit_business_toml=emit_business_toml,
-            messages_file=MESSAGES_FILE,
-            known_keys=_PROFILE_KNOWN_KEYS,
+            acknowledge_delivery_failure=acknowledge_delivery_failure,
             store=STORE,
         )
         admin_runner = web.AppRunner(admin_app, access_log=None)
@@ -4451,10 +4471,12 @@ async def _serve() -> None:
         admin_site = web.TCPSite(admin_runner, "127.0.0.1", ADMIN_PORT)
         await admin_site.start()
         track_server(admin_runner, admin_site)
-        log.info("admin dashboard on 127.0.0.1:%d — expose it tailnet-only "
-                 "(tailscale serve), NEVER on the public funnel path", ADMIN_PORT)
+        log.info("owner dashboard on 127.0.0.1:%d for %d login(s) — publish it "
+                 "tailnet-only over https (tailscale serve), NEVER on the "
+                 "public funnel path", ADMIN_PORT, len(OWNERS))
     else:
-        log.info("admin dashboard: off (ADMIN_TOKEN unset)")
+        log.info("owner dashboard: off (no [owners.*] in businesses.toml and no "
+                 "ADMIN_TOKEN in the env file)")
 
     housekeeping = [asyncio.create_task(retention_task()),
                     asyncio.create_task(health_refresh_task())]

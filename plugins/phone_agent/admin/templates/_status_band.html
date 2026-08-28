@@ -1,0 +1,13 @@
+{# The one line that answers "is my phone being answered properly?".
+   htmx swaps this element in place every 30 seconds, so the answer on screen
+   is never older than the "checked" stamp beside it. #}
+<div class="band band-{{ band.level }}" id="line-status" role="status"
+     aria-live="polite" hx-get="/overview/status" hx-trigger="every 30s"
+     hx-swap="outerHTML">
+  <span class="band-dot" aria-hidden="true"></span>
+  <div class="band-words">
+    <span class="strong">{{ band.headline }}</span>
+    <span class="muted band-detail">{{ band.summary }}</span>
+  </div>
+  <span class="subtle band-checked">Checked {{ checked_at | fmt_ago }}</span>
+</div>

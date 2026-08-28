@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Overview{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Overview</h1>
+    <p class="muted flush">{{ today_label }} · {{ business_label }}</p>
+  </div>
+</div>
+
+{% if acknowledged %}
+<p class="notice notice-ok" role="status" aria-live="polite">Marked as seen. Your
+  line reports healthy again unless something else fails.</p>
+{% endif %}
+
+{# A model whose own label says "test only" is answering real customers. That
+   is a banner, not a chip — the audit found this exact condition live with
+   nothing on screen about it. There is no `production` flag on a model yet, so
+   the label is the signal; add the flag and this reads it first. #}
+{% if test_only_brain %}
+<div class="banner banner-bad" role="alert">
+  <span class="banner-icon">{{ icon("warn", 24) }}</span>
+  <div class="banner-words">
+    <span class="display display-m">Your line is running on a test model that isn't licensed for business use.</span>
+    <span class="muted">{{ test_only_brain.model }} is answering callers. Switch
+      to a model approved for business use before customers call.</span>
+  </div>
+  {% if can_switch_brain %}
+  <a class="btn btn-primary" href="/brain">Switch model</a>
+  {% endif %}
+</div>
+{% endif %}
+
+{% include "_status_band.html" %}
+
+{% if delivery_failed %}
+<div class="banner banner-warn" role="alert">
+  <span class="banner-icon">{{ icon("warn", 24) }}</span>
+  <div class="banner-words">
+    <span class="strong">A message was taken but could not be delivered.</span>
+    <span class="muted">
+      {{ delivery.ts | fmt_local }}{% if delivery.error %} — {{ delivery.error }}{% endif %}.
+      The message itself was saved. Your line reports unhealthy until the next
+      message gets through, or until you mark this as seen.</span>
+  </div>
+  <form method="post" action="/acknowledge-delivery">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="btn btn-ghost" type="submit">Mark as seen</button>
+  </form>
+</div>
+{% endif %}
+
+{% if first_run %}
+<div class="card empty-first-run">
+  <h2 class="display display-m flush">No calls yet</h2>
+  {% if numbers %}
+  <p class="muted">Ring {% for number in numbers %}<span class="strong">{{ number | fmt_phone }}</span>{{ ", " if not loop.last }}{% endfor %}
+    to test your line. The call, what was said and any message will appear here.</p>
+  {% else %}
+  <p class="muted">No phone number points at your business yet, so nothing can
+    ring through. Ask whoever set up your line to point a number at it.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<h2 class="section">Today</h2>
+{% if data.stats_error %}
+<p class="notice notice-bad" role="alert">{{ data.stats_error }}</p>
+{% else %}
+<div class="grid-4">
+  <div class="card stat">
+    <span class="eyebrow">Calls today</span>
+    <span class="display display-xl">{{ stats.calls_today }}</span>
+    <span class="subtle">7-day average {{ week_average }}</span>
+  </div>
+  <div class="card stat">
+    <span class="eyebrow">Messages waiting</span>
+    <span class="display display-xl {{ 'accent' if data.waiting_count else '' }}">{{ data.waiting_count }}</span>
+    {% if data.waiting_error %}
+    <span class="subtle">{{ data.waiting_error }}</span>
+    {% elif data.oldest_waiting_at %}
+    <span class="subtle">Oldest {{ data.oldest_waiting_at | fmt_ago }}</span>
+    {% else %}
+    <span class="subtle">Nothing waiting</span>
+    {% endif %}
+  </div>
+  <div class="card stat">
+    <span class="eyebrow">Couldn't help</span>
+    <span class="display display-xl">{{ stats.no_info_today }}</span>
+    <span class="subtle">Caller left without details</span>
+  </div>
+  <div class="card stat">
+    <span class="eyebrow">Average call · 7 days</span>
+    <span class="display display-xl">{{ stats.avg_duration_s | fmt_duration }}</span>
+    <span class="subtle">Minutes and seconds</span>
+  </div>
+</div>
+{% endif %}
+
+<div class="grid-3">
+  <div class="card span-2 stack-16">
+    <div class="card-head">
+      <span class="eyebrow">Calls · last 7 days</span>
+      <span class="legend subtle">
+        <span class="key key-handled"></span>Handled
+        <span class="key key-noinfo"></span>Couldn't help
+      </span>
+    </div>
+    {% if data.stats_error %}
+    <p class="notice notice-bad" role="alert">{{ data.stats_error }}</p>
+    {% elif not chart.any %}
+    <p class="subtle flush">No calls in the last seven days.</p>
+    {% else %}
+    {# The bars are SVG geometry (attributes, not CSS — this page allows no
+       inline styles) stretched to the card's width; the day names are ordinary
+       HTML underneath, so they are never scaled by the viewBox. #}
+    <svg class="chart" viewBox="0 0 {{ chart.width }} {{ chart.height }}"
+         preserveAspectRatio="none" role="img"
+         aria-label="Calls per day for the last seven days">
+      {% for bar in chart.bars %}
+      <g>
+        <title>{{ bar.label }}: {{ bar.calls }} call{{ '' if bar.calls == 1 else 's' }}, {{ bar.no_info }} where the caller left no details</title>
+        {% if bar.handled_h %}
+        <rect class="bar-handled" x="{{ bar.x }}" y="{{ bar.handled_y }}" width="{{ chart.bar_width }}" height="{{ bar.handled_h }}"></rect>
+        {% endif %}
+        {% if bar.no_info_h %}
+        <rect class="bar-noinfo" x="{{ bar.x }}" y="{{ bar.no_info_y }}" width="{{ chart.bar_width }}" height="{{ bar.no_info_h }}"></rect>
+        {% endif %}
+      </g>
+      {% endfor %}
+    </svg>
+    <div class="chart-days subtle">
+      {% for bar in chart.bars %}
+      <span>{{ bar.label }}<span class="visually-hidden">: {{ bar.calls }} call{{ '' if bar.calls == 1 else 's' }}</span></span>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="card stack-12">
+    <span class="eyebrow">Needs attention</span>
+    {% if data.alerts_error %}
+    <p class="notice notice-bad" role="alert">{{ data.alerts_error }}</p>
+    {% elif not data.alerts %}
+    <p class="subtle flush">Nothing has gone wrong in the last seven days.</p>
+    {% else %}
+    <ul class="alerts">
+      {% for alert in data.alerts %}
+      <li class="alert alert-{{ alert.level }}">
+        <span class="alert-icon">{{ icon("warn", 18) }}</span>
+        <div>
+          <div>{{ alert.label }} · {{ alert.ts | fmt_local }}</div>
+          <div class="subtle">{{ alert.detail }}</div>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</div>
+
+<h2 class="section">Latest messages</h2>
+<div class="card flat">
+  {% if data.messages_error %}
+  <p class="notice notice-bad" role="alert">{{ data.messages_error }}</p>
+  {% elif not data.messages %}
+  <p class="subtle pad-16 flush">No messages yet. When a caller leaves one, it
+    appears here and on your phone.</p>
+  {% else %}
+  <table class="table">
+    <caption class="visually-hidden">The five most recent messages callers left</caption>
+    <thead>
+      <tr><th scope="col">When</th><th scope="col">Caller</th><th scope="col">What they wanted</th><th scope="col">Status</th></tr>
+    </thead>
+    <tbody>
+      {% for message in data.messages %}
+      <tr>
+        <td class="nowrap strong">{{ message.created_at | fmt_local }}</td>
+        <td>
+          <span class="strong">{{ message.caller_name or "Name not given" }}</span>
+          <span class="subtle">{{ (message.callback or message.from_number) | fmt_phone }}</span>
+        </td>
+        <td>{{ message.need or message.summary or "The details of this message have aged out of the records." }}</td>
+        <td><span class="tag tag-{{ message.status_tone }}">{{ message.status_label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endblock %}

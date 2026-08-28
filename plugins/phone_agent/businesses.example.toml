@@ -159,19 +159,34 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # Agent") with its built-in palette. Fill it in to put your own agency's name,
 # logo and colours over it.
 #
-# WHAT THIS DOES TODAY: validated and preserved by every save, exactly like the
-# owners above. The dashboard that READS it is the admin/ package being built
-# on this branch; until that is installed the current page keeps its own plain
-# styling whatever you write here. Colour and font names must be letters,
-# digits, underscores or hyphens.
+# Leave the whole table out and the dashboard uses its own neutral dark look
+# and the system font. Colour and font names must be letters, digits,
+# underscores or hyphens.
 #
 # [branding]
 # vendor_name = "Acme Digital"
 # product_name = "Front Desk"
 # logo_path = "/srv/acme-digital/logo.png"     # optional; a path on THIS box
 # support_email = "help@acmedigital.example"   # shown on the sign-in page
-# colors = { brand = "#e85d1a", ink = "#0a0a0a" }
-# fonts = { body = "Inter", display = "Inter" }
+#
+# The colours the dashboard reads, all optional — anything you leave out keeps
+# the neutral default:
+#   bg           the page          bg_elevated  cards and the side rail
+#   fg           text              fg_muted     hint and secondary text
+#   accent       the one primary action per screen
+#   accent_2     links and the chart bars
+#   ok warn danger   healthy / needs attention / failed. Nothing decorative is
+#                    ever drawn in these. Set `gold` instead of `warn` and the
+#                    gold becomes the amber.
+# Keep fg_muted readable on bg — hint text is drawn in it, which wants a
+# contrast ratio of at least 4.5:1.
+#
+# colors = { bg = "#0a0a0a", bg_elevated = "#1c1812", fg = "#f5e6c8", fg_muted = "#a89c80", accent = "#e85d1a", accent_2 = "#2f7f99", danger = "#c23b22", warn = "#d4a847" }
+#
+# Font families, by role. Each is loaded from Google Fonts if it is one, and
+# falls back to the system font if it is not; no other outside request is ever
+# made by the dashboard.
+# fonts = { body = "Inter", display = "Inter", wordmark = "Inter" }
 
 
 # ---- the model that answers ---------------------------------------------
