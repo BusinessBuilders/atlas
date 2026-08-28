@@ -190,4 +190,31 @@
     row.parentNode.removeChild(row);
     markDirty();
   });
+
+  /* Fourth: Escape closes a confirm dialog.
+   *
+   * The confirms (switch the model, put the settings back, bring a business
+   * back) are server-rendered <dialog open> elements, on purpose: they work
+   * with JavaScript off, which is the only way a page whose CSP forbids inline
+   * script can offer a confirm at all. The cost is that the browser's own
+   * Escape handling belongs to showModal() and never runs for them, so the one
+   * key everybody presses to back out of a question did nothing.
+   *
+   * This does exactly what Cancel does — it follows the dialog's Cancel link,
+   * which is a plain GET back to the screen behind. Nothing here is load
+   * bearing: with JavaScript off the Cancel link and the Cancel button are
+   * still there and still work, and a dialog without one is left alone rather
+   * than half-closed. */
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape" || event.defaultPrevented) {
+      return;
+    }
+    var dialog = document.querySelector('dialog[open][aria-modal="true"]');
+    var cancel = dialog ? dialog.querySelector("a[data-dialog-cancel][href]") : null;
+    if (!cancel) {
+      return;
+    }
+    event.preventDefault();
+    cancel.click();
+  });
 })();

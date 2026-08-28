@@ -244,6 +244,25 @@ async def test_the_call_log_pages_fifty_at_a_time(line):
     assert "Newer calls" in second
 
 
+async def test_a_page_past_the_last_one_says_that_and_not_that_nothing_matched(
+        line):
+    """A page number past the end of the list is not a filter that matched
+    nothing. Saying "No calls match those filters" and offering "Clear
+    filters" sends the owner undoing filters that are working."""
+    now = time.time()
+    for i in range(3):
+        _call(line, f"CA00000000000000000000000000pg{i:03d}", started=now - i * 60)
+
+    page = await _page(line, "/calls?page=2")
+
+    assert "There is nothing after the last page." in page
+    assert "No calls match those filters" not in page
+    assert "Clear filters" not in page
+    # and the way back is page one, with the filters still on
+    assert 'href="/calls?outcome=message_taken"' in await _page(
+        line, "/calls?outcome=message_taken&page=2")
+
+
 async def test_drawing_the_call_log_asks_the_store_for_calls_once(line):
     """One page render, one call query. The Overview's `gather()` is six reads;
     a list that reached for it would put them on every page of the log."""

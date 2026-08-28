@@ -180,8 +180,14 @@ def build_admin_app(*, get_state, get_config, get_brains, get_branding,
         session_id = await asyncio.to_thread(deps.auth.start_session, owner)
         log.info("dashboard: %s signed in from %s", owner.key, ip)
         try:
+            # The stored sentence is read months later on the Activity screen,
+            # so it carries the login's NAME, not its config key: the implicit
+            # whole-line login's key is `_admin`, which means nothing to the
+            # person whose line it is. The log line above keeps the key,
+            # because that one is read by whoever runs the bridge.
             store.add_event(None, None, "info", "dashboard_signin",
-                            f"{owner.key} signed in from {ip}")
+                            f"{auth_module.owner_name(owner.key)} signed in "
+                            f"from {ip}")
         except Exception:
             log.exception("call store: could not record the sign-in")
         response = web.HTTPSeeOther("/")

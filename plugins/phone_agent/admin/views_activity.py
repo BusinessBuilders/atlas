@@ -32,6 +32,7 @@ from datetime import datetime
 
 from aiohttp import web
 
+from . import auth
 from . import config_edit as edit
 from . import render
 from .views_overview import alert_words
@@ -67,6 +68,28 @@ _FENCES = ('"' * 3, "'" * 3)
 UNCERTAIN_SUMMARY = ("Settings on this line changed (the line owner can see "
                      "the details)")
 UNKNOWN_ACTOR = "somebody who manages this line"
+# A sign-in sentence recorded before the implicit whole-line login had a name
+# in words starts with its config key. Those rows are already in the store and
+# are read for as long as they are kept, so they are translated on the way to
+# the screen as well: `_admin signed in from 127.0.0.1` reads as `Line owner
+# signed in from 127.0.0.1`. Anchored at the start and on a word boundary, so
+# it can only ever match the actor the sentence was built from.
+_STORED_LEGACY_ACTOR = re.compile(rf"^{re.escape(auth.LEGACY_OWNER_KEY)}\b")
+
+
+def _actor_label(actor: str) -> str:
+    """Who did something, in the words a customer reads.
+
+    Every owner key but one was typed by whoever set this line up, so it is
+    their own name for that login and is shown as it is. The exception is the
+    implicit whole-line login, whose key is ours.
+    """
+    return auth.owner_name(actor) if actor else ""
+
+
+def _sign_in_sentence(detail: str) -> str:
+    """One stored sign-in sentence, with the old machine name translated."""
+    return _STORED_LEGACY_ACTOR.sub(auth.LEGACY_OWNER_NAME, str(detail or ""))
 
 
 def _every_string_ends_on_its_line(source: str) -> bool:
@@ -356,7 +379,7 @@ def decorate_change(deps, change: dict, session=None, reading=None) -> dict:
     change["can_restore"] = bool(change.get("applied")) and bool(reading.body)
     actor = str(change.get("actor") or "")
     if not scoped:
-        change["actor_label"] = actor or "somebody on this line"
+        change["actor_label"] = _actor_label(actor) or "somebody on this line"
         return change
     # A login name is a fact about who else manages this line. The label is
     # what the template shows; the name itself comes off the row as well, so
@@ -444,8 +467,9 @@ def deleted_businesses(deps, days: int, owner_key=None) -> list:
             "age_days": age,
             "restorable": age is not None and age < days,
             "window_days": days,
-            # The sign-ins that get it back, named on the confirm.
-            "owners": covered,
+            # The sign-ins that get it back, named on the confirm — in the
+            # words a customer reads, never the implicit login's config key.
+            "owners": [_actor_label(name) for name in covered],
         })
     listed.sort(key=lambda row: row["at"] or 0, reverse=True)
     return listed
@@ -457,7 +481,8 @@ def gather(deps, session) -> dict:
         "what happened on your line", deps.store.list_events,
         session.profile_keys, limit=EVENTS_SHOWN * 4,
         include_unscoped=session.sees_whole_line)
-    signed = [dict(row, label=alert_words(row["kind"]))
+    signed = [dict(row, label=alert_words(row["kind"]),
+                   detail=_sign_in_sentence(row["detail"]))
               for row in events or [] if row["kind"] in SIGN_IN_KINDS]
     reported = [dict(row, label=alert_words(row["kind"]))
                 for row in events or []

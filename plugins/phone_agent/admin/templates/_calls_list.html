@@ -28,6 +28,16 @@
       calls are hidden unless you ask for them. Tick "Show test calls" to see
       them.</p>
   </div>
+  {% elif past_end %}
+  {# A page number past the end of the list — the filters are working, there is
+     simply nothing this far down. Offering "Clear filters" here would send the
+     owner undoing a filter that is not the problem. #}
+  <div class="empty-first-run pad-24">
+    <h2 class="display display-m flush">There is nothing after the last page.</h2>
+    <p class="muted flush">The calls you asked for are on the pages before this
+      one.</p>
+    <a class="btn btn-ghost self-start" href="/calls{{ newest_query }}">Back to the newest calls</a>
+  </div>
   {% elif not rows %}
   <div class="empty-first-run pad-24">
     <h2 class="display display-m flush">No calls match those filters</h2>

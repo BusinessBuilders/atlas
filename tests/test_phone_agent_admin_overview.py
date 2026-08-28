@@ -269,6 +269,18 @@ def test_the_transport_a_push_rides_on_is_never_named_to_an_owner():
                    last_notify=dict(failed, target="ntfy_test"))
     assert band.summary.count("The test alert you sent did not get through") == 1
 
+    # And an urgent alert gets its own sentence: it is only ever sent when the
+    # message pad could not be written either, so the caller's message reached
+    # nothing at all. That is not the same event as a routine push failing.
+    for band in (_status(whole_line=False,
+                         last_notify=dict(failed, target="ntfy_urgent")),
+                 _status(health=_snapshot(last_delivery=dict(failed, ok=False)),
+                         notify_failure=dict(failed, target="ntfy_urgent"))):
+        assert band.level == "warn"
+        assert ("The emergency alert for a message we could not file did not "
+                "get through") in band.summary
+        assert "The last message alert" not in band.summary
+
 
 def test_a_delivery_that_never_landed_is_amber():
     band = _status(health=_snapshot(

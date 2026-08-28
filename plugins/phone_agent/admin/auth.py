@@ -52,6 +52,18 @@ GLOBAL_LOCK_SECONDS = 60
 # The wildcard an owner's `profiles` list uses to mean "every business".
 ALL_PROFILES = "*"
 SIGN_IN_PATH = "/sign-in"
+# The pre-owners login: one shared access code in the environment, with the
+# run of the whole line. `service.LEGACY_OWNER_KEY` gives it this key, which is
+# a name for a settings file and not a thing to print at a customer — every
+# other owner key was typed by whoever set the line up, so it is a name a human
+# chose and is shown as it is. A test pins the two spellings together.
+LEGACY_OWNER_KEY = "_admin"
+LEGACY_OWNER_NAME = "Line owner"
+
+
+def owner_name(key: str) -> str:
+    """The words for one login, as the person reading the dashboard sees them."""
+    return LEGACY_OWNER_NAME if str(key) == LEGACY_OWNER_KEY else str(key)
 
 
 def _is_loopback(address: str) -> bool:

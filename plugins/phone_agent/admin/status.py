@@ -120,12 +120,23 @@ def _named_target(row) -> str:
 def _alert_subject(row) -> str:
     """What failed, as the sentence's subject.
 
-    A test gets said out loud: the owner pressed that button a moment ago, and
-    "the last message alert did not get through" would send them looking for a
-    caller's message that never existed.
+    Two of the three transports earn their own sentence, because the sentence
+    is what the owner does something about:
+
+      * a **test** gets said out loud — the owner pressed that button a moment
+        ago, and "the last message alert did not get through" would send them
+        looking for a caller's message that never existed;
+      * an **urgent** alert is only ever sent by `_escalate_undelivered`, which
+        runs when the message pad could not be written AND the ordinary push
+        failed. A failure there means the caller's message reached nothing at
+        all, which is not the same event as a routine push failing while the
+        message itself is safely filed.
     """
-    if str((row or {}).get("target", "")).strip() == "ntfy_test":
+    target = str((row or {}).get("target", "")).strip()
+    if target == "ntfy_test":
         return "The test alert you sent"
+    if target == "ntfy_urgent":
+        return "The emergency alert for a message we could not file"
     named = _named_target(row)
     return f"The last message alert to {named}" if named else "The last message alert"
 

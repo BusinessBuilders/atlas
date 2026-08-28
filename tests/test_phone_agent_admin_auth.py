@@ -253,6 +253,31 @@ async def test_the_right_code_sets_a_session_cookie_with_the_right_flags(line):
         assert (await dash.client.get("/", allow_redirects=False)).status == 200
 
 
+def test_the_dashboards_name_for_the_legacy_login_is_the_services_name(line):
+    """The dashboard has to recognise the implicit whole-line login to give it
+    words. Two spellings of one key drift apart in silence, so they are pinned
+    together here rather than discovered on a customer's Activity screen."""
+    auth = load_admin().auth
+    assert auth.LEGACY_OWNER_KEY == line.LEGACY_OWNER_KEY
+    assert auth.owner_name(line.LEGACY_OWNER_KEY) == "Line owner"
+    # Every other owner key was typed by whoever set the line up: their name
+    # for that login, shown as it is.
+    assert auth.owner_name("jo") == "jo"
+
+
+async def test_the_recorded_sign_in_says_who_in_words_not_in_a_config_key(line):
+    """`_admin` is the key the legacy access code gets. It is written into an
+    events row that is read months later on the Activity screen, so what goes
+    into the row is the login's NAME."""
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("line-code")
+
+    [event] = [row for row in dash.store.list_events([], include_unscoped=True)
+               if row["kind"] == "dashboard_signin"]
+    assert event["detail"] == "Line owner signed in from 127.0.0.1"
+    assert "_admin" not in event["detail"]
+
+
 async def test_a_signed_in_owner_is_sent_on_from_the_sign_in_page(line):
     async with dashboard(line) as dash:
         await dash.client.sign_in("line-code")

@@ -310,6 +310,29 @@ async def test_the_greeting_section_shows_what_the_caller_hears(line):
     assert "seconds at a normal speaking pace" in page
 
 
+async def test_a_greeting_that_is_too_long_comes_back_with_every_word_in_it(line):
+    """The greeting is the section an owner writes and rewrites, and its limit
+    lives somewhere else (`config_edit.LIMITS`) than the sections whose
+    keep-your-typing behaviour is already pinned. Losing 611 typed characters
+    to a refusal is the exact failure this dashboard was rebuilt to remove."""
+    typed = ("Thanks for calling Acme Co, this is the assistant. " * 13)[:610] + "!"
+    assert len(typed) == 611
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        response = await _save(dash.client, "/settings/acme/greeting", {
+            "greeting": typed, "ai_disclosure": "on", "recording_notice": "on",
+            "ai_disclosure_text": "I'm the AI assistant for {business_name}.",
+            "recording_notice_text": "This call may be recorded and transcribed."})
+        body = await response.text()
+
+    assert response.status == 400
+    assert "That is 611 characters" in _text(body)
+    # every character back, not a truncation and not the saved value
+    assert typed in html.unescape(body)
+    assert line.PROFILES["acme"]["greeting"] == "hi"
+
+
 async def test_switching_off_a_notice_needs_the_waiver_on_the_record(line):
     async with dashboard(line) as dash:
         await _signed_in(dash)
@@ -2250,3 +2273,62 @@ async def test_a_scoped_owner_still_sees_a_removed_business_that_was_theirs(
     assert "Other Co" in scoped
     # but putting it back is not hers to do, so it is not offered
     assert "restore-business=other" not in scoped
+
+
+# ================ the login that owns the whole line has a NAME =============
+
+async def test_the_activity_screen_never_shows_the_legacy_logins_config_key(line):
+    """`_admin` is the key the pre-owners access code gets. It is a name in a
+    settings file; the person reading their own Activity screen owns a
+    plumbing company, and on their screen this login is the Line owner."""
+    line.apply_config(
+        dataclasses.replace(line.CONFIG, profiles={
+            "acme": dict(line.CONFIG.profiles["acme"], greeting="Changed.")}),
+        line.LEGACY_OWNER_KEY, "Changed the greeting callers hear for Acme Co")
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)                      # the ADMIN_TOKEN login
+        page = _text(await (await dash.client.get("/activity")).text())
+
+    assert line.LEGACY_OWNER_KEY not in page
+    assert "by Line owner" in page
+    assert "Line owner signed in from 127.0.0.1" in page
+
+
+async def test_a_sign_in_recorded_before_this_still_reads_as_the_line_owner(line):
+    """The sentence is STORED, so rows written by an older build already carry
+    the key. They are read for as long as they are kept."""
+    line.STORE.add_event(None, None, "info", "dashboard_signin",
+                         "_admin signed in from 100.64.0.9")
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        page = _text(await (await dash.client.get("/activity")).text())
+
+    assert "Line owner signed in from 100.64.0.9" in page
+    assert "_admin" not in page
+
+
+# ====================== the confirm works with no JavaScript ================
+
+async def test_the_confirm_dialog_carries_its_own_cancel_link(line):
+    """Escape closing the dialog is JavaScript, and JavaScript here is only
+    ever an enhancement: the way out of the question is a plain link the
+    server rendered, which works with scripting off and is what the Escape
+    handler follows."""
+    line.apply_config(
+        dataclasses.replace(line.CONFIG, profiles={
+            "acme": dict(line.CONFIG.profiles["acme"], greeting="Changed.")}),
+        "line", "Changed the greeting callers hear for Acme Co")
+    change_id = str(line.STORE.list_config_changes()[0]["id"])
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        page = await (await dash.client.get(
+            f"/activity?restore={change_id}")).text()
+
+    assert '<dialog class="confirm" open aria-modal="true"' in page
+    assert ('<a class="btn btn-quiet" href="/activity" data-dialog-cancel '
+            'autofocus>Cancel</a>') in page
+    # and nothing on the page depends on a script the CSP would refuse anyway
+    assert "<script>" not in page

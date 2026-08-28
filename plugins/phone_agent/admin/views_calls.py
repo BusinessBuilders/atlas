@@ -253,6 +253,11 @@ def gather_calls(deps, session, query) -> dict:
             "error": error or probe_error,
             "messages_error": messages_error, "has_next": has_next,
             "only_tests": only_tests,
+            # Walked off the end of the list — a page number in the URL past
+            # the last page of results. The filters matched something; there
+            # is simply nothing this far down, and "no calls match those
+            # filters" would send the owner clearing filters that are working.
+            "past_end": bool(not rows and not error and filters["page"] > 1),
             "first_run": (empty_start and not only_tests and not probe_error)}
 
 
@@ -270,10 +275,12 @@ def _list_context(deps, session, data: dict) -> dict:
         "rows": data["rows"], "error": data["error"],
         "messages_error": data["messages_error"], "filters": filters,
         "has_next": data["has_next"], "first_run": data["first_run"],
-        "only_tests": data["only_tests"],
+        "only_tests": data["only_tests"], "past_end": data["past_end"],
         "next_query": filter_query(filters, page=filters["page"] + 1),
         "prev_query": filter_query(filters, page=filters["page"] - 1)
         if filters["page"] > 2 else filter_query(filters),
+        # Page one, with whatever the owner is filtering by still on.
+        "newest_query": filter_query(filters),
         "first_row": (filters["page"] - 1) * PAGE_SIZE + 1,
         "last_row": (filters["page"] - 1) * PAGE_SIZE + len(data["rows"]),
         "many_businesses": len(session.profile_keys) > 1,
