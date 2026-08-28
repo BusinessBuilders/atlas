@@ -421,12 +421,128 @@ p { margin: 0 0 var(--s-3); }
 .signin-wordmark { font-size: var(--t-display); }
 .signin-card { width: 100%; display: flex; flex-direction: column; gap: var(--s-6); }
 
+/* -------------------------------------------------------- calls + inbox -- */
+
+.pad-24 { padding: var(--s-6); }
+.stack-0 { display: block; }
+.sid-list { margin: 0; padding-left: var(--s-6); font-size: var(--t-meta); }
+
+/* The filter bar. One row on a wide screen, a stack on a phone; every control
+   is a labelled 44px target, never a bare icon. */
+.filters {
+  display: flex; flex-wrap: wrap; gap: var(--s-3) var(--s-4);
+  align-items: flex-end; padding: var(--s-4);
+}
+.filter-search { flex: 1 1 260px; min-width: 0; }
+.filter-field { flex: 0 1 170px; }
+.filter-check, .filter-go { align-self: center; }
+.filter-check .checkline { min-height: 44px; align-items: center; }
+.filter-tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); }
+.filter {
+  display: inline-flex; align-items: center; min-height: 44px;
+  padding: 0 var(--s-4); border-radius: 999px;
+  border: 1px solid var(--line-control); color: var(--fg-soft);
+  font-size: var(--t-meta); font-weight: var(--w-strong); text-decoration: none;
+}
+.filter:hover { color: var(--fg); }
+.filter.on { background: var(--brand-accent); color: var(--brand-bg);
+             border-color: var(--brand-accent); }
+.filter.on:hover { color: var(--brand-bg); }
+
+.list-head, .list-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--s-3); padding: var(--s-3) var(--s-4);
+}
+.list-foot { border-top: 1px solid var(--line-soft); flex-wrap: wrap; }
+.table-calls td { vertical-align: top; }
+.table-calls .subtle { display: block; }
+.row-link { color: var(--fg); text-decoration: none; }
+.row-link:hover { text-decoration: underline; }
+.row-open {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 44px; min-height: 44px; color: var(--fg-quiet);
+}
+.row-open:hover { color: var(--fg); }
+
+.nav-badge { padding: 0 var(--s-2); margin-left: auto; }
+
+/* The message inbox: a card per message, the actions inside it. */
+.msg-list { display: flex; flex-direction: column; gap: var(--s-3); }
+.msg-card { display: flex; gap: var(--s-4); align-items: flex-start; }
+.msg-avatar {
+  width: 46px; height: 46px; border-radius: 50%; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-sunken); color: var(--fg);
+  font-weight: var(--w-strong);
+}
+.msg-body { flex: 1 1 0; min-width: 0;
+            display: flex; flex-direction: column; gap: var(--s-2); }
+.msg-head { display: flex; align-items: center; justify-content: space-between;
+            gap: var(--s-3); }
+.msg-who { font-size: var(--t-body); font-weight: var(--w-strong); }
+.msg-actions { display: flex; flex-wrap: wrap; gap: var(--s-2);
+               align-items: center; }
+.msg-status { margin-left: auto; }
+.btn-small { min-height: 44px; padding: var(--s-2) var(--s-3);
+             letter-spacing: 0.06em; }
+
+/* "Show more" with no script: closed, the text is clamped to three lines;
+   open, all of it is there. The whole message is in the page either way. */
+.msg-text-wrap summary { list-style: none; cursor: pointer; }
+.msg-text-wrap summary::-webkit-details-marker { display: none; }
+.msg-text-wrap .msg-text { display: block; }
+.msg-text-wrap:not([open]) .msg-text {
+  display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
+  -webkit-box-orient: vertical; overflow: hidden;
+}
+.msg-expand::after {
+  content: "Show more"; display: inline-block; margin-top: var(--s-1);
+  color: var(--brand-accent-2); font-size: var(--t-meta);
+  font-weight: var(--w-strong);
+}
+.msg-text-wrap[open] .msg-expand::after { content: "Show less"; }
+
+/* --------------------------------------------------------- one call ------ */
+
+.detail-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: var(--s-4);
+  align-items: start;
+}
+.talk { display: flex; flex-direction: column; gap: var(--s-3); }
+.turn { display: flex; }
+.turn-caller { justify-content: flex-start; }
+.turn-agent { justify-content: flex-end; }
+.turn-keypress { justify-content: center; }
+.bubble {
+  max-width: 76%; padding: var(--s-3) var(--s-4); border-radius: var(--radius);
+  display: flex; flex-direction: column; gap: var(--s-1);
+  border: 1px solid var(--line-soft); background: var(--surface-sunken);
+}
+.bubble-agent { border-color: var(--brand-accent-2); }
+.bubble-agent { border-color: color-mix(in srgb, var(--brand-accent-2) 45%, transparent);
+                background: color-mix(in srgb, var(--brand-accent-2) 12%, transparent); }
+.bubble-keypress {
+  max-width: 100%; font-size: var(--t-meta); color: var(--fg-quiet);
+  border-style: dashed; align-items: center;
+}
+.facts-block { display: flex; flex-direction: column; gap: var(--s-1); }
+.dial { text-decoration: none; font-size: var(--t-title); }
+.note-box { min-height: 88px; resize: vertical; }
+.danger-zone summary { cursor: pointer; min-height: 24px; }
+.danger-zone[open] { border-color: var(--brand-danger); }
+.danger-zone[open] { border-color: color-mix(in srgb, var(--brand-danger) 50%, transparent); }
+
 /* htmx's own two indicator rules. They normally arrive as an inline <style>
    this page's CSP refuses, so htmx is told not to inject them (see the
-   htmx-config meta tag) and they live here instead. */
-.htmx-indicator { opacity: 0; transition: opacity 200ms ease-in; }
+   htmx-config meta tag) and they live here instead.
+
+   `visibility` as well as htmx's opacity, because an element at opacity 0 is
+   still read out by a screen reader: "Updating the list…" has to be absent
+   while nothing is updating, and announced when something is. */
+.htmx-indicator { opacity: 0; visibility: hidden;
+                  transition: opacity 200ms ease-in; }
 .htmx-request .htmx-indicator,
-.htmx-request.htmx-indicator { opacity: 1; }
+.htmx-request.htmx-indicator { opacity: 1; visibility: visible; }
 
 /* ------------------------------------------------------------- mobile -- */
 
@@ -446,6 +562,15 @@ p { margin: 0 0 var(--s-3); }
   .band-checked { width: 100%; }
   .banner .btn, .banner form { width: 100%; }
   .banner .btn { width: 100%; }
+  .detail-grid { grid-template-columns: 1fr; }
+  .filters { flex-direction: column; align-items: stretch; }
+  .filter-field, .filter-search { flex: 1 1 auto; }
+  .filter-go .btn { width: 100%; }
+  .msg-card { gap: var(--s-3); }
+  .msg-avatar { display: none; }
+  .msg-status { margin-left: 0; }
+  .list-foot { flex-direction: column; align-items: flex-start; }
+  .bubble { max-width: 92%; }
   .table thead { display: none; }
   .table tr { display: grid; gap: var(--s-1); padding: var(--s-3) 0;
               border-bottom: 1px solid var(--line-soft); }
@@ -464,3 +589,13 @@ p { margin: 0 0 var(--s-3); }
   }
   .tab.active { color: var(--brand-accent); }
 }
+
+/* A copy button that could not copy says so on itself, in the failure colour —
+   never a silent no-op that looks like it worked. */
+.copy-failed { color: var(--brand-danger); border-color: var(--brand-danger); }
+.copy-failed { color: color-mix(in srgb, var(--brand-danger) 50%, var(--brand-fg));
+               border-color: color-mix(in srgb, var(--brand-danger) 55%, transparent); }
+
+/* The tab bar's own waiting count — the rail is hidden on a phone, which is
+   where an unanswered message matters most. */
+.tab-count { font-weight: var(--w-display); color: var(--brand-accent); }

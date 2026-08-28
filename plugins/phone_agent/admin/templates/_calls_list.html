@@ -1,0 +1,97 @@
+{% from "_icons.html" import icon %}
+{# The results half of the call log. htmx swaps this whole element when a
+   filter changes, so every state the list can be in lives in here: the error,
+   the never-rung empty, the nothing-matched empty, and the table itself. #}
+<section id="call-list" class="card flat stack-0" aria-live="polite"
+         aria-label="Your calls">
+  {% if error %}
+  <p class="notice notice-bad pad-16" role="alert">{{ error }}</p>
+  {% elif first_run %}
+  <div class="empty-first-run pad-24">
+    <h2 class="display display-m flush">No calls yet</h2>
+    {% if numbers %}
+    <p class="muted flush">Ring {% for number in numbers %}<span class="strong">{{ number | fmt_phone }}</span>{{ ", " if not loop.last }}{% endfor %}
+      to test your line. The call, what was said and any message it leaves will
+      appear here within a minute of hanging up.</p>
+    {% else %}
+    <p class="muted flush">No phone number points at your business yet, so
+      nothing can ring through. Ask whoever set up your line to point a number
+      at it.</p>
+    {% endif %}
+  </div>
+  {% elif not rows %}
+  <div class="empty-first-run pad-24">
+    <h2 class="display display-m flush">No calls match those filters</h2>
+    <p class="muted flush">Nothing on your line matches what you asked for.
+      {% if not filters.show_test %}Test calls are hidden unless you tick
+      "Show test calls".{% endif %}</p>
+    <a class="btn btn-ghost self-start" href="/calls">Clear filters</a>
+  </div>
+  {% else %}
+  <div class="list-head">
+    <span class="subtle">Calls {{ first_row }}–{{ last_row }}, newest first</span>
+    <span class="subtle htmx-indicator" role="status">Updating the list…</span>
+  </div>
+  <table class="table table-calls">
+    <caption class="visually-hidden">Every call your line answered, newest first</caption>
+    <thead>
+      <tr>
+        <th scope="col">When</th>
+        <th scope="col">Caller</th>
+        {% if many_businesses %}<th scope="col">Business</th>{% endif %}
+        <th scope="col">Length</th>
+        <th scope="col">Outcome</th>
+        <th scope="col">Message</th>
+        <th scope="col"><span class="visually-hidden">Open</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td class="nowrap strong">
+          <a class="row-link" href="/calls/{{ row.call_sid }}">{{ row.started_at | fmt_local }}</a>
+        </td>
+        <td>
+          <span class="strong">{{ row.caller_name or "Name not given" }}</span>
+          <span class="subtle">{{ row.from_number | fmt_phone_masked }}</span>
+        </td>
+        {% if many_businesses %}<td class="subtle">{{ row.business }}</td>{% endif %}
+        <td class="nowrap">
+          {% if row.is_text %}
+          <span class="tag tag-info">Text</span>
+          {% else %}
+          {{ row.duration_s | fmt_duration }}
+          {% endif %}
+        </td>
+        <td><span class="tag tag-{{ row.outcome_tone }}">{{ row.outcome_label }}</span></td>
+        <td>
+          {% if row.status_label %}
+          <span class="tag tag-{{ row.status_tone }}">{{ row.status_label }}</span>
+          {% else %}
+          <span class="subtle">None</span>
+          {% endif %}
+          {% if row.is_test %}<span class="tag tag-ghost">Test</span>{% endif %}
+        </td>
+        <td class="nowrap">
+          <a class="row-open" href="/calls/{{ row.call_sid }}">{{ icon("arrow", 18) }}<span class="visually-hidden">Open this call</span></a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if messages_error %}
+  <p class="notice notice-bad pad-16" role="alert">{{ messages_error }}</p>
+  {% endif %}
+  <div class="list-foot">
+    <span class="subtle">Blocked and test calls are hidden unless you ask for them.</span>
+    <span class="row-gap">
+      {% if filters.page > 1 %}
+      <a class="btn btn-quiet" href="/calls{{ prev_query }}">Newer calls</a>
+      {% endif %}
+      {% if has_next %}
+      <a class="btn btn-quiet" href="/calls{{ next_query }}">Older calls</a>
+      {% endif %}
+    </span>
+  </div>
+  {% endif %}
+</section>

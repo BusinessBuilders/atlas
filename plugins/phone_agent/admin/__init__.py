@@ -33,7 +33,7 @@ import os
 from aiohttp import web
 
 from . import auth as auth_module
-from . import render, views_brain, views_overview
+from . import render, views_brain, views_calls, views_messages, views_overview
 
 log = logging.getLogger("atlas-phone")
 
@@ -252,6 +252,16 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
     app.router.add_get("/health/detail", views_overview.health_detail)
     app.router.add_post("/acknowledge-delivery",
                         views_overview.acknowledge_delivery)
+    app.router.add_get("/calls", views_calls.calls)
+    # Before /calls/{sid}: a literal path and a pattern that would also match it
+    # are resolved in the order they are added.
+    app.router.add_post("/callers/delete", views_calls.delete_caller)
+    app.router.add_get("/calls/{sid}", views_calls.call_detail)
+    app.router.add_post("/calls/{sid}/note", views_calls.add_note)
+    app.router.add_post("/calls/{sid}/handled", views_calls.mark_handled)
+    app.router.add_get("/messages", views_messages.messages)
+    app.router.add_get("/messages.csv", views_messages.messages_csv)
+    app.router.add_post("/messages/{id}/status", views_messages.message_status)
     app.router.add_get("/brain", views_brain.brain)
     app.router.add_post("/brain", views_brain.switch_brain)
     app.router.add_get(auth_module.SIGN_IN_PATH, sign_in_page)

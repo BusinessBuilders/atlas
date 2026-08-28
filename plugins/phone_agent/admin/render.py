@@ -166,12 +166,44 @@ def fmt_phone(number) -> str:
     return text
 
 
+MASK_CHAR = "•"
+MASKED_NUMBER_TAIL = 4
+
+
+def fmt_phone_masked(number) -> str:
+    """A caller's number with only its last four digits left.
+
+    The same rule `service.mask_number` applies to the journal, applied here to
+    every LIST: a call log open on a laptop in a shop is read over the owner's
+    shoulder, and the last four digits are enough to recognise a caller. The
+    whole number is on the call's own page, which only its owner can open, and
+    on the call-back link that has to dial it.
+    """
+    text = str(number or "").strip()
+    if not text:
+        return "no number"
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return text[:32]                      # "unknown", "anonymous", …
+    if len(digits) <= MASKED_NUMBER_TAIL:
+        return MASK_CHAR * len(digits)
+    return (MASK_CHAR * (len(digits) - MASKED_NUMBER_TAIL)
+            + digits[-MASKED_NUMBER_TAIL:])
+
+
 def fmt_duration(seconds) -> str:
     """How long a call lasted, as minutes and seconds."""
     if seconds is None:
         return "not recorded"
     total = int(round(float(seconds)))
     return f"{total // 60}:{total % 60:02d}"
+
+
+def fmt_wait(milliseconds) -> str:
+    """How long a caller waited for the agent's first word, in seconds."""
+    if milliseconds is None:
+        return "not recorded"
+    return f"{float(milliseconds) / 1000:.1f} s"
 
 
 def fmt_local(ts) -> str:
@@ -210,23 +242,31 @@ class NavItem:
     """One row in the navigation.
 
     `url` is None for a group heading, so a screen that has not been built yet
-    is simply absent — the owner never clicks a link into nothing.
+    is simply absent — the owner never clicks a link into nothing. `badge` marks
+    the one row that carries a count: how many messages are still waiting.
     """
     label: str
     icon: str
     url: str | None
     whole_line_only: bool = False
     children: tuple = ()
+    badge: bool = False
 
 
-# Only screens that exist are listed. Calls, Messages, Hours, Numbers,
-# Notifications and Activity join this list in the tasks that build them.
+# Only screens that exist are listed. Hours, Numbers, Notifications and
+# Activity join this list in the tasks that build them.
 NAV = (
     NavItem("Overview", "grid", "/"),
+    NavItem("Calls", "phone", "/calls"),
+    NavItem("Messages", "inbox", "/messages", badge=True),
     NavItem("Settings", "sliders", None, children=(
         NavItem("Brain", "cpu", "/brain", whole_line_only=True),
     )),
 )
+# The navigation badge stops counting here: past this the number is a shape,
+# not a fact, and reading every waiting row to draw it would cost more than it
+# tells the owner.
+BADGE_CEILING = 99
 
 
 def nav_for(session) -> list:
@@ -245,8 +285,45 @@ def nav_for(session) -> list:
         if item.url is None and not children:
             continue
         visible.append(NavItem(item.label, item.icon, item.url,
-                               item.whole_line_only, children))
+                               item.whole_line_only, children, item.badge))
     return visible
+
+
+def guarded_read(what: str, fn, *args, **kwargs):
+    """(value, reason) for one panel's data. Never raises.
+
+    `reason` is a sentence the owner reads in place of the panel. The failure
+    is logged with its traceback as well — a panel quietly showing "nothing
+    here" when the truth is "the database would not open" is the dishonesty
+    this dashboard was rebuilt to remove.
+    """
+    try:
+        return fn(*args, **kwargs), ""
+    except Exception as e:
+        log.exception("dashboard: could not read %s", what)
+        return None, f"Could not read {what}: {type(e).__name__}: {e}"
+
+
+def waiting_badge(deps, session):
+    """A callable the page shell uses to draw the "messages waiting" count.
+
+    Lazy on purpose: only `base.html` asks for it, so the panels htmx swaps
+    every thirty seconds never pay for the query. A count that cannot be read
+    is left off the navigation — the Messages screen itself is where a store
+    that will not answer is reported, loudly, in words.
+    """
+    def count() -> int:
+        if session is None:
+            return 0
+        try:
+            waiting = deps.store.list_messages(session.profile_keys,
+                                               status="new",
+                                               limit=BADGE_CEILING + 1)
+        except Exception:
+            log.exception("dashboard: could not count the waiting messages")
+            return 0
+        return len(waiting)
+    return count
 
 
 @dataclass(frozen=True)
@@ -289,6 +366,8 @@ def base_context(request, deps: Deps, session=None) -> dict:
         "asset_version": deps.asset_version,
         "session": session,
         "nav": nav_for(session) if session is not None else [],
+        "waiting_count": waiting_badge(deps, session),
+        "badge_ceiling": BADGE_CEILING,
         "csrf": deps.auth.csrf_token(session) if session is not None else "",
         "path": request.path,
         # A page that is asking a question in a <dialog> says so, and the
@@ -329,6 +408,7 @@ def make_env() -> jinja2.Environment:
         lstrip_blocks=True,
         undefined=jinja2.StrictUndefined,   # a missing value is a loud error
     )
-    env.filters.update(fmt_phone=fmt_phone, fmt_duration=fmt_duration,
+    env.filters.update(fmt_phone=fmt_phone, fmt_phone_masked=fmt_phone_masked,
+                       fmt_duration=fmt_duration, fmt_wait=fmt_wait,
                        fmt_local=fmt_local, fmt_ago=fmt_ago)
     return env

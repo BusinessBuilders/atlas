@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Messages{% endblock %}
+{% block main %}
+{% set waiting = messages | selectattr("status", "equalto", "new") | list | length %}
+{# Where a status button sends a browser without JavaScript back to. #}
+{% set back = "/messages?status=" + chosen if chosen else "/messages" %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Messages</h1>
+    <p class="muted flush">
+      {% if error %}Your messages could not be read
+      {% elif chosen %}{{ messages | length }} shown · newest first
+      {% else %}{{ waiting }} waiting · newest first{% endif %}
+    </p>
+  </div>
+  <div class="row-gap">
+    <a class="btn btn-quiet" href="/messages.csv{{ '?status=' + chosen if chosen else '' }}">Export CSV</a>
+  </div>
+</div>
+
+{% if unknown_status %}
+<p class="notice notice-bad" role="alert">That is not a state a message can be
+  in, so every message is shown.</p>
+{% endif %}
+
+<nav class="filter-tabs" aria-label="Filter messages by state">
+  {% for value, label in tabs %}
+  <a class="filter{{ ' on' if chosen == value else '' }}"
+     href="/messages{{ '?status=' + value if value else '' }}"
+     {% if chosen == value %}aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</nav>
+
+{% if error %}
+<p class="notice notice-bad" role="alert">{{ error }}</p>
+{% elif not messages %}
+<div class="card empty-first-run">
+  <h2 class="display display-m flush">
+    {% if chosen == 'new' %}Nothing waiting
+    {% elif chosen %}Nothing here
+    {% else %}Nothing waiting{% endif %}
+  </h2>
+  <p class="muted flush">
+    {% if chosen == 'in_progress' %}No message is marked as being worked on.
+    {% elif chosen == 'done' %}No message has been marked done yet.
+    {% else %}When a caller leaves their name and what they want, it appears
+    here and on your phone. Calls that left nothing to act on stay in your call
+    log instead.{% endif %}
+  </p>
+  {% if chosen %}
+  <a class="btn btn-ghost self-start" href="/messages">Show every message</a>
+  {% endif %}
+</div>
+{% else %}
+<div class="msg-list">
+  {% for message in messages %}
+  {% include "_message_card.html" %}
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

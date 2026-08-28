@@ -1,0 +1,59 @@
+{% from "_icons.html" import icon %}
+{% from "_nav_badge.html" import waiting_badge, waiting_count_tab %}
+{# One message, and everything the owner can do about it without leaving the
+   list. htmx swaps this whole element when a status button is pressed; with
+   JavaScript off the same forms post and the page comes back. #}
+<article class="card msg-card" id="message-{{ message.id }}">
+  <span class="msg-avatar" aria-hidden="true">{{ message.initials }}</span>
+  <div class="msg-body">
+    <div class="msg-head">
+      <h3 class="msg-who">{{ message.who }}</h3>
+      <span class="subtle nowrap">{{ message.created_at | fmt_local }}</span>
+    </div>
+    {% if many_businesses %}
+    <span class="subtle">{{ message.business }}</span>
+    {% endif %}
+    {% if message.clamped %}
+    {# The whole message is in the page either way — closed it is clamped to a
+       few lines, open it is all there. Nothing is ever cut off. #}
+    <details class="msg-text-wrap">
+      <summary><span class="msg-text">{{ message.body }}</span><span class="msg-expand"></span></summary>
+    </details>
+    {% else %}
+    <p class="flush">{{ message.body }}</p>
+    {% endif %}
+    {% if message.note %}
+    <p class="subtle flush">Your note: {{ message.note }}</p>
+    {% endif %}
+    <div class="msg-actions">
+      {% if message.dial %}
+      <a class="btn btn-quiet btn-small" href="tel:{{ message.dial }}">{{ icon("phone", 16) }}Call {{ message.dial | fmt_phone }}</a>
+      {% endif %}
+      {% if message.email %}
+      <a class="btn btn-quiet btn-small" href="mailto:{{ message.email }}">{{ icon("mail", 16) }}Email</a>
+      {% endif %}
+      <button class="btn btn-quiet btn-small" type="button"
+              data-copy="{{ message.body }}" data-copied-label="Copied"
+              data-failed-label="Could not copy">{{ icon("copy", 16) }}<span data-copy-label>Copy</span></button>
+      {% for value, label in message.actions %}
+      <form method="post" action="/messages/{{ message.id }}/status"
+            hx-post="/messages/{{ message.id }}/status"
+            hx-target="#message-{{ message.id }}" hx-swap="outerHTML">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="status" value="{{ value }}">
+        <input type="hidden" name="back" value="{{ back }}">
+        <button class="btn btn-quiet btn-small" type="submit"
+                data-busy-label="Saving…">{{ label }}</button>
+      </form>
+      {% endfor %}
+      <a class="btn btn-quiet btn-small" href="/calls/{{ message.call_sid }}">Open call</a>
+      <span class="tag tag-{{ message.status_tone }} msg-status">{{ message.status_label }}</span>
+    </div>
+  </div>
+</article>
+{% if oob_waiting is defined %}
+{# htmx swaps these two out of band so the navigation's count agrees with the
+   card that has just moved. Rendered only for an htmx status change. #}
+{{ waiting_badge(oob_waiting, badge_ceiling, oob=true) }}
+{{ waiting_count_tab(oob_waiting, badge_ceiling, oob=true) }}
+{% endif %}

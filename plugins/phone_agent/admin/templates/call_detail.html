@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ call.caller_name or "Call" }}{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">
+      {% if call.caller_name %}Call with {{ call.caller_name }}
+      {% elif call.is_text %}Text from {{ call.from_number | fmt_phone }}
+      {% else %}Call from {{ call.from_number | fmt_phone }}{% endif %}
+    </h1>
+    <p class="muted flush">{{ call.started_at | fmt_local }}
+      {% if not call.is_text %} · {{ call.duration_s | fmt_duration }}{% endif %}
+      · {{ call.business }}</p>
+  </div>
+  <div class="row-gap">
+    <a class="btn btn-quiet" href="/calls">Back to calls</a>
+    {% if message %}
+    <button class="btn btn-quiet" type="button"
+            data-copy="{{ message.summary or message.need or '' }}"
+            data-copied-label="Copied"
+            data-failed-label="Could not copy"><span data-copy-label>Copy summary</span></button>
+    {% endif %}
+    {% if message and message.status != 'done' %}
+    <form method="post" action="/calls/{{ call.call_sid }}/handled">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-primary" type="submit"
+              data-busy-label="Saving…">Mark handled</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if saved == 'handled' %}
+<p class="notice notice-ok" role="status" aria-live="polite">Marked handled. It
+  is out of your waiting list from now on.</p>
+{% elif saved == 'note' %}
+<p class="notice notice-ok" role="status" aria-live="polite">Your note is
+  saved with this message.</p>
+{% endif %}
+{% if messages_error %}
+<p class="notice notice-bad" role="alert">{{ messages_error }}</p>
+{% endif %}
+
+<div class="detail-grid">
+  <div class="stack-16">
+    {% if call.is_text %}
+    <div class="card stack-12">
+      <span class="eyebrow">The text they sent</span>
+      <p class="flush">{{ message.summary or message.need if message else "" }}</p>
+      <p class="subtle flush">This came in as a text message, so there is no
+        conversation to read — what they sent is the message itself.</p>
+    </div>
+    {% elif call.outcome == 'no_info_given' and no_info_note %}
+    <div class="card stack-12">
+      <span class="eyebrow">What the caller said</span>
+      <p class="flush">{{ no_info_note }}</p>
+      <p class="subtle flush">Nothing here needed answering, so no message was
+        added to your list.</p>
+    </div>
+    {% endif %}
+
+    {% if not call.is_text %}
+    <div class="card stack-12">
+      <span class="eyebrow">Transcript</span>
+      {% if call.turns %}
+      <div class="talk">
+        {% for turn in call.turns %}
+        {% if turn.role == 'keypress' %}
+        <div class="turn turn-keypress">
+          <span class="bubble bubble-keypress">Keypad: {{ turn.text }}</span>
+        </div>
+        {% else %}
+        <div class="turn turn-{{ turn.role }}">
+          <div class="bubble bubble-{{ turn.role }}">
+            <span class="eyebrow">{{ "Caller" if turn.role == 'caller' else "Your agent" }}</span>
+            <span>{{ turn.text }}</span>
+          </div>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+      {% elif call.outcome == 'no_info_given' and no_info_note %}
+      <p class="subtle flush">The words of this call are no longer kept. What
+        the caller wanted is written above.</p>
+      {% else %}
+      <p class="subtle flush">Nothing was said on this call, or the words have
+        aged out of your records. Everything else on this page is kept.</p>
+      {% endif %}
+      {% if events_error %}
+      <p class="notice notice-bad" role="alert">{{ events_error }}</p>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="stack-16">
+    <div class="card stack-12">
+      <span class="eyebrow">Who called</span>
+      <div class="facts-block">
+        <span class="subtle">Their number</span>
+        <span class="row-gap">
+          <a class="strong dial" href="tel:{{ call.from_number }}">{{ call.from_number | fmt_phone }}</a>
+          <button class="btn btn-quiet btn-small" type="button"
+                  data-copy="{{ call.from_number }}"
+                  data-copied-label="Copied"
+                  data-failed-label="Could not copy">{{ icon("copy", 16) }}<span data-copy-label>Copy</span></button>
+        </span>
+      </div>
+      {% if call.is_test %}
+      <p class="subtle flush">This was a test call. It is kept out of your
+        numbers and your message list.</p>
+      {% endif %}
+    </div>
+
+    {% if message %}
+    <div class="card stack-12">
+      <div class="card-head">
+        <span class="eyebrow">Message</span>
+        <span class="tag tag-{{ call.status_tone }}">{{ call.status_label }}</span>
+      </div>
+      <div class="facts-block">
+        <span class="subtle">Name</span>
+        <span class="strong">{{ message.caller_name or "Not given" }}</span>
+      </div>
+      {% if message.callback %}
+      <div class="facts-block">
+        <span class="subtle">Call back</span>
+        <span class="row-gap">
+          <a class="strong dial" href="tel:{{ message.callback }}">{{ message.callback | fmt_phone }}</a>
+          <button class="btn btn-quiet btn-small" type="button"
+                  data-copy="{{ message.callback }}"
+                  data-copied-label="Copied"
+                  data-failed-label="Could not copy">{{ icon("copy", 16) }}<span data-copy-label>Copy</span></button>
+        </span>
+      </div>
+      {% endif %}
+      {% if message.email %}
+      <div class="facts-block">
+        <span class="subtle">Email</span>
+        <span class="row-gap">
+          <a href="mailto:{{ message.email }}">{{ message.email }}</a>
+          <button class="btn btn-quiet btn-small" type="button"
+                  data-copy="{{ message.email }}"
+                  data-copied-label="Copied"
+                  data-failed-label="Could not copy">{{ icon("copy", 16) }}<span data-copy-label>Copy</span></button>
+        </span>
+      </div>
+      {% endif %}
+      <div class="facts-block">
+        <span class="subtle">What they wanted</span>
+        <span>{{ message.need or message.summary or "The words of this message have aged out of your records." }}</span>
+      </div>
+    </div>
+
+    <form class="card stack-12" method="post" action="/calls/{{ call.call_sid }}/note">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label class="eyebrow" for="note">Your note</label>
+      <textarea class="input note-box" id="note" name="note" rows="3"
+                aria-describedby="note-hint">{{ message.note or "" }}</textarea>
+      <p class="hint" id="note-hint">Only you see this. Notes are kept even
+        after the words of the call are cleared out.</p>
+      <button class="btn btn-ghost self-start" type="submit"
+              data-busy-label="Saving…">Save note</button>
+    </form>
+    {% else %}
+    <div class="card stack-12">
+      <span class="eyebrow">Message</span>
+      <p class="subtle flush">This call left no message, so there is nothing to
+        answer and nothing to mark handled. Notes are kept with a message, so
+        this call cannot carry one.</p>
+    </div>
+    {% endif %}
+
+    <div class="card stack-12">
+      <span class="eyebrow">How the call went</span>
+      <dl class="facts">
+        <dt class="subtle">Outcome</dt>
+        <dd><span class="tag tag-{{ call.outcome_tone }}">{{ call.outcome_label }}</span></dd>
+        <dt class="subtle">Answered by</dt>
+        <dd>{{ brain_label or "Not recorded" }}{% if brain_runs %} · {{ brain_runs }}{% endif %}
+          {% if brain_gone and call.brain %}<span class="subtle">(no longer set up on this line)</span>{% endif %}</dd>
+        {% if not call.is_text %}
+        <dt class="subtle">Answer speed</dt>
+        <dd>{% if call.ttft_ms_p50 %}{{ call.ttft_ms_p50 | fmt_wait }} typical ·
+          {{ call.ttft_ms_p95 | fmt_wait }} slowest{% else %}Not recorded{% endif %}</dd>
+        {% endif %}
+        <dt class="subtle">Alert to you</dt>
+        <dd>{% if notify_label %}<span class="tag tag-{{ notify_tone }}">{{ notify_label }}</span>{% else %}<span class="subtle">Nothing to send</span>{% endif %}</dd>
+        <dt class="subtle">Promises made</dt>
+        <dd>{% if overpromise %}<span class="tag tag-warn">Check this call</span>
+          <span class="subtle">said: {{ overpromise | join(", ") }}</span>
+          {% else %}None flagged{% endif %}</dd>
+      </dl>
+    </div>
+
+    <details class="card stack-12 danger-zone"{{ ' open' if deleting or delete_error else '' }}>
+      <summary class="eyebrow">Delete everything from this caller</summary>
+      <p class="flush muted">This removes every call from
+        {{ call.from_number | fmt_phone }} on your line — the calls, everything
+        said on them, any messages and the alert history. It cannot be undone.</p>
+      {% if delete_error %}
+      <p class="notice notice-bad" role="alert">{{ delete_error }}</p>
+      {% endif %}
+      <form method="post" action="/callers/delete" class="stack-12">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="call_sid" value="{{ call.call_sid }}">
+        <label class="label" for="number">Type {{ call.from_number }} to confirm</label>
+        <input class="input" type="text" id="number" name="number"
+               autocomplete="off" inputmode="tel" aria-describedby="delete-hint">
+        <p class="hint" id="delete-hint">Type the number exactly as it is shown,
+          including the country code.</p>
+        <button class="btn btn-ghost self-start" type="submit"
+                data-busy-label="Deleting…">Delete this caller's records</button>
+      </form>
+    </details>
+  </div>
+</div>
+{% endblock %}

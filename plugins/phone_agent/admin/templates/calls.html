@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Calls{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Calls</h1>
+    <p class="muted flush">Every call your line answered{% if retention %} ·
+      kept for {{ retention }} days{% endif %}</p>
+  </div>
+</div>
+
+{% if deleted %}
+<div class="card notice-ok stack-12" role="status" aria-live="polite">
+  <h2 class="display display-m flush">That caller's records are gone</h2>
+  <p class="flush">{{ deleted.call_sids | length }}
+    call{{ '' if deleted.call_sids | length == 1 else 's' }} removed, and the
+    {{ deleted.rows }} record{{ '' if deleted.rows == 1 else 's' }} kept about
+    {{ 'it' if deleted.call_sids | length == 1 else 'them' }}: everything said,
+    any message left, and the history of the alerts sent to you.</p>
+  {% if deleted.call_sids %}
+  <p class="flush">Your written message pad is a plain text file this dashboard
+    cannot edit, so any entry for these calls has to be crossed out by hand.
+    These are the call references to look for:</p>
+  <ul class="sid-list">
+    {% for sid in deleted.call_sids %}
+    <li><code>{{ sid }}</code></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
+
+{% for problem in filters.problems %}
+<p class="notice notice-bad" role="alert">{{ problem }}</p>
+{% endfor %}
+
+{# Works with or without JavaScript: the button submits it as an ordinary GET,
+   and where htmx is running the same request redraws only the list below. #}
+<form class="card filters" method="get" action="/calls"
+      hx-get="/calls" hx-target="#call-list" hx-swap="outerHTML"
+      hx-trigger="submit, change" hx-push-url="true" hx-indicator="#call-list">
+  <div class="filter-search">
+    <label class="label" for="q">Search</label>
+    <input class="input" type="search" id="q" name="q" value="{{ filters.q }}"
+           placeholder="Names, numbers, or what was said"
+           aria-describedby="q-hint">
+    <p class="hint" id="q-hint">Searches what callers said and what they wanted.
+      Words older than your retention window are cleared out, so a search only
+      finds what is still kept.</p>
+  </div>
+  <div class="filter-field">
+    <label class="label" for="from">From</label>
+    <input class="input" type="date" id="from" name="from" value="{{ filters.raw['from'] }}">
+  </div>
+  <div class="filter-field">
+    <label class="label" for="to">To</label>
+    <input class="input" type="date" id="to" name="to" value="{{ filters.raw['to'] }}">
+  </div>
+  <div class="filter-field">
+    <label class="label" for="outcome">Outcome</label>
+    <select class="input" id="outcome" name="outcome">
+      <option value="">Any outcome</option>
+      {% for key, label in outcomes %}
+      <option value="{{ key }}"{{ ' selected' if filters.outcome == key else '' }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  {% if businesses | length > 1 %}
+  <div class="filter-field">
+    <label class="label" for="profile">Business</label>
+    <select class="input" id="profile" name="profile">
+      <option value="">All of your businesses</option>
+      {% for key, name in businesses %}
+      <option value="{{ key }}"{{ ' selected' if filters.profile == key else '' }}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
+  <div class="filter-field">
+    <label class="label" for="has_message">Message</label>
+    <select class="input" id="has_message" name="has_message">
+      <option value="">With or without</option>
+      <option value="yes"{{ ' selected' if filters.has_message is true else '' }}>Left a message</option>
+      <option value="no"{{ ' selected' if filters.has_message is false else '' }}>Left no message</option>
+    </select>
+  </div>
+  <div class="filter-field filter-check">
+    <label class="checkline" for="show_test">
+      <input type="checkbox" id="show_test" name="show_test" value="1"
+             {{ 'checked' if filters.show_test else '' }}>
+      <span>Show test calls</span>
+    </label>
+  </div>
+  <div class="filter-field filter-go">
+    <button class="btn btn-ghost" type="submit">Show these calls</button>
+  </div>
+</form>
+
+{% include "_calls_list.html" %}
+{% endblock %}

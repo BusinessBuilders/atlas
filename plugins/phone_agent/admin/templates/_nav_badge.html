@@ -1,0 +1,16 @@
+{# The "messages waiting" count, in the two places the navigation shows it.
+   Both are always in the page and hidden when the count is zero, so htmx can
+   swap them out of band after a status change — a badge still reading "2"
+   beside a message the owner has just moved is the screen contradicting
+   itself. #}
+{% macro waiting_badge(waiting, ceiling, oob=false) -%}
+<span class="tag tag-accent nav-badge" id="nav-waiting"
+      {%- if oob %} hx-swap-oob="true"{% endif %}
+      {%- if not waiting %} hidden{% endif %}>{{ waiting if waiting <= ceiling else ceiling ~ '+' }}<span class="visually-hidden"> waiting</span></span>
+{%- endmacro %}
+
+{% macro waiting_count_tab(waiting, ceiling, oob=false) -%}
+<span class="tab-count" id="tab-waiting"
+      {%- if oob %} hx-swap-oob="true"{% endif %}
+      {%- if not waiting %} hidden{% endif %}> ({{ waiting if waiting <= ceiling else ceiling ~ '+' }})<span class="visually-hidden"> waiting</span></span>
+{%- endmacro %}

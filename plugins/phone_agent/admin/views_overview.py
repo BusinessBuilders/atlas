@@ -72,19 +72,9 @@ def alert_words(kind: str) -> str:
     return ALERT_WORDS.get(kind) or str(kind).replace("_", " ").capitalize()
 
 
-def _read(what: str, fn, *args, **kwargs):
-    """(value, reason) for one panel's data. Never raises.
-
-    `reason` is a sentence the owner reads in place of the panel. The failure
-    is logged with its traceback as well — a panel quietly showing "nothing
-    here" when the truth is "the database would not open" is the dishonesty
-    this dashboard was rebuilt to remove.
-    """
-    try:
-        return fn(*args, **kwargs), ""
-    except Exception as e:
-        log.exception("dashboard: could not read %s", what)
-        return None, f"Could not read {what}: {type(e).__name__}: {e}"
+# Every screen reads the store the same guarded way; the helper lives in
+# render.py so the Calls and Messages views share this one, not a copy of it.
+_read = render.guarded_read
 
 
 def _oldest_waiting(messages) -> float | None:
