@@ -30,7 +30,11 @@
                  {% if not error %}autofocus{% endif %}>
           <p id="code-hint" class="hint">The code from your setup email.</p>
         </div>
+        {# data-busy-label: app.js puts this on the button while the server is
+           checking, so a pressed button stops looking unpressed. With
+           JavaScript off the form behaves exactly as it always did. #}
         <button class="btn btn-primary btn-block" type="submit"
+                data-busy-label="Checking…"
                 {% if locked %}disabled{% endif %}>Sign in</button>
       </form>
       {% if support_email %}

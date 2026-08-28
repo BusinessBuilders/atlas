@@ -18,11 +18,19 @@
 <link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
 {# htmx keeps the line-status band current without reloading the page. #}
 <script src="/static/htmx.min.js?v={{ asset_version }}" defer></script>
+{# Our own: a pressed button says so while the server is working. #}
+<script src="/static/app.js?v={{ asset_version }}" defer></script>
 </head>
 <body>
-<a class="skip-link" href="#main">Skip to the page content</a>
+{# `dialog_open` marks a page that is asking a question in a <dialog>. A
+   server-rendered `<dialog open>` is NOT modal: without `inert` on everything
+   behind it, the page under the question stays tabbable and clickable and a
+   keyboard user walks straight out of the dialog into the navigation. `inert`
+   is an attribute, so this needs no JavaScript — which the page's CSP would
+   refuse inline anyway. #}
+<a class="skip-link" href="#main"{% if dialog_open %} inert{% endif %}>Skip to the page content</a>
 {% block body %}
-<div class="shell">
+<div class="shell"{% if dialog_open %} inert{% endif %}>
   <aside class="rail" aria-label="Sections">
     <div class="rail-brand">
       {% if has_logo %}
@@ -66,7 +74,7 @@
   </main>
 </div>
 {% if nav %}
-<nav class="tabbar" aria-label="Sections">
+<nav class="tabbar"{% if dialog_open %} inert{% endif %} aria-label="Sections">
   {% for item in nav %}
     {% if item.url %}
   <a class="tab{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon, 22) }}<span>{{ item.label }}</span></a>
@@ -77,6 +85,10 @@
   {% endfor %}
 </nav>
 {% endif %}
+{# Anything that sits ON TOP of the page — a confirm dialog — belongs here,
+   outside the `inert` shell above: content inside an inert subtree cannot be
+   used, and that would include the question itself. #}
+{% block overlay %}{% endblock %}
 {% endblock %}
 </body>
 </html>

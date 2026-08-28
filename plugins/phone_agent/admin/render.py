@@ -152,7 +152,7 @@ def icon_svg(branding) -> str:
 def fmt_phone(number) -> str:
     """A phone number the way the owner reads it out loud.
 
-    North American numbers become (508) 886-3046; anything else is left in the
+    North American numbers become (555) 000-0001; anything else is left in the
     international form it arrived in, which is still dialable.
     """
     text = str(number or "").strip()
@@ -291,6 +291,9 @@ def base_context(request, deps: Deps, session=None) -> dict:
         "nav": nav_for(session) if session is not None else [],
         "csrf": deps.auth.csrf_token(session) if session is not None else "",
         "path": request.path,
+        # A page that is asking a question in a <dialog> says so, and the
+        # layout puts the rest of the page beyond reach while it is open.
+        "dialog_open": False,
     }
 
 
@@ -299,15 +302,23 @@ def page(request, deps: Deps, template: str, *, session=None, status: int = 200,
     """Render one whole page. The security headers are added by the app's
     middleware, so nothing here can forget them."""
     body = deps.env.get_template(template).render(
-        **base_context(request, deps, session), **context)
+        _context(request, deps, session, context))
     return web.Response(text=body, status=status, content_type="text/html")
 
 
 def partial(request, deps: Deps, template: str, *, session=None, **context):
     """Render one panel, for the pieces htmx swaps in place."""
     body = deps.env.get_template(template).render(
-        **base_context(request, deps, session), **context)
+        _context(request, deps, session, context))
     return web.Response(text=body, content_type="text/html")
+
+
+def _context(request, deps: Deps, session, context: dict) -> dict:
+    """The page's own values on top of the ones every page has, so a view can
+    override a default (`dialog_open`) instead of colliding with it."""
+    merged = base_context(request, deps, session)
+    merged.update(context)
+    return merged
 
 
 def make_env() -> jinja2.Environment:

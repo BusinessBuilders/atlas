@@ -15,6 +15,11 @@
   {% if switched %}
   <p class="notice notice-ok">Switched. The next caller is answered by {{ switched }}.</p>
   {% endif %}
+  {# Both of these are resolved against the real cards before they get here, so
+     the URL cannot put a sentence — or a model's name — on this page. #}
+  {% if already %}
+  <p class="notice notice-ok">That model is already answering. Nothing changed.</p>
+  {% endif %}
 </div>
 
 {% if error %}
@@ -59,10 +64,16 @@
   {% endfor %}
 </div>
 
+{% endblock %}
+
+{% block overlay %}
 {% if confirming %}
 {# Server-rendered open dialog: the confirm step works with or without
-   JavaScript, which the page's CSP would not let us add inline anyway. #}
-<dialog class="confirm" open aria-labelledby="confirm-title">
+   JavaScript, which the page's CSP would not let us add inline anyway. It
+   lives in the `overlay` block — OUTSIDE the shell, which base.html marks
+   `inert` while this is open — and says `aria-modal` so a screen reader reads
+   it as the only thing on the page, which `inert` has now made true. #}
+<dialog class="confirm" open aria-modal="true" aria-labelledby="confirm-title">
   <form method="post" action="/brain" class="stack-16">
     <h2 class="display display-m flush" id="confirm-title">Switch to {{ confirming.label }}?</h2>
     <p class="muted flush">Every call from now on is answered by

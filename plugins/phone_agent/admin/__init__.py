@@ -53,6 +53,7 @@ SECURITY_HEADERS = {
 # then, and so no page load costs a disk read on the loop that carries calls.
 BUNDLED = {
     "/static/app.css": ("app.css", "text/css"),
+    "/static/app.js": ("app.js", "application/javascript"),
     "/static/htmx.min.js": ("htmx.min.js", "application/javascript"),
 }
 

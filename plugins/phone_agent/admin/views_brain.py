@@ -72,16 +72,20 @@ def _require_whole_line(deps, request, session):
 
 
 def _page(request, deps, session, *, confirming=None, error="", switched="",
-          status_code=200):
+          already="", status_code=200):
     cards = brain_cards(deps)
     chosen = next((c for c in cards if c["key"] == confirming), None)
     # The confirmation names the model the owner recognises, not its key in the
     # config file — and resolving it against the real cards means the URL
     # cannot put words of its own on the page.
     just_switched = next((c["label"] for c in cards if c["key"] == switched), "")
+    # Same resolution for "you already have that one": the message appears only
+    # for a model that really exists AND is really the one answering.
+    already_active = any(c["key"] == already and c["active"] for c in cards)
     return render.page(
         request, deps, "brain.html", session=session, status=status_code,
         cards=cards, confirming=chosen, error=error, switched=just_switched,
+        already=already_active, dialog_open=chosen is not None,
         active_card=next((c for c in cards if c["active"]), None))
 
 
@@ -93,7 +97,8 @@ async def brain(request: web.Request) -> web.Response:
         return refused
     return _page(request, deps, session,
                  confirming=request.query.get("switch", "") or None,
-                 switched=request.query.get("switched", ""))
+                 switched=request.query.get("switched", ""),
+                 already=request.query.get("already", ""))
 
 
 async def switch_brain(request: web.Request) -> web.Response:
@@ -116,7 +121,10 @@ async def switch_brain(request: web.Request) -> web.Response:
                      error="That model is not set up on this line any more. "
                            "Reload the page and pick one of the models below.")
     if wanted == active:
-        raise web.HTTPSeeOther("/brain")
+        # A page left open while somebody else switched can still offer "use
+        # this model" for the model that is already answering. Redirecting in
+        # silence looks exactly like a click that did nothing.
+        raise web.HTTPSeeOther(f"/brain?already={wanted}")
 
     card = next(c for c in brain_cards(deps) if c["key"] == wanted)
     if card["health"]["reachable"] is False and not override:

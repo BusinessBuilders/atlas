@@ -392,7 +392,7 @@ async def test_the_band_says_how_old_the_answer_is_and_never_probes(line):
 
     async def snapshot():
         probed.append(1)
-        return health_ok.__wrapped__() if False else await health_ok()
+        return await health_ok()
 
     page = await _page(line, health=snapshot)
     assert "Checked" in page and "ago" in page
@@ -622,6 +622,47 @@ async def test_switching_asks_first_and_names_the_model(two_brains):
     assert "qwen2.5:7b-instruct" in page
     assert "applies to the next call" in page
     assert 'name="csrf"' in page
+
+
+async def test_the_page_behind_the_confirm_dialog_cannot_be_used(two_brains):
+    """`<dialog open>` rendered by the server is NOT modal: everything behind
+    it stays tabbable and clickable, so a keyboard user tabs straight out of
+    the question and into the navigation. `inert` takes the page behind out of
+    the tab order and out of the screen reader, with no JavaScript."""
+    asking = await _page(two_brains, "/brain?switch=local_qwen")
+    assert '<div class="shell" inert>' in asking
+    assert '<nav class="tabbar" inert' in asking
+    assert 'aria-modal="true"' in asking
+
+    ordinary = await _page(two_brains, "/brain")
+    assert " inert" not in ordinary
+
+
+async def test_switching_to_the_model_that_already_answers_says_so(two_brains):
+    """A stale page can offer "use this model" for the model that is already
+    answering. Redirecting in silence looks like the click did nothing."""
+    async with dashboard(two_brains) as dash:
+        await dash.client.sign_in("line-code")
+        token = await dash.client.csrf("/brain")
+        response = await dash.client.post(
+            "/brain", {"csrf": token, "brain": "cloud_test"})
+        assert response.status == 303
+        assert response.headers["Location"] == "/brain?already=cloud_test"
+        page = await (await dash.client.get("/brain?already=cloud_test")).text()
+
+    assert "That model is already answering." in page
+    assert two_brains.ACTIVE_BRAIN == "cloud_test"
+
+
+async def test_a_made_up_already_value_puts_no_words_on_the_page(two_brains):
+    """Resolved against the real cards, like ?switched= — the URL cannot put a
+    sentence on the page, and it cannot claim a model that is not answering."""
+    quiet = await _page(two_brains, "/brain?already=local_qwen")
+    assert "already answering" not in quiet
+
+    invented = await _page(two_brains, "/brain?already=Call+this+number+now")
+    assert "already answering" not in invented
+    assert "Call this number now" not in invented
 
 
 async def test_a_switch_without_the_csrf_token_changes_nothing(two_brains):

@@ -462,6 +462,34 @@ async def test_the_bundled_assets_are_served_from_this_machine(line):
         assert "unpkg.com" in body                   # …and where it came from
 
 
+async def test_the_sign_in_button_says_when_it_is_working(line):
+    """A button that looks unpressed while the server is checking gets pressed
+    again. The state is set by an external script served from this machine —
+    the page's CSP allows no inline script, and none is used."""
+    async with dashboard(line) as dash:
+        page = await (await dash.client.get("/sign-in")).text()
+        response = await dash.client.get("/static/app.js")
+        script = await response.text()
+        stylesheet = await dash.client.get("/static/app.css")
+
+    assert response.status == 200
+    assert response.content_type in ("application/javascript", "text/javascript")
+
+    # cache-busted by the same bundle digest the stylesheet carries
+    version = page.split("/static/app.css?v=", 1)[1].split('"', 1)[0]
+    assert version and f'/static/app.js?v={version}"' in page
+    assert stylesheet.status == 200
+
+    # the words are in the template, where a reseller's copy lives; the script
+    # only carries them from the attribute onto the button
+    assert 'data-busy-label="Checking…"' in page
+    assert "data-busy-label" in script
+    assert "button.disabled = true" in script
+    assert "eval(" not in script
+    for handler in ("onsubmit", "onclick", "innerHTML"):
+        assert handler not in script
+
+
 # --------------------------------------------------------------- tenancy ---
 
 async def test_an_owner_of_one_business_reads_only_that_business(tmp_path,
