@@ -117,7 +117,7 @@ cd <the checkout you work in>          # NOT ~/atlas-phone-deploy
 PYTHONPATH=$PWD:$PWD/src python -m pytest -q -W error tests/test_phone_agent*.py
 ```
 
-Expected: `711 passed`. This is also the websocket simulation the cutover plan
+Expected: `722 passed`. This is also the websocket simulation the cutover plan
 calls for — `tests/test_phone_agent_hardening.py` and
 `tests/test_phone_agent_runtime.py` open real websockets to the real relay
 handler and assert what happened to the caller's message through a malformed

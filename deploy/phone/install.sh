@@ -13,7 +13,10 @@ set -euo pipefail
 
 DEPLOY_DIR_NAME="atlas-phone-deploy"      # the path baked into the unit files
 UNITS=(atlas-phone-bridge.service atlas-phone-tunnel.service atlas-phone-alert@.service)
-PYDEPS=(aiohttp jinja2)
+# Pinned to the major versions this code is written and tested against. An
+# unpinned re-install the day aiohttp 4 lands would take a live phone line down
+# on a dependency nobody chose to upgrade.
+PYDEPS=("aiohttp>=3.9,<4" "jinja2>=3.1,<4")
 
 die() { echo "[phone-install] ERROR: $*" >&2; exit 1; }
 say() { echo "[phone-install] $*"; }

@@ -28,7 +28,10 @@
                  autocomplete="current-password" required
                  aria-describedby="code-hint"
                  {% if not error %}autofocus{% endif %}>
-          <p id="code-hint" class="hint">The code from your setup email.</p>
+          {# Nothing in this product sends a setup email, and the hint used to
+             say one had. A person hunting an inbox for a message that was
+             never sent does not sign in. #}
+          <p id="code-hint" class="hint">The access code you were given.</p>
         </div>
         {# data-busy-label: app.js puts this on the button while the server is
            checking, so a pressed button stops looking unpressed. With

@@ -208,17 +208,21 @@ def line_status(*, health: dict, numbers: dict, profiles, last_call_at=None,
 
 
 # ------------------------------------------------------ production safety --
-# A Brain carries no "is this licensed for business use" field, so the label is
-# the signal: an owner (or the installer) writes "test only" into the label of
-# a backend whose plan forbids answering real customers. If a `production` flag
-# is ever added to [brains.*], read it here first and keep the label rule as
-# the fallback.
+# A Brain carries no "is this licensed for business use" field, so the LABEL is
+# the signal, and the only one: whoever sets the line up writes "test only"
+# into the label of a backend whose plan forbids answering real customers, and
+# that phrase is what draws the red banner. It is documented in three places a
+# person setting up a line reads — businesses.example.toml under [brains.*],
+# the plugin README's brains section, and step 3 of the deploy runbook —
+# because a rule nobody is told about is a banner that never appears.
+#
+# This used to read a `production` flag first. There is no such key: the brain
+# parser refuses any setting it does not know, so the flag could never be set
+# and the check was dead. If a real flag is added later, read it here first and
+# keep the label rule as the fallback.
 
 def is_test_only(brain) -> bool:
     """True when this backend's label says it is not for real customers."""
-    production = getattr(brain, "production", None)
-    if production is False:
-        return True
     return "test only" in str(getattr(brain, "label", "")).lower()
 
 

@@ -16,8 +16,8 @@
 
 {# A model whose own label says "test only" is answering real customers. That
    is a banner, not a chip — the audit found this exact condition live with
-   nothing on screen about it. There is no `production` flag on a model yet, so
-   the label is the signal; add the flag and this reads it first. #}
+   nothing on screen about it. The label is the signal (see status.is_test_only)
+   and the setup docs say so. #}
 {% if test_only_brain %}
 <div class="banner banner-bad" role="alert">
   <span class="banner-icon">{{ icon("warn", 24) }}</span>

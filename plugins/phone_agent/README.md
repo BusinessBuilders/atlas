@@ -663,7 +663,7 @@ business.
 ## Checking the code yourself
 
 ```bash
-# the whole suite (711 tests): handlers over real sockets, a real model
+# the whole suite (722 tests): handlers over real sockets, a real model
 # backend, a real notification receiver, a real database
 PYTHONPATH=<checkout>:<checkout>/src python -m pytest -q -W error \
     tests/test_phone_agent*.py

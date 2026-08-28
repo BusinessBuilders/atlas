@@ -10,6 +10,7 @@ import configparser
 import filecmp
 import http.server
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -20,6 +21,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 UNITS = REPO / "deploy" / "systemd"
 PHONE = REPO / "deploy" / "phone"
+PLUGIN = REPO / "plugins" / "phone_agent"
 
 BRIDGE_UNIT = UNITS / "atlas-phone-bridge.service"
 TUNNEL_UNIT = UNITS / "atlas-phone-tunnel.service"
@@ -211,6 +213,50 @@ def test_install_never_tells_anyone_to_restart_the_phone_line():
     assert "systemctl --user restart" not in text
     assert "README.md" in text          # it points at the runbook instead
     assert "Cutover" in text
+
+
+def _prose(path: Path) -> str:
+    """A document as one line of plain words — markdown emphasis, code ticks,
+    comment hashes and line wrapping taken out — so an assertion about a
+    sentence does not depend on where the sentence happened to wrap."""
+    text = path.read_text(encoding="utf-8")
+    for mark in ("`", "*", "#"):
+        text = text.replace(mark, "")
+    return re.sub(r"\s+", " ", text)
+
+
+SETUP_DOCS = (PHONE / "README.md", PLUGIN / "README.md",
+              PLUGIN / "businesses.example.toml")
+
+
+def test_every_setup_document_says_which_label_draws_the_safety_banner():
+    """The red "not licensed for business use" banner is drawn by the words
+    "test only" in a backend's label, and by nothing else. A rule nobody is
+    told about is a banner that never appears — which is how a live line ran
+    for weeks on a coding plan under a green Overview. All three documents a
+    person sets a line up from have to say it, with an example label to copy."""
+    for path in SETUP_DOCS:
+        prose = _prose(path)
+        assert '— test only"' in prose, f"no example label to copy in {path}"
+        assert "red banner" in prose.lower(), f"{path} does not say what it draws"
+
+
+def test_every_setup_document_says_to_give_each_business_its_own_push_topic():
+    """The line-wide push address belongs to whoever runs the line. Every
+    business left on it pushes to that one topic, so one subscription reads
+    everybody's messages."""
+    for path in SETUP_DOCS:
+        assert "give every business its own" in _prose(path).lower(), \
+            f"{path} does not say to give each business its own push topic"
+
+
+def test_install_pins_the_two_libraries_the_bridge_needs():
+    """A re-install is run on a line that is already carrying customers. An
+    unpinned dependency means the next major release of aiohttp or jinja2
+    installs itself into a phone line on a day nobody chose."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.startswith("PYDEPS="))
+    assert line == 'PYDEPS=("aiohttp>=3.9,<4" "jinja2>=3.1,<4")'
 
 
 def test_install_tells_you_how_to_make_the_checkout_correctly():

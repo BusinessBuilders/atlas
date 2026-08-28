@@ -749,6 +749,44 @@ async def test_the_line_default_is_labelled_as_the_default(tmp_path,
     assert "https://push.line.test/the-line" in page
 
 
+async def test_a_scoped_owner_is_not_shown_the_lines_own_push_address(
+        tmp_path, monkeypatch):
+    """Two businesses on one line can both fall back to the line's own push
+    address. Naming that address to the owner of one hands them the
+    subscription to their neighbours' messages, and they cannot change the
+    line's default anyway — the answer is a topic of their own, which the
+    screen already asks them for."""
+    monkeypatch.setenv("PHONE_OWNER_JO_TOKEN", "jo-code")
+    svc = _import_service(
+        tmp_path, monkeypatch,
+        extra_env={"ADMIN_TOKEN": "line-code",
+                   "NTFY_URL": "https://push.line.test",
+                   "NTFY_TOPIC": "neighbours-topic"},
+        cfg_extra=ONE_BUSINESS)
+
+    async def fake_push(target, *, title, body, priority=None, session=None):
+        return True, ""
+
+    monkeypatch.setattr(svc, "push_ntfy", fake_push)
+    async with dashboard(svc) as dash:
+        await _signed_in(dash, "jo-code")
+        raw = await (await dash.client.get("/notifications/acme")).text()
+        csrf = raw.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        response = await dash.client.post("/notifications/acme/test",
+                                          {"csrf": csrf})
+        receipt = await response.text()
+
+    # They are still told WHERE their messages go, in words…
+    assert "using the line" in _text(raw) and "own alert address" in _text(raw)
+    assert response.status == 200, _text(receipt)
+    assert "Test alert sent to the line's own alert address" in _text(receipt)
+    # …and the address itself is in neither page. Hunted in the RAW markup,
+    # because most of a value reaches a page inside a value= attribute.
+    for page in (raw, receipt):
+        assert "push.line.test" not in page
+        assert "neighbours-topic" not in page
+
+
 # ============================================================== the activity ==
 
 async def test_activity_lists_the_change_with_its_diff_and_puts_it_back(line):

@@ -906,6 +906,18 @@ class CallStore:
             return int(self.conn.execute(
                 "DELETE FROM sessions WHERE owner_key = ?", (str(owner_key),)).rowcount)
 
+    def delete_all_sessions(self) -> int:
+        """Log EVERY owner out. Returns how many sign-ins were cleared.
+
+        The service calls this once at boot, so a restart is what makes a
+        rotated access code stick: a session row is resolved by the owner it
+        belongs to, not by the code it was issued against, so without this a
+        cookie handed out before the rotation would keep working for another
+        fourteen idle days.
+        """
+        with self._lock, self.conn:
+            return int(self.conn.execute("DELETE FROM sessions").rowcount)
+
 
 def default_db_path() -> str:
     """Where the store lives: $PHONE_DATA_DIR/calls.db, default

@@ -109,6 +109,14 @@ FALLBACK_SAY_NO_FORWARD = (
     "Thanks for calling {business_name}. We're sorry — we can't take your call "
     "right now. Please try again in a few minutes."
 )
+# And what they hear when that forward rings out. Word for word the sentence
+# the live line speaks in the same situation (service.action_response_twiml),
+# so a caller gets the same answer whether the bridge was up or down. Without
+# it a <Dial> nobody answers ends the call in silence, which reads to the
+# caller as the business hanging up on them.
+FALLBACK_SAY_NO_ANSWER = (
+    "Sorry, no one could pick up. Please call back and leave a message."
+)
 
 
 @dataclass(frozen=True)
@@ -252,14 +260,16 @@ def api_params(changes: dict) -> dict:
 def render_fallback(business_name: str, forward_to: str) -> str:
     """The TwiML the VPS serves when this machine cannot answer.
 
-    With a forward number the caller is put through to a person; without one
-    they get an apology and the call ends. Both are one short sentence: a
-    caller who reached the fallback is already waiting.
+    With a forward number the caller is put through to a person, and told
+    something if that person does not pick up; without one they get an apology
+    and the call ends. Both are one short sentence: a caller who reached the
+    fallback is already waiting.
     """
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     if forward_to:
         say = FALLBACK_SAY_CONNECTING.format(business_name=business_name)
-        action = f"<Dial><Number>{xml_escape(forward_to)}</Number></Dial>"
+        action = (f"<Dial><Number>{xml_escape(forward_to)}</Number></Dial>"
+                  f"<Say>{xml_escape(FALLBACK_SAY_NO_ANSWER)}</Say>")
     else:
         say = FALLBACK_SAY_NO_FORWARD.format(business_name=business_name)
         action = "<Hangup/>"

@@ -648,6 +648,28 @@ def test_a_business_with_a_forward_number_gets_dialled_through():
     assert root.find("Hangup") is None
 
 
+def test_a_forward_that_rings_out_is_not_silence():
+    """A <Dial> with nothing after it ends the call in silence when nobody
+    picks up, and a caller hears silence as being hung up on."""
+    tc = twilio_config_module()
+    root = ET.fromstring(tc.render_fallback("Acme Plumbing", "+15085550100"))
+    assert [child.tag for child in root] == ["Say", "Dial", "Say"]
+    assert (root.findall("Say")[1].text or "") == (
+        "Sorry, no one could pick up. Please call back and leave a message.")
+
+
+def test_the_fallback_and_the_live_line_say_the_same_thing_on_no_answer(
+        tmp_path, monkeypatch):
+    """One situation, one sentence: the bridge speaks this when a transfer
+    rings out, and the fallback the VPS serves has to match it — otherwise the
+    caller gets a different answer depending on which machine happened to be
+    up."""
+    tc = twilio_config_module()
+    svc = _import_service(tmp_path, monkeypatch)
+    assert tc.FALLBACK_SAY_NO_ANSWER in svc.action_response_twiml(
+        "transfer", "+15085550100")
+
+
 def test_a_business_without_one_hears_an_apology_and_a_hangup():
     tc = twilio_config_module()
     xml = tc.render_fallback("Acme Plumbing", "")

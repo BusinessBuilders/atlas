@@ -479,6 +479,8 @@ async def test_two_businesses_get_two_pads_and_two_push_topics(tmp_path, monkeyp
     other_pad = tmp_path / "other-pad.md"
     cfg = _other_profile(pad=str(other_pad), ntfy_url=second_push.base_url,
                          ntfy_topic="other-topic", timezone_name="Asia/Tokyo")
+    # A reseller's own name, so the pad header has something to follow.
+    cfg += '\n[branding]\nvendor_name = "Acme Digital"\nproduct_name = "Reception"\n'
     try:
         async with phone_line(tmp_path, monkeypatch, cfg_extra=cfg) as line:
             await run_call(line, [setup_frame(), prompt_frame("hello")])
@@ -495,6 +497,11 @@ async def test_two_businesses_get_two_pads_and_two_push_topics(tmp_path, monkeyp
             # and the second business's pad is stamped in ITS timezone
             assert "JST" in other
             assert datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d") in other
+            # Both pads are files the owner reads, so both are headed with
+            # whoever's product this line is — never this repository's name.
+            header = "# Phone messages — Acme Digital Reception\n"
+            assert acme_pad.startswith(header)
+            assert other.startswith(header)
     finally:
         await second_push.stop()
 

@@ -26,8 +26,15 @@ Entries look like this (the format service.format_message_entry writes):
 
 Usage:
     python migrate_pad.py --pad ~/atlas-phone-messages.md \\
-        --db ~/.local/share/atlas-phone/calls.db --profile business_builders
+        --db ~/.local/share/atlas-phone/calls.db --profile business_builders \\
+        --mark-done
     python migrate_pad.py --pad … --db … --dry-run
+
+`--mark-done` imports the history as already answered. Without it every entry
+lands as a message waiting, and the first Overview the owner ever opens reads
+"N messages waiting · oldest 5 weeks ago" about calls somebody dealt with last
+month. Nothing is hidden either way: a message marked done is on the Messages
+screen under Done, with its note and its call.
 
 Idempotent: a CallSid already in the store is skipped, so running it twice
 imports nothing the second time. Exit code 0 when everything parsed, 1 when
@@ -101,9 +108,18 @@ def _pad_time(when: str) -> float:
     return datetime.strptime(when, "%Y-%m-%d %H:%M").astimezone().timestamp()
 
 
-def import_entries(store, entries: list, profile_key: str) -> dict:
-    """Write each entry as a minimal call + its message. Returns counts."""
-    counts = {"imported": 0, "skipped": 0, "duplicate": 0, "test": 0}
+def import_entries(store, entries: list, profile_key: str,
+                   mark_done: bool = False) -> dict:
+    """Write each entry as a minimal call + its message. Returns counts.
+
+    `mark_done` imports the history as answered rather than waiting. A pad
+    entry is a message somebody already dealt with weeks ago; imported at the
+    default `new`, a year of them lands in the owner's inbox and the first
+    Overview they ever see reads "N messages waiting · oldest 5 weeks ago".
+    Nothing is deleted either way — a message marked done is still on the
+    Messages screen under Done, with its note and its call.
+    """
+    counts = {"imported": 0, "skipped": 0, "duplicate": 0, "test": 0, "done": 0}
     seen: set = set()
     for entry in entries:
         if store.get_call(entry["call_sid"]) is not None:
@@ -123,9 +139,17 @@ def import_entries(store, entries: list, profile_key: str) -> dict:
                          "", "", is_test=is_test)
         store.end_call(entry["call_sid"], outcome, "imported from the message pad",
                        entry["caller_turns"], [])
-        store.add_message(entry["call_sid"], profile_key, None, None, None, None, note)
+        message_id = store.add_message(entry["call_sid"], profile_key, None, None,
+                                       None, None, note)
+        if mark_done:
+            # No note: that column is the owner's own words about what they did,
+            # and this tool did not do anything on their behalf.
+            store.set_message_status(message_id, "done")
+            counts["done"] += 1
         # The pad's timestamp is the truth about when the call happened; the
-        # rows above were stamped "now" by the store, as live calls are.
+        # rows above were stamped "now" by the store, as live calls are — and
+        # marking one done above stamped `updated_at` again, which the write
+        # below puts back to the moment the caller actually rang.
         with store.conn:
             store.conn.execute(
                 "UPDATE calls SET started_at = ?, ended_at = NULL, duration_s = NULL "
@@ -147,6 +171,9 @@ def main(argv=None) -> int:
                         help="profile key these messages belong to")
     parser.add_argument("--dry-run", action="store_true",
                         help="parse and count, write nothing")
+    parser.add_argument("--mark-done", action="store_true",
+                        help="import every entry as already answered instead of "
+                             "waiting — old messages are history, not an inbox")
     args = parser.parse_args(argv)
 
     try:
@@ -167,7 +194,9 @@ def main(argv=None) -> int:
         print(f"unparseable (no CallSid): {unparseable}")
 
     if args.dry_run:
-        print(f"would import: {len(entries)}  (dry run — nothing written)")
+        state = "already answered" if args.mark_done else "waiting"
+        print(f"would import: {len(entries)} as {state}  "
+              f"(dry run — nothing written)")
         return 1 if unparseable else 0
 
     db_dir = os.path.dirname(os.path.abspath(args.db))
@@ -180,11 +209,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
     try:
-        counts = import_entries(store, entries, args.profile)
+        counts = import_entries(store, entries, args.profile,
+                                mark_done=args.mark_done)
     finally:
         store.close()
 
     print(f"imported: {counts['imported']}")
+    if args.mark_done:
+        print(f"marked as already answered: {counts['done']}")
     print(f"skipped (already imported): {counts['skipped']}")
     if counts["duplicate"]:
         print(f"skipped (same CallSid twice in the pad): {counts['duplicate']}")

@@ -21,6 +21,7 @@ import importlib.util
 import logging
 import sys
 from http.cookies import SimpleCookie
+from pathlib import Path
 
 import aiohttp
 import pytest
@@ -212,6 +213,11 @@ async def test_the_sign_in_page_names_the_product_not_an_env_var(line):
     async with dashboard(line) as dash:
         page = await (await dash.client.get("/sign-in")).text()
     assert "Access code" in page
+    # The hint must not promise a process this product does not have: nothing
+    # here sends a setup email, and somebody hunting their inbox for one never
+    # signs in.
+    assert "The access code you were given." in page
+    assert "setup email" not in page
     assert 'autocomplete="current-password"' in page
     assert 'for="code"' in page and 'id="code"' in page
     assert 'aria-live="assertive"' in page
@@ -469,6 +475,26 @@ async def test_signing_out_everywhere_ends_every_session(line):
         response = await dash.client.post("/sign-out-all", {"csrf": token})
         assert response.status == 303
         assert dash.store.get_session(elsewhere) is None
+
+
+async def test_a_restart_signs_everyone_out(line):
+    """Rotating a leaked access code has to actually end the sessions it was
+    leaked to. A session row is resolved by the owner it belongs to, not by
+    the code it was issued against, so the restart that picks up the new code
+    is what kills the old cookies — the service clears every sign-in at boot,
+    before the dashboard is built."""
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("line-code")
+        session_id = dash.client.cookies["phone_session"]
+        assert dash.store.get_session(session_id) is not None
+
+        assert line.sign_everyone_out(dash.store) == 1     # what boot does
+        assert dash.store.get_session(session_id) is None
+        assert (await dash.client.get("/", allow_redirects=False)).status == 302
+
+    # …and boot really does it, before the dashboard exists to be signed into.
+    boot = Path(line.__file__).read_text(encoding="utf-8").split("if OWNERS:", 1)[1]
+    assert boot.index("sign_everyone_out(STORE)") < boot.index("build_admin_app")
 
 
 # -------------------------------------------------------------- headers ----

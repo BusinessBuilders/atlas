@@ -703,6 +703,16 @@ def test_delete_owner_sessions_logs_everyone_out(store):
     assert store.get_session(theirs) is not None
 
 
+def test_delete_all_sessions_signs_every_owner_out(store):
+    """What a restart does, so that rotating an access code ends the sessions
+    issued against the old one."""
+    everyone = [store.create_session("owner"), store.create_session("second_owner"),
+                store.create_session("_admin")]
+    assert store.delete_all_sessions() == 3
+    assert all(store.get_session(s) is None for s in everyone)
+    assert store.delete_all_sessions() == 0          # nothing left to clear
+
+
 def test_touching_an_unknown_session_raises(store):
     with pytest.raises(KeyError):
         store.touch_session("never-issued")
@@ -1054,6 +1064,42 @@ def test_migrate_pad_dry_run_writes_nothing(migrate_pad, callstore, pad_file, db
     store = callstore.CallStore(db_path)
     try:
         assert store.list_messages(["acme"], include_test=True) == []
+    finally:
+        store.close()
+
+
+def test_migrate_pad_marks_history_done_when_asked(migrate_pad, callstore, pad_file,
+                                                   db_path, capsys):
+    """Imported history is history, not an inbox: with --mark-done the first
+    Overview the owner ever opens does not say "3 messages waiting" about calls
+    somebody dealt with weeks ago. The messages are still all there, and still
+    stamped with the moment the caller actually rang."""
+    assert migrate_pad.main(["--pad", str(pad_file), "--db", db_path,
+                             "--profile", "acme", "--mark-done"]) == 0
+    assert "marked as already answered: 3" in capsys.readouterr().out
+
+    store = callstore.CallStore(db_path)
+    try:
+        messages = store.list_messages(["acme"], include_test=True)
+        assert len(messages) == 3
+        assert {m["status"] for m in messages} == {"done"}
+        assert store.count_messages(["acme"], status="new", include_test=True) == 0
+        # marking done must not have restamped them to the moment of the import
+        assert all(m["updated_at"] == m["created_at"] for m in messages)
+        assert all(m["created_at"] < time.time() - 86400 for m in messages)
+    finally:
+        store.close()
+
+
+def test_migrate_pad_leaves_messages_waiting_by_default(migrate_pad, callstore,
+                                                        pad_file, db_path, capsys):
+    """--mark-done is opt-in: without it nothing about the import changed."""
+    migrate_pad.main(["--pad", str(pad_file), "--db", db_path, "--profile", "acme"])
+    assert "marked as already answered" not in capsys.readouterr().out
+    store = callstore.CallStore(db_path)
+    try:
+        assert {m["status"] for m in
+                store.list_messages(["acme"], include_test=True)} == {"new"}
     finally:
         store.close()
 

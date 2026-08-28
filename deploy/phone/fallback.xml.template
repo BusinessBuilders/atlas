@@ -5,7 +5,8 @@
   Twilio fetches this when the normal voice webhook fails or times out — the
   bridge machine is off, the SSH tunnel is down, the house has no power. Without
   it the caller hears Twilio's own "an application error has occurred" and the
-  call ends; with it they hear one sentence and are put through to a person.
+  call ends; with it they hear one sentence and are put through to a person —
+  and one more sentence, rather than silence, if that person does not pick up.
 
   It lives on the VPS ON PURPOSE. A fallback served by the machine that just
   died is not a fallback.

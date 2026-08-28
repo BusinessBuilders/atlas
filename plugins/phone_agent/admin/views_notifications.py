@@ -32,23 +32,42 @@ TEST_TARGET = "ntfy_test"
 LOG_ROWS = 20
 
 
-def _targets(deps, profile: dict) -> dict:
-    """Where this business's messages go, and whether it chose that itself."""
+def _targets(deps, profile: dict, *, whole_line: bool) -> dict:
+    """Where this business's messages go, and whether it chose that itself.
+
+    The address a message actually lands on (`live_url`/`live_topic`) is put in
+    front of an owner only when it is theirs: either they see the whole line,
+    or this business has an address of its own. On a shared line two businesses
+    can both fall back to the line's own address, and naming it to the owner of
+    one hands them the subscription to their neighbours' messages — the same
+    leak the rest of these screens are scoped to prevent. They cannot change
+    the line's default anyway; the fix is to give each business its own topic.
+    """
     own_url = str(edit.setting(deps, profile, "ntfy_url")).strip()
     own_topic = str(edit.setting(deps, profile, "ntfy_topic")).strip()
     resolved = deps.delivery_targets(profile)
+    using_default = not (own_url and own_topic)
+    show_live = whole_line or not using_default
     return {
         "url": own_url, "topic": own_topic,
-        "using_default": not (own_url and own_topic),
-        "live_url": str(resolved.ntfy_url or ""),
-        "live_topic": str(resolved.ntfy_topic or ""),
+        "using_default": using_default,
+        "live_url": str(resolved.ntfy_url or "") if show_live else "",
+        "live_topic": str(resolved.ntfy_topic or "") if show_live else "",
         "anywhere": bool(resolved.ntfy_url and resolved.ntfy_topic),
     }
 
 
+def _target_name(targets: dict) -> str:
+    """What to call the address an alert went to. An owner who is not shown the
+    line's own address is not shown it in the receipt either."""
+    if targets["live_url"] and targets["live_topic"]:
+        return f"{targets['live_url'].rstrip('/')}/{targets['live_topic']}"
+    return "the line's own alert address"
+
+
 def gather(deps, session, key: str, *, values=None) -> dict:
     profile = edit.profile_of(deps, key)
-    targets = _targets(deps, profile)
+    targets = _targets(deps, profile, whole_line=session.sees_whole_line)
     rows, error = render.guarded_read("your alert history",
                                       deps.store.list_notify, [key],
                                       limit=LOG_ROWS)
@@ -177,7 +196,7 @@ async def send_test(request: web.Request) -> web.Response:
         return await render.page(request, deps, "refused.html", session=session,
                                  status=403, reason=reason)
     profile = edit.profile_of(deps, key)
-    targets = _targets(deps, profile)
+    targets = _targets(deps, profile, whole_line=session.sees_whole_line)
     name = edit.business_name(deps, key)
     if not targets["anywhere"]:
         return await _page(
@@ -207,7 +226,7 @@ async def send_test(request: web.Request) -> web.Response:
                     session.owner_key, key, failure)
     result = {
         "ok": sent,
-        "target": f"{targets['live_url'].rstrip('/')}/{targets['live_topic']}",
+        "target": _target_name(targets),
         "text": ("Sent. It should be on your phone now — if it is not, the push "
                  "server took it but your device is not subscribed to this "
                  "topic.") if sent

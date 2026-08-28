@@ -32,9 +32,13 @@
         <span class="tag tag-bad">Nowhere to send</span>
         {% endif %}
       </div>
+      {# The line's own address is named only to an owner who sees the whole
+         line: on a shared line it is the address the OTHER businesses fall
+         back to as well. `_targets` blanks it out for everyone else. #}
       {% if targets.using_default and targets.anywhere %}
       <p class="notice" role="status">This business is using the line's own
-        alert address — <span class="strong">{{ targets.live_url }}/{{ targets.live_topic }}</span>.
+        alert address{% if targets.live_url and targets.live_topic %} —
+        <span class="strong">{{ targets.live_url }}/{{ targets.live_topic }}</span>{% endif %}.
         Fill both boxes in below to send its messages somewhere of its own.</p>
       {% elif not targets.anywhere %}
       <p class="notice notice-bad" role="status">No push address is set up for

@@ -2965,7 +2965,10 @@ async def deliver_note(http: aiohttp.ClientSession, *, call_sid: str,
             new_pad = not os.path.exists(targets.messages_file)
             with open(targets.messages_file, "a", encoding="utf-8") as f:
                 if new_pad:
-                    f.write("# Phone messages — Atlas phone agent\n")
+                    # The pad is a file the owner reads. It carries whoever's
+                    # product this line is, not this repository's name.
+                    f.write(f"# Phone messages — {BRANDING.vendor_name} "
+                            f"{BRANDING.product_name}\n")
                 f.write(entry)
     except Exception as e:
         # The caller was told the owner would get back to them. A pad write we
@@ -4679,6 +4682,23 @@ async def health(_: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+def sign_everyone_out(store) -> int:
+    """Clear every dashboard sign-in. Called once at boot; returns the count.
+
+    This is what makes rotating an access code mean something. A session row
+    is resolved by the owner it belongs to, not by the code it was issued
+    against, so an owner who says "I think my code has leaked" needs the new
+    code AND a restart — after which every cookie handed out before now is
+    dead. Loud on purpose: the count goes in the journal, and a store that
+    cannot be written to raises here rather than leaving stale sign-ins alive.
+    """
+    cleared = store.delete_all_sessions()
+    log.info("owner dashboard: this restart signed out %d existing dashboard "
+             "sign-in(s) — everyone signs in again with the current access code",
+             cleared)
+    return cleared
+
+
 async def _serve() -> None:
     app = web.Application()
     app.router.add_post("/voice/incoming", voice_incoming)
@@ -4703,6 +4723,7 @@ async def _serve() -> None:
 
     if OWNERS:
         import admin
+        sign_everyone_out(STORE)
         admin_app = admin.build_admin_app(
             get_state=lambda: (NUMBERS, PROFILES),
             get_config=lambda: CONFIG,

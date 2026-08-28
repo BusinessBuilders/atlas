@@ -479,6 +479,21 @@ async def test_a_production_model_gets_no_banner(two_brains):
     assert "test model that isn't licensed" not in page
 
 
+async def test_the_label_is_the_only_thing_that_draws_the_banner(two_brains):
+    """There is no second signal — no `production` flag, nothing read from the
+    provider. Relabel the very same backend without those two words and the
+    banner is gone. That is why the three places somebody sets a line up from
+    all have to say to write it (see the deploy test that pins them)."""
+    status = load_admin().status
+    brain = two_brains.BRAINS["cloud_test"]
+    assert status.is_test_only(brain)
+    assert "test model that isn't licensed" in await _page(two_brains)
+
+    brain.label = "Cloud GLM"
+    assert not status.is_test_only(brain)
+    assert "test model that isn't licensed" not in await _page(two_brains)
+
+
 # ------------------------------------------- the undelivered-message alert --
 
 async def test_an_undelivered_message_can_be_acknowledged(line):
