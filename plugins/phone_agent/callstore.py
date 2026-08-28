@@ -380,8 +380,12 @@ class CallStore:
                    limit=100, offset=0) -> list:
         """The call log, newest first, scoped to the profiles the reader owns.
 
-        `q` searches the CallSid, the caller's number and the message fields —
-        never the transcript, which the retention purge is allowed to delete.
+        `q` searches the CallSid, the caller's number, the message fields AND
+        the transcript — the owner's search box promises "what was said", and
+        the words live in `turns`. A call whose words have aged out past its
+        retention window simply stops matching on them; its outcome, its number
+        and its message fields still do, which is exactly what the purge left
+        behind.
         """
         keys = [str(k) for k in profile_keys]
         if not keys:
@@ -411,8 +415,10 @@ class CallStore:
                 "IFNULL(m.callback, '') LIKE ? ESCAPE '\\' OR "
                 "IFNULL(m.email, '') LIKE ? ESCAPE '\\' OR "
                 "IFNULL(m.need, '') LIKE ? ESCAPE '\\' OR "
-                "IFNULL(m.summary, '') LIKE ? ESCAPE '\\')))")
-            params += [pattern] * 7
+                "IFNULL(m.summary, '') LIKE ? ESCAPE '\\')) "
+                "OR EXISTS (SELECT 1 FROM turns t WHERE t.call_sid = c.call_sid "
+                "AND t.text LIKE ? ESCAPE '\\'))")
+            params += [pattern] * 8
         params += [int(limit), int(offset)]
         with self._lock:
             rows = self.conn.execute(
@@ -546,17 +552,24 @@ class CallStore:
         return "(" + " OR ".join(parts) + ")", params
 
     def list_events(self, profile_keys, *, since=None, levels=None, limit=50,
-                    include_unscoped=False) -> list:
+                    include_unscoped=False, call_sid=None) -> list:
         """The operational events one owner may read, newest first.
 
         The dashboard's in-memory ring holds the last few minutes and dies with
         the process; this is what answers "when did this start" a week later,
         which is the whole reason the alerts list reads it and not the ring.
+
+        `call_sid` narrows it to one call, which is how a call's own page finds
+        the `no_info_note` a call that left no message still wrote — without
+        reading every event the line has recorded since.
         """
         scope = self._scope_clause(profile_keys, include_unscoped)
         if scope is None:
             return []
         where, params = [scope[0]], list(scope[1])
+        if call_sid is not None:
+            where.append("call_sid = ?")
+            params.append(str(call_sid))
         if since is not None:
             where.append("ts >= ?")
             params.append(float(since))
