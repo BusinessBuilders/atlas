@@ -82,6 +82,7 @@ Three things are deliberate:
 | The call store (calls, transcripts, messages) | `~/.local/share/atlas-phone/calls.db` (folder 700, file 600; `PHONE_DATA_DIR` moves it) |
 | The message file (plain text, append-only) | `~/atlas-phone-messages.md` |
 | The old hand-made directory | `~/atlas-phone-bridge.archived-<date>` (kept 30 days) |
+| The units as they were before the install | `~/atlas-phone-bridge.unit.backup-<date>`, `~/atlas-phone-tunnel.unit.backup-<date>` (step 1 — keep them as long as the archive) |
 
 The call store is the one file here that cannot be rebuilt from the repo: it
 holds what callers said and the messages they left. Back it up with the
@@ -123,31 +124,86 @@ handler and assert what happened to the caller's message through a malformed
 frame, a replayed token, an unwritable message file and a dead notification
 channel. A failure here is a reason not to cut over today.
 
-**b. The settings, validated exactly as the service will validate them:**
+**b. The settings, validated exactly as the service will validate them.** Run
+this from the same checkout as 0a — `~/atlas-phone-deploy` does not exist yet;
+step 1 is what creates it.
 
 ```bash
 set -a; . ~/.config/atlas-phone/env; set +a
-cd ~/atlas-phone-deploy    # or your development checkout
+cd <the checkout you work in>
 python3 plugins/phone_agent/service.py --check
 ```
 
+Use the same Python you just ran the suite with. If it answers
+`ModuleNotFoundError: aiohttp`, you are on a different interpreter — use that
+checkout's virtualenv (`.venv/bin/python`, or whatever it is called there).
+`~/atlas-phone-deploy/.venv` cannot help here: step 1 is what builds it.
+
 `--check` opens no database, no port and no network connection, so it is safe
-beside the live line. Expected: `…businesses.toml is valid.`, the list of
-businesses, the number count, the active model backend, the logins, and
-`Every environment variable this config names is set.` Anything else is one
-sentence saying what is wrong and exit code 1 — fix it before going on.
+beside the live line.
+
+**What you will actually see.** The service logs to the error output first, so
+INFO and WARNING lines come *before* the summary. On a config that is fine but
+has not been through steps 2 and 3 yet, all five of these are expected:
+
+```
+… WARNING WS_SECRET is not set — the relay still accepts the shared static WS_TOKEN …
+… INFO --check: validating …/businesses.toml only — no call store, no sockets
+… WARNING profile acme_plumbing has no timezone; using host zone EDT …
+… INFO 1 business profile(s) loaded: acme_plumbing …
+… INFO active brain: default (model qwen2.5:7b-instruct at http://127.0.0.1:11434/v1)
+…/businesses.toml is valid.
+  businesses: acme_plumbing
+  numbers:    1
+  brain:      default (qwen2.5:7b-instruct at http://127.0.0.1:11434/v1)
+  logins:     none
+Every environment variable this config names is set.
+```
+
+**The pass condition is the summary block plus exit code 0** — not silence. The
+`WS_SECRET` warning goes away after step 2, and the timezone warning after step
+3. A failure is different in kind: no summary block at all, one sentence saying
+what is wrong, and exit code 1.
 
 ## Step 1 — install, and keep a way back
 
+**Back up the installed units BEFORE running the installer.** `install.sh`
+overwrites both of them with the repo's versions, so a copy taken afterwards is
+a copy of the new file — and a "rollback" using it would restart the new code
+while you believed you were back on the old.
+
+**a. Make the checkout and copy the units aside — in that order, and stop at
+the `diff`:**
+
 ```bash
 cd ~/atlas && git worktree add --detach ~/atlas-phone-deploy feat/phone-agent-product
-~/atlas-phone-deploy/deploy/phone/install.sh ~/atlas-phone-deploy
 cp ~/.config/systemd/user/atlas-phone-bridge.service \
    ~/atlas-phone-bridge.unit.backup-$(date +%F)
+cp ~/.config/systemd/user/atlas-phone-tunnel.service \
+   ~/atlas-phone-tunnel.unit.backup-$(date +%F)
+# prove the backup is of the OLD unit — this MUST print differences
+diff ~/atlas-phone-bridge.unit.backup-$(date +%F) \
+     ~/atlas-phone-deploy/deploy/systemd/atlas-phone-bridge.service
+```
+
+Expected from the `diff`: **differences, and exit code 1.** That is the proof
+the backup was taken in time. If it prints nothing, the two files are already
+identical, which means the installer has run before and this "backup" is a copy
+of the new unit — **stop**, and find the previous unit another way (the
+archived directory, or the commit the deployment was on) before going on.
+
+On a machine that has never had these units, the `cp` lines fail with "No such
+file or directory". That is correct: there is nothing to roll back to, and the
+`diff` will say so too.
+
+**b. Then install, and write down where you are:**
+
+```bash
+~/atlas-phone-deploy/deploy/phone/install.sh ~/atlas-phone-deploy
 cd ~/atlas-phone-deploy && git log --oneline -1     # WRITE THIS DOWN
 ```
 
-Two details in the first command matter:
+Two details in the first command of (a) matter:
 
 - **`cd ~/atlas` first.** `git worktree add` only works from inside the repo.
 - **`--detach`.** A deployment is pinned to one exact commit, not following a
@@ -204,7 +260,18 @@ from an older build, the ones that matter are:
   must have one off, it also needs `ack_disclosure_waived = true`, which is
   refused at start-up if it is missing.
 
-Then run `--check` from step 0b again. Do not go on until it prints `is valid.`
+Then run the same check as step 0b again — this time it can run from the
+deployment itself, which now exists:
+
+```bash
+set -a; . ~/.config/atlas-phone/env; set +a
+cd ~/atlas-phone-deploy
+.venv/bin/python plugins/phone_agent/service.py --check
+```
+
+Do not go on until it prints the summary block ending in `Every environment
+variable this config names is set.` and exits 0. The two warnings from step 0b
+should be gone now: `WS_SECRET` was added in step 2, the timezones in step 3.
 
 ## Step 4 — bring the old messages in
 
@@ -261,30 +328,49 @@ console, or with `--apply-voice-url --yes` once you are sure.
 
 `--render` writes `deploy/phone/rendered/fallback-<digits>.xml`, one per
 number: a sentence and a transfer to that business's number, or a sentence and
-a hang-up when it has none. Copy it to the public server and serve it:
+a hang-up when it has none.
+
+**One number or several — the name on the server is not the same.** With
+exactly one number mapped, that number's fallback URL is the shared
+`…/fallback.xml`. The moment a second number exists, every number gets its own
+`…/fallback-<digits>.xml` instead, because one shared file can only name one
+business and can only forward to one person — a second business sharing it
+would hear the first one's apology. `--show` prints the right URL for each
+number on its "serve it on the VPS as …" line; that is the name to use.
 
 ```bash
+# ONE number: the shared name
 scp deploy/phone/rendered/fallback-<digits>.xml \
     <public server>:/var/www/atlas-phone/fallback.xml
+
+# TWO OR MORE: every file, each under its own name — do not rename any of them
+scp deploy/phone/rendered/*.xml <public server>:/var/www/atlas-phone/
+
 # on that server, as root: paste deploy/phone/nginx-phone-fallback.conf into
 # the server block that already proxies your /phone/ path, then
 nginx -t && systemctl reload nginx
 ```
 
-`nginx-phone-fallback.conf` carries its own installation notes, including the
-one trap: a `location ^~ /phone/` proxy block beats the regex block, which
-would send the per-number fallback files down the tunnel — exactly wrong when
-the tunnel is what is broken.
+`nginx-phone-fallback.conf` ships both locations for exactly this reason — an
+exact match for the shared name and a regex one for the per-number files. It
+carries its own installation notes, including the one trap: a
+`location ^~ /phone/` proxy block beats the regex block, which would send the
+per-number fallback files down the tunnel — exactly wrong when the tunnel is
+what is broken.
 
-**Prove it from your own machine before going near Twilio:**
+**Prove it from your own machine before going near Twilio.** Check **every**
+URL that `--show` printed on a "serve it on the VPS as …" line — one on a
+single-number line, one per number otherwise:
 
 ```bash
-curl -i "$(grep '^PUBLIC_BASE=' ~/.config/atlas-phone/env | cut -d= -f2- | tr -d '"')/fallback.xml"
+curl -i "<the exact URL --show printed for this number>"
 ```
 
 Expected: `HTTP/1.1 200`, `Content-Type: text/xml`, and a body containing
 `<Response>`. Anything else — 404, HTML, a redirect — means the fallback would
-not work. Fix that first.
+not work for that number. Fix that first. Checking only the shared
+`/fallback.xml` on a two-business line is how you would pass this step and
+still have `--apply` write two URLs that 404.
 
 **c. Then, and only then, write the settings Twilio should hold:**
 
@@ -295,7 +381,33 @@ not work. Fix that first.
 `--apply` writes only the fields that differ, prints each one, and never
 touches a setting it does not manage or the `voice_url`.
 
-## Step 6 — switch
+## Step 6 — make it survive a reboot
+
+`install.sh` deliberately enables nothing, and until something does, both unit
+files' `[Install] WantedBy=default.target` sits there doing nothing: the line
+would answer calls until the first reboot and then never come back — with
+nobody paged, because a unit that was never started cannot fail.
+
+```bash
+systemctl --user enable atlas-phone-bridge.service atlas-phone-tunnel.service
+loginctl enable-linger "$USER"      # so user services run without you logged in
+systemctl --user is-enabled atlas-phone-bridge.service atlas-phone-tunnel.service
+loginctl show-user "$USER" --property=Linger
+```
+
+Expected: `enabled` twice, then `Linger=yes`. `enable` on its own does not start
+anything — step 7 does that — and both commands are safe to run on a line that
+is already set up this way.
+
+Linger is the other half of it: without it, systemd stops your user's services
+when your last login session ends, so a machine that reboots to a login screen
+answers nothing until somebody logs in. If `enable-linger` asks for a password
+or refuses, run it with `sudo`.
+
+`atlas-phone-alert@.service` is deliberately NOT enabled and has no `[Install]`
+section: it is started by the other two units' `OnFailure=`, never by a target.
+
+## Step 7 — switch
 
 ```bash
 systemctl --user daemon-reload
@@ -315,12 +427,12 @@ Then move the old directory aside so nothing can accidentally run it again:
 mv ~/atlas-phone-bridge ~/atlas-phone-bridge.archived-$(date +%F)
 ```
 
-## Step 7 — verify, all of it, in order
+## Step 8 — verify, all of it, in order
 
 **a. The bridge answers locally.**
 
 ```bash
-curl -s http://127.0.0.1:8890/health
+curl -s "http://127.0.0.1:$(grep '^BRIDGE_PORT=' ~/.config/atlas-phone/env | cut -d= -f2- | tr -d '"')/health"
 ```
 
 Expected: exactly `{"status": "ok"}`. A 503 with a short reason means the line
@@ -390,14 +502,26 @@ Expected: `active` twice.
 
 **e. The dashboard.** Open the https address you publish it at, sign in with
 one owner's access code, and check the Overview's status band. Expected: five
-checks, and no red. "The phone network connection has not been confirmed today"
-is expected until the first real call arrives — it reads the time of the newest
-call in your call log.
+checks, and no red.
 
-**f. The outside monitor.** Whatever polls `PUBLIC_BASE/health` from off this
-machine should be green. It only reads the status code: 200 is up, 503 is
-degraded and pages. *(In this install that monitor is the `atlas-phone-line`
-tripwire.)*
+One amber check is expected until the first real call arrives: the phone-network
+one reads the time of the newest call in your call log, so it says either "No
+calls yet, so the phone network connection has not been confirmed" on a line
+whose log is empty, or "No calls in the last 24 hours, so the phone network
+connection has not been confirmed today" once there are older calls in it.
+Either wording is the same thing — nobody has rung the number today — and step
+h is what clears it.
+
+**f. The outside monitor — set one up now if there is not one.** Something off
+this machine has to poll `PUBLIC_BASE/health` and page a human on any non-200.
+Any uptime service will do; it only reads the status code (200 up, 503
+degraded). **This is not optional.** Every other alarm on this line is raised
+BY this machine: `OnFailure=` cannot page from a box that is off, unplugged or
+without power, and that is exactly when every caller hears the fallback and
+nobody knows. Without an outside poller, a machine that is off pages nobody.
+
+If one already exists, check it is green. *(In this install it is the
+`atlas-phone-line` tripwire.)*
 
 **g. The pager — once, deliberately. It sends a real notification.**
 
@@ -405,6 +529,11 @@ tripwire.)*
 systemctl --user start atlas-phone-alert@manual-test.service
 journalctl --user -u atlas-phone-alert@manual-test.service -n 5 --no-pager
 ```
+
+(This is the one time the pager is started by hand. It is a `oneshot` with no
+`[Install]` section, so it runs, pages, and exits — it can never be enabled or
+left running, and `manual-test` is not a real unit name, so nothing else reads
+it as a failure.)
 
 Expected: `paged ntfy about failed unit 'manual-test'` in the journal and a
 notification on the phone. An error about `NTFY_URL` / `NTFY_TOPIC` instead
@@ -424,21 +553,32 @@ the call's page shows the transcript.
 The old setup is still on disk. Put it back:
 
 ```bash
-systemctl --user stop atlas-phone-bridge.service
+systemctl --user stop atlas-phone-bridge.service atlas-phone-tunnel.service
 # the old code directory (use the date in its name)
 mv ~/atlas-phone-bridge.archived-<date> ~/atlas-phone-bridge
-# the old unit file (the copy from step 1)
+# BOTH old unit files (the copies from step 1 — the installer replaced both)
 cp ~/atlas-phone-bridge.unit.backup-<date> \
    ~/.config/systemd/user/atlas-phone-bridge.service
+cp ~/atlas-phone-tunnel.unit.backup-<date> \
+   ~/.config/systemd/user/atlas-phone-tunnel.service
+# read them back before starting anything: ExecStart must point at the OLD
+# code, not at ~/atlas-phone-deploy
+grep ExecStart ~/.config/systemd/user/atlas-phone-bridge.service
 systemctl --user daemon-reload
 systemctl --user start atlas-phone-bridge.service
-systemctl --user restart atlas-phone-tunnel.service
-curl -s http://127.0.0.1:8890/health
+systemctl --user start atlas-phone-tunnel.service
+curl -s "http://127.0.0.1:$(grep '^BRIDGE_PORT=' ~/.config/atlas-phone/env | cut -d= -f2- | tr -d '"')/health"
 ```
 
-The tunnel is restarted at the end because it only carries the port — it does
-not care which copy of the code is answering — so restarting it re-runs the
-guard and gives the restored line a fresh, working forward.
+That `grep` is the whole point of backing the units up before the install: if
+`ExecStart` still says `%h/atlas-phone-deploy`, you restored the NEW unit and
+the line you are about to start is the new code wearing the old name. Stop and
+fix the unit file first.
+
+The tunnel is stopped and started rather than left alone because its unit file
+was replaced too; starting it re-runs the guard and gives the restored line a
+fresh, working forward. It only carries the port, so it does not care which
+copy of the code is answering.
 
 Two things the rollback does **not** undo, on purpose:
 
@@ -461,7 +601,7 @@ git checkout --detach <the commit id from before the update>
 ./deploy/phone/install.sh ~/atlas-phone-deploy
 systemctl --user restart atlas-phone-bridge.service
 systemctl --user restart atlas-phone-tunnel.service
-curl -s http://127.0.0.1:8890/health
+curl -s "http://127.0.0.1:$(grep '^BRIDGE_PORT=' ~/.config/atlas-phone/env | cut -d= -f2- | tr -d '"')/health"
 ```
 
 ## If a settings change broke it
@@ -485,11 +625,11 @@ git fetch
 git checkout --detach <an exact commit id>
 ./deploy/phone/install.sh ~/atlas-phone-deploy   # picks up unit/dependency changes
 set -a; . ~/.config/atlas-phone/env; set +a
-python3 plugins/phone_agent/service.py --check   # before the restart, not after
+.venv/bin/python plugins/phone_agent/service.py --check   # before the restart
 systemctl --user restart atlas-phone-bridge.service
 systemctl --user restart atlas-phone-tunnel.service
 systemctl --user is-active atlas-phone-bridge.service atlas-phone-tunnel.service
-curl -s http://127.0.0.1:8890/health
+curl -s "http://127.0.0.1:$(grep '^BRIDGE_PORT=' ~/.config/atlas-phone/env | cut -d= -f2- | tr -d '"')/health"
 ```
 
 That commit id you wrote down is the whole rollback plan.

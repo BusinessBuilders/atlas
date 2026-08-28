@@ -196,10 +196,18 @@ python3 plugins/phone_agent/service.py --check
 
 `--check` validates the settings file and every environment variable that file
 names, prints what it found, and exits. It opens no database, no port and no
-network connection, so it is safe to run beside a live line. Good looks like
-this:
+network connection, so it is safe to run beside a live line.
+
+It talks twice. INFO and WARNING lines go to the error output **first**, and
+then the summary goes to the normal output. On a config that is valid but not
+finished yet, lines like these are expected, not failures:
 
 ```
+… WARNING WS_SECRET is not set — the relay still accepts the shared static WS_TOKEN …
+… INFO --check: validating …/businesses.toml only — no call store, no sockets
+… WARNING profile acme_plumbing has no timezone; using host zone EDT …
+… INFO 1 business profile(s) loaded: acme_plumbing …
+… INFO active brain: default (model qwen2.5:7b-instruct at http://127.0.0.1:11434/v1)
 /home/you/.config/atlas-phone/businesses.toml is valid.
   businesses: acme_plumbing
   numbers:    1
@@ -208,8 +216,11 @@ this:
 Every environment variable this config names is set.
 ```
 
-Anything wrong is one sentence on the error output and an exit code of 1. The
-same validation runs at boot and on every dashboard save, so a setting that
+**It passed if you got the summary block and exit code 0.** The two warnings
+above are the line telling you what is still worth setting: `WS_SECRET` in the
+secrets file, and a `timezone` on each business. A real failure looks nothing
+like this — no summary at all, one sentence saying what is wrong, exit code 1.
+The same validation runs at boot and on every dashboard save, so a setting that
 passes here cannot be refused later.
 
 ### 4. Install and start it
@@ -331,7 +342,9 @@ shown as **Line owner**.
 `[branding]` puts a reseller's name, product name, logo, support email, colours
 and fonts over the whole dashboard. Nothing in the templates names a colour, a
 font or a company; with no branding table the dashboard uses its own neutral
-dark palette and the system font.
+dark palette and the system font, and calls itself **Atlas · Phone Agent**
+until `vendor_name` and `product_name` say otherwise. If you are putting this
+in front of your own customers, set those two first.
 
 `[deleted_profiles.*]` holds a business removed on the dashboard — its settings
 exactly as they were, plus the date it went. Nothing that answers a call reads
@@ -659,6 +672,7 @@ fiction in them, are in
 | `twilio_config.py` | Shows and sets the four Twilio settings per number; renders the fallback answers. |
 | `migrate_pad.py` | One-shot import of the old Markdown message file. |
 | `plugin.py` | The one owner-facing tool, `phone_line_status`. |
+| `skill.md` | What that tool is for, in the form Atlas's tool catalogue reads. |
 | `businesses.example.toml` | Every setting, documented next to its default. |
 | `../../deploy/phone/` | Install, cutover and rollback — the runbook. |
 

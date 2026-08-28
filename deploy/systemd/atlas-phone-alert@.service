@@ -1,7 +1,12 @@
 [Unit]
 Description=Atlas phone line alert — push the failed unit %i to ntfy
-# Triggered only by OnFailure= on the phone units; there is no [Install]
-# section because nothing should ever enable or start this by hand.
+# Triggered by OnFailure= on the phone units. There is no [Install] section
+# because nothing should ever ENABLE this: it is not something a target wants,
+# it is something a failure summons.
+#
+# Starting one instance by hand is fine and the runbook does it exactly once,
+# as `atlas-phone-alert@manual-test.service`, to prove the pager really reaches
+# the owner's phone. It is a oneshot: it pages and exits.
 
 [Service]
 Type=oneshot
