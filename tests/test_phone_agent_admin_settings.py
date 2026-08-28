@@ -1270,3 +1270,28 @@ async def test_the_sign_in_page_says_it_is_shut_during_a_line_wide_lock(line):
     assert response.status == 429
     assert "closed to everybody" in page or "Too many wrong access codes" in page
     assert "disabled" in page
+
+
+async def test_a_refusal_keeps_your_typing_with_javascript_off_too(line):
+    """No htmx header, so this is a plain browser posting a plain form. A
+    redirect here would rebuild the page from the settings in force and throw
+    away everything typed — defect D.1 arriving by the back door."""
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        body = _text(await (await dash.client.get("/settings/acme")).text())
+        csrf = body.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        version = body.split('name="version" value="', 1)[1].split('"', 1)[0]
+        response = await dash.client.post("/settings/acme/transfer", {
+            "csrf": csrf, "version": version, "transfer_on": "on",
+            "forward_to": "ring the shop", "phrase": ["operator", "put me through"]})
+        page = _text(await response.text())
+
+    assert response.status == 400
+    assert "Location" not in response.headers
+    # the whole page came back, with what was typed still in the boxes
+    assert "ring the shop" in page
+    assert 'value="put me through"' in page
+    assert "not a phone number this line can dial" in page
+    # and every other section is still drawn, from the live settings
+    assert 'id="section-greeting"' in page and 'id="section-facts"' in page
+    assert "forward_to" not in line.PROFILES["acme"]

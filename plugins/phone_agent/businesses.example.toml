@@ -215,3 +215,19 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 #                                          # every chat request, under the
 #                                          # call's own keys (a preset can
 #                                          # never override model/stream).
+
+# ---------------------------------------------------------------------------
+# [deleted_profiles.<name>] — a business the owner REMOVED from the dashboard.
+#
+# You never write one of these by hand. Removing a business on the dashboard
+# moves its whole section down here word for word, adds the date it went, and
+# unhooks its phone numbers; Activity puts it back for thirty days. It is kept
+# out of everything that answers a call, and it is NOT validated as a working
+# profile — a business is often removed BECAUSE something in it was wrong, and
+# refusing to start over a business nobody answers as would make the removal
+# unrecoverable.
+#
+# [deleted_profiles.old_shop]
+# business_name = "Old Shop"
+# ...                                      # its settings, exactly as they were
+# deleted_at = "2026-08-27T09:00:00-04:00" # required: an ISO 8601 date+time

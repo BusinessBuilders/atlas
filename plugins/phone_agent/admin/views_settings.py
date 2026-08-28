@@ -577,12 +577,28 @@ async def _answer(request, deps, session, key: str, section: str, *,
         return render.partial(request, deps, f"_section_{section}.html",
                               session=session, status=status, section=context)
     if saved:
+        # Redirect, don't render: a receipt rendered onto the POST comes back on
+        # refresh, and "refresh re-saves" is not something to leave in a product.
         render.set_flash(request, session, SAVED_MESSAGE)
-    else:
-        render.set_flash(request, session,
-                         error or "That change was not saved — the reasons are "
-                                  "beside the fields below.")
-    raise web.HTTPSeeOther(f"/settings/{key}#section-{section}")
+        raise web.HTTPSeeOther(f"/settings/{key}#section-{section}")
+    # A REFUSAL is drawn, never redirected. A redirect would rebuild the page
+    # from the settings in force and throw away everything the owner typed —
+    # which is defect D.1 itself, arriving by the back door on a browser with
+    # no JavaScript.
+    page = await asyncio.to_thread(_page_with, deps, session, key, section,
+                                   context)
+    return await render.page(request, deps, "settings.html", session=session,
+                             status=status, flash="", **page)
+
+
+def _page_with(deps, session, key: str, section: str, refused: dict) -> dict:
+    """The whole Business screen, with one section drawn from what was
+    submitted instead of from the settings in force."""
+    page = page_context(deps, session, key)
+    for column in ("main_sections", "side_sections"):
+        page[column] = [refused if drawn["name"] == section else drawn
+                        for drawn in page[column]]
+    return page
 
 
 # ---------------------------------------------------- removing a business --

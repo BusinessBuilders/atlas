@@ -230,9 +230,13 @@ environment variable holding their token (never the token itself) and
 `[branding]` carries a reseller's `vendor_name`, `product_name`, `logo_path`,
 `support_email`, `colors` and `fonts`.
 
-Both tables are validated at boot, on `--check` and on every dashboard save,
-and both are preserved byte-for-byte through a save — an owner login written
-into the config cannot be lost by pressing Save. The dashboard reads them:
+`[deleted_profiles.<name>]` holds a business the owner removed on the
+dashboard: its settings exactly as they were, plus `deleted_at`. Nothing that
+answers a call reads it, and Activity puts it back for thirty days.
+
+All three tables are validated at boot, on `--check` and on every dashboard
+save, and all three are preserved byte-for-byte through a save — an owner login
+written into the config cannot be lost by pressing Save. The dashboard reads them:
 `[owners.jo]` lets Jo sign in and see only her businesses, and `[branding]`
 decides the name, logo, colours and fonts on every page. `ADMIN_TOKEN` still
 works: when it is set it appears as the implicit owner `_admin` with `["*"]`.
