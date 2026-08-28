@@ -49,10 +49,18 @@ class LineStatus:
         return tuple(c for c in self.checks if c.level != OK)
 
 
-def _brain_check(health: dict) -> Check:
+def _brain_check(health: dict, owner_brains) -> Check:
+    """The model that answers, plus any OTHER model this owner's businesses run
+    on that is not answering.
+
+    `owner_brains` is what keeps that second half honest on a shared line: an
+    owner of one business is told their own backend is down and is never told
+    the name of anybody else's.
+    """
     backend = str(health.get("model_backend", ""))
     others = [name for name in health.get("unreachable_brains") or []
-              if name != health.get("brain")]
+              if name != health.get("brain")
+              and (owner_brains is None or name in owner_brains)]
     if backend == "UNREACHABLE":
         why = str(health.get("probe_error", "")).strip()
         return Check("brain", "The model that answers", DOWN,
@@ -112,15 +120,19 @@ def _notify_check(health: dict, notify_failure) -> Check:
 
 
 def line_status(*, health: dict, numbers: dict, profiles, last_call_at=None,
-                notify_failure=None, now=None) -> LineStatus:
-    """The band across the top of the Overview."""
+                notify_failure=None, owner_brains=None, now=None) -> LineStatus:
+    """The band across the top of the Overview.
+
+    `owner_brains` names the model backends this reader's businesses actually
+    run on; None means every one on the line.
+    """
     moment = time.time() if now is None else float(now)
     bridge_ok = str(health.get("bridge", "")) == "ok"
     checks = (
         Check("answering", "Answering calls", OK if bridge_ok else DOWN,
               "Answering calls" if bridge_ok
               else "The phone service is not answering"),
-        _brain_check(health),
+        _brain_check(health, owner_brains),
         _twilio_check(last_call_at, moment),
         _numbers_check(numbers, profiles),
         _notify_check(health, notify_failure),

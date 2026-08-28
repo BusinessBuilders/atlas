@@ -132,6 +132,21 @@ def test_another_businesss_dead_model_is_still_amber():
     assert "backup" in band.summary
 
 
+def test_a_dead_model_that_is_not_this_owners_is_not_named_to_them():
+    """On a shared line, a backend key is a name the reseller chose for
+    somebody's business. An owner of one business is told about their own
+    backends and never about anyone else's."""
+    band = _status(health=_snapshot(unreachable_brains=["someone_elses"]),
+                   owner_brains={"local_qwen"})
+    assert band.level == "ok"
+    assert "someone_elses" not in band.summary
+
+    mine = _status(health=_snapshot(unreachable_brains=["mine"]),
+                   owner_brains={"local_qwen", "mine"})
+    assert mine.level == "warn"
+    assert "mine" in mine.summary
+
+
 def test_a_number_pointing_nowhere_takes_the_line_down():
     band = _status(numbers={})
     assert band.level == "down"
@@ -368,6 +383,19 @@ async def test_an_undelivered_message_can_be_acknowledged(line):
     assert line.public_health()[0] == 200
     kinds = [e["kind"] for e in line.STORE.list_events([], include_unscoped=True)]
     assert "delivery_failure_acknowledged" in kinds
+
+
+async def test_marking_nothing_as_seen_does_not_claim_it_did(line):
+    """The alert can clear itself between the page being drawn and the button
+    being pressed — saying "marked as seen" then would be a small lie."""
+    assert line.LAST_DELIVERY["ok"] is None
+    async with dashboard(line, health=line.health_snapshot) as dash:
+        await dash.client.sign_in("line-code")
+        token = await dash.client.csrf()
+        response = await dash.client.post("/acknowledge-delivery",
+                                          {"csrf": token})
+        assert response.status == 303
+        assert response.headers["Location"] == "/"
 
 
 async def test_acknowledging_needs_the_csrf_token(line):

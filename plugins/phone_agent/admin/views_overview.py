@@ -134,6 +134,25 @@ def gather(deps, session, *, now=None) -> dict:
     }
 
 
+def owner_brains(deps, session):
+    """The model backends this owner's businesses actually answer on.
+
+    An owner of the whole line gets None, which means "all of them". Anyone
+    else is told about their own backends only: a brain key is a name the
+    reseller chose, and it can belong to a business that is not theirs.
+    """
+    if session.sees_whole_line:
+        return None
+    brains, active = deps.get_brains()
+    _numbers, profiles = deps.get_state()
+    mine = {active}
+    for key in session.profile_keys:
+        chosen = str(profiles.get(key, {}).get("brain", "")).strip()
+        if chosen in brains:
+            mine.add(chosen)
+    return mine
+
+
 def scoped_numbers(deps, session) -> dict:
     """The phone numbers this owner's businesses answer on."""
     numbers, _profiles = deps.get_state()
@@ -198,7 +217,8 @@ async def overview(request: web.Request) -> web.Response:
     brain = active_brain(deps)
     band = status.line_status(
         health=health, numbers=numbers, profiles=session.profile_keys,
-        last_call_at=data["last_call_at"], notify_failure=data["notify_failure"])
+        last_call_at=data["last_call_at"], notify_failure=data["notify_failure"],
+        owner_brains=owner_brains(deps, session))
     stats = data["stats"] or {}
     per_day = stats.get("per_day") or []
     week_total = sum(int(d["calls"]) for d in per_day)
@@ -230,7 +250,8 @@ async def status_band(request: web.Request) -> web.Response:
     band = status.line_status(
         health=health, numbers=scoped_numbers(deps, session),
         profiles=session.profile_keys, last_call_at=data["last_call_at"],
-        notify_failure=data["notify_failure"])
+        notify_failure=data["notify_failure"],
+        owner_brains=owner_brains(deps, session))
     return render.partial(request, deps, "_status_band.html", session=session,
                           band=band, checked_at=health.get("probe_checked_at"))
 
@@ -248,7 +269,8 @@ async def health_detail(request: web.Request) -> web.Response:
     numbers = scoped_numbers(deps, session)
     band = status.line_status(
         health=health, numbers=numbers, profiles=session.profile_keys,
-        last_call_at=data["last_call_at"], notify_failure=data["notify_failure"])
+        last_call_at=data["last_call_at"], notify_failure=data["notify_failure"],
+        owner_brains=owner_brains(deps, session))
     body = dict(health)
     body["profiles"] = list(session.profile_keys)
     body["numbers"] = len(numbers)
@@ -258,6 +280,7 @@ async def health_detail(request: web.Request) -> web.Response:
         body.pop("unreachable_brains", None)
         body.pop("brain", None)
         body.pop("model", None)
+        body.pop("probe_error", None)     # can name the backend's own host
         body.pop("recent_events", None)
     body["line_status"] = {
         "level": band.level, "headline": band.headline,
@@ -281,5 +304,8 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
     if reason:
         return render.page(request, deps, "refused.html", session=session,
                            status=403, reason=reason)
-    await asyncio.to_thread(deps.acknowledge_delivery_failure, session.owner_key)
-    raise web.HTTPSeeOther("/?acknowledged=1")
+    acknowledged = await asyncio.to_thread(deps.acknowledge_delivery_failure,
+                                           session.owner_key)
+    # Only say "marked as seen" when there was something to mark: the alert may
+    # have cleared itself between the page being drawn and the button pressed.
+    raise web.HTTPSeeOther("/?acknowledged=1" if acknowledged else "/")
