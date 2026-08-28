@@ -46,26 +46,75 @@ SIGN_IN_KINDS = ("dashboard_signin", "dashboard_signin_failed",
 # neighbourhood — not the whole config file, which is what the stored diff
 # holds so that "put it back" can be exact.
 CONTEXT_LINES = 3
-_HEADER = re.compile(r"^[ +-]\[(profiles|deleted_profiles)\.([A-Za-z0-9_-]+)\]\s*$")
-
-
-def _diff_body(diff: str) -> list:
-    return [line for line in str(diff).splitlines()
-            if not line.startswith(("---", "+++", "@@", "\\"))]
+# A table header, and any table header at all. Both allow leading whitespace,
+# because TOML does: an indented `[profiles.x]` this did not recognise would
+# leave the walker attributing that business's lines to the PREVIOUS one, which
+# on a shared line is a leak rather than a cosmetic miss.
+_HEADER = re.compile(
+    r"^[ +-]\s*\[(profiles|deleted_profiles)\.([A-Za-z0-9_-]+)\]\s*$")
+_ANY_TABLE = re.compile(r"^[ +-]\s*\[")
+# TOML's multi-line string fence. A line inside one is text somebody wrote, not
+# a table header, however much it looks like one.
+_FENCE = '"' * 3
 
 
 def _walk(diff: str):
-    """(the business each line belongs to, the line) — "" outside any profile."""
+    """(the business each line belongs to, the line) — "" outside any profile.
+
+    This is a tenancy control, not a formatting nicety: `visible_diff` drops
+    every line it cannot attribute to the reader's own businesses, so anything
+    mis-attributed here is one business's settings shown to another. It is
+    written to fail CLOSED — a line it is unsure about belongs to no business,
+    and a scoped reader does not see it.
+
+    Three things it has to get right, in the order they bite:
+
+      * **A hunk boundary resets the table.** `@@` means the next line comes
+        from somewhere else in the file entirely, so a hunk starting in the
+        middle of a table belongs to no known one until a header says
+        otherwise. `config_diff` emits unlimited context and therefore a single
+        hunk today, but that is an invariant of one function — carrying the
+        current table across `@@` would silently become a leak the day
+        anything shortened it.
+      * **A header inside a multi-line string is not a header.** A triple-quoted
+        TOML value can hold a line reading exactly like a profile header. The
+        two sides of a diff are two different files, so the fence state is
+        tracked for each: a removed line is read against the old file's state,
+        an added one against the new file's, and a context line counts as
+        inside a string if EITHER thinks so — the direction that hides rather
+        than reveals.
+      * **Any other table ends the current one**, indented or not.
+    """
     current = ""
-    for line in _diff_body(diff):
-        header = _HEADER.match(line)
-        if header:
-            current = header.group(2)
-            yield current, line
+    in_old = in_new = False
+    for line in str(diff).splitlines():
+        if line.startswith(("---", "+++", "\\")):
             continue
-        if line[1:2] == "[" and line[:1] in " +-":
-            current = ""                       # some other table
+        if line.startswith("@@"):
+            current, in_old, in_new = "", False, False
+            continue
+        mark, text = line[:1], line[1:]
+        inside = (in_old or in_new) if mark == " " else (
+            in_old if mark == "-" else in_new)
+        if text.count(_FENCE) % 2:
+            if mark in " -":
+                in_old = not in_old
+            if mark in " +":
+                in_new = not in_new
+        if not inside:
+            header = _HEADER.match(line)
+            if header:
+                current = header.group(2)
+                yield current, line
+                continue
+            if _ANY_TABLE.match(line):
+                current = ""                   # some other table
         yield current, line
+
+
+def _diff_body(diff: str) -> list:
+    """Every content line of a diff, hunk and file headers dropped."""
+    return [line for _key, line in _walk(diff)]
 
 
 def sections_touched(diff: str) -> set:
@@ -130,13 +179,71 @@ def visible_diff(diff: str, keys=None) -> list:
     return shown
 
 
-def decorate_change(change: dict, keys=None) -> dict:
+def _named(names: list) -> str:
+    """"Acme Co", "Acme Co and Riverside", "Acme Co, Riverside and Third"."""
+    listed = list(names)
+    if len(listed) <= 1:
+        return listed[0] if listed else ""
+    return ", ".join(listed[:-1]) + " and " + listed[-1]
+
+
+def scoped_summary(deps, diff: str, keys) -> str:
+    """What this change did TO THIS OWNER'S businesses, in the owner's words.
+
+    The stored summary is written for whoever made the change and describes the
+    whole save: "Removed the business Other Co" is the truth, and it is not
+    this reader's truth to be told. So a scoped reader gets a sentence built
+    from the same filtered lines their diff is built from — never the stored
+    one — and the names come from the live config, not from the diff.
+    """
+    _numbers, profiles = deps.get_state()
+    mine = set(keys)
+    touched = sorted(sections_touched(diff) & mine)
+    names = [str((profiles.get(key) or {}).get("business_name", "")).strip()
+             or key for key in touched]
+    if names:
+        sentence = f"Settings changed for {_named(names)}"
+    else:
+        # It is on their screen because it touched one of theirs; if nothing
+        # names one now, say only that something on the line changed.
+        sentence = "Settings on this line changed"
+    if line_wide(diff):
+        sentence += ", and settings shared by the whole line"
+    return sentence
+
+
+def decorate_change(deps, change: dict, session=None) -> dict:
+    """One change as the reader in front of it may see it.
+
+    `session` is None for an owner of the whole line: they get the change
+    exactly as it was recorded. For anybody else every field is rebuilt from
+    the part of the diff that is theirs — the lines, the sentence, who did it,
+    and why it was refused — because each of those was written about the whole
+    save and each of them can name a business next door.
+    """
     diff = change.get("diff") or ""
+    scoped = session is not None and not session.sees_whole_line
+    keys = tuple(session.profile_keys) if scoped else None
     change["lines"] = visible_diff(diff, keys)
     # Read off the WHOLE diff, never the filtered view: whether a version can
     # be put back is a fact about the change, not about who is looking at it.
     change["can_restore"] = bool(change.get("applied")) and bool(_diff_body(diff))
-    change["actor_label"] = str(change.get("actor") or "somebody on this line")
+    actor = str(change.get("actor") or "")
+    if not scoped:
+        change["actor_label"] = actor or "somebody on this line"
+        return change
+    change["summary"] = scoped_summary(deps, diff, keys)
+    # A login name is a fact about who else manages this line.
+    change["actor_label"] = ("you" if actor and actor == session.owner_key
+                             else "somebody who manages this line")
+    if change.get("reason") and (
+            sections_touched(diff) - set(keys) or line_wide(diff)):
+        # The validator names the field it refused, which on a save that also
+        # touched another business is that business's field.
+        change["reason"] = ""
+    # The raw diff is not rendered, but it is the thing being kept from this
+    # reader — it does not travel to the template at all.
+    change.pop("diff", None)
     return change
 
 
@@ -155,16 +262,22 @@ def changes_for(deps, session) -> tuple:
             # targets. An owner of one business reads only what touched theirs.
             if not (sections_touched(change.get("diff") or "") & mine):
                 continue
-        kept.append(decorate_change(
-            dict(change),
-            None if session.sees_whole_line else session.profile_keys))
+        kept.append(decorate_change(deps, dict(change), session))
         if len(kept) >= CHANGES_SHOWN:
             break
     return kept, ""
 
 
-def deleted_businesses(deps, days: int) -> list:
-    """The businesses that were put away, newest first."""
+def deleted_businesses(deps, days: int, owner_key=None) -> list:
+    """The businesses that were put away, newest first.
+
+    `owner_key` is None for an owner of the whole line: they see every one. For
+    anybody else only the ones their own sign-in used to cover are listed —
+    which is what `owners` was recorded for. A row that does not say who could
+    see it is shown to nobody but the line's owner: a business removed by hand,
+    or before this was recorded, must not become the one place a neighbour's
+    name appears.
+    """
     config = deps.get_config()
     stamp_key = str(deps.product_defaults.get("deleted_at_key", "deleted_at"))
     owners_key = str(deps.product_defaults.get("deleted_owners_key", "owners"))
@@ -179,6 +292,9 @@ def deleted_businesses(deps, days: int) -> list:
         # wrong, a hand-edited file) would otherwise come out negative and read
         # as "31 days left" on a thirty-day window.
         age = max(0, (now - when).days) if when is not None else None
+        covered = [str(name) for name in profile.get(owners_key, [])]
+        if owner_key is not None and owner_key not in covered:
+            continue
         listed.append({
             "key": key,
             "name": str(profile.get("business_name", "")).strip() or key,
@@ -187,7 +303,7 @@ def deleted_businesses(deps, days: int) -> list:
             "restorable": age is not None and age < days,
             "window_days": days,
             # The sign-ins that get it back, named on the confirm.
-            "owners": [str(name) for name in profile.get(owners_key, [])],
+            "owners": covered,
         })
     listed.sort(key=lambda row: row["at"] or 0, reverse=True)
     return listed
@@ -206,8 +322,9 @@ def gather(deps, session) -> dict:
                 if row["kind"] not in SIGN_IN_KINDS
                 and row["level"] in ("warning", "error")]
     days = int(deps.product_defaults.get("recovery_days", 30))
-    removed, removed_error = render.guarded_read("your removed businesses",
-                                                 deleted_businesses, deps, days)
+    removed, removed_error = render.guarded_read(
+        "your removed businesses", deleted_businesses, deps, days,
+        None if session.sees_whole_line else session.owner_key)
     return {
         "changes": changes, "changes_error": changes_error,
         "sign_ins": signed[:EVENTS_SHOWN], "events_error": events_error,

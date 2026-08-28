@@ -790,7 +790,10 @@ async def test_a_scoped_owner_only_sees_changes_that_touched_their_business(two)
         await _signed_in(dash, "jo-code")
         page = _text(await (await dash.client.get("/activity")).text())
 
-    assert "Changed the greeting callers hear for Acme Co" in page
+    # the sentence is rebuilt from the lines that are theirs — the stored one
+    # describes the whole save and is not theirs to be told
+    assert "Settings changed for Acme Co" in page
+    assert "Changed the greeting callers hear for Acme Co" not in page
     assert "Other Co" not in page
     assert "secret greeting" not in page
     # and the whole-line restore is not offered to them
@@ -1322,10 +1325,10 @@ token_env = "PHONE_OWNER_JO_TOKEN"
 profiles = ["acme"]
 
 [profiles.acme]
+greeting = "hi"
+owner_name = "Jo"
 business_name = "Acme Co"
 services = "widget repair"
-owner_name = "Jo"
-greeting = "hi"
 
 [profiles.other]
 ntfy_url = "https://push.other.test"
@@ -1365,8 +1368,8 @@ async def test_a_scoped_owner_never_reads_another_business_out_of_a_diff(
         await _signed_in(dash, "jo-code")
         scoped = _text(await (await dash.client.get("/activity")).text())
 
-    # their own change is there, in full
-    assert "Changed the greeting callers hear for Acme Co" in scoped
+    # their own change is there, in their own words
+    assert "Settings changed for Acme Co" in scoped
     assert "Good morning, Acme." in scoped
     # and not one line of the business next door
     assert "other-co-secret-topic" not in scoped
@@ -1687,3 +1690,214 @@ async def test_a_push_with_nowhere_to_go_says_so_instead_of_raising(line):
         title="t", body="b")
     assert ok is False
     assert "no push address is set up" in why
+
+
+# ===================== the diff walker is a tenancy control, so: =============
+
+def test_a_second_hunk_belongs_to_no_business_until_a_header_says_so(
+        hand_written):
+    """`@@` means the next line comes from somewhere else in the file. Carrying
+    the last-seen table across it attributes a hunk that starts mid-table to
+    whichever business was named further up — which on a shared line hands one
+    owner the next one's settings."""
+    import difflib
+
+    admin = load_admin()
+    before = hand_written.config_toml(hand_written.CONFIG)
+    after = (before
+             .replace('business_name = "Acme Co"', 'business_name = "Acme Repairs"')
+             .replace('ntfy_topic = "other-co-secret-topic"',
+                      'ntfy_topic = "changed-topic"'))
+    # Short context on purpose: two hunks, the first carrying [profiles.acme]
+    # in its context and the second starting in the middle of [profiles.other].
+    short = "\n".join(difflib.unified_diff(
+        before.splitlines(), after.splitlines(), lineterm="", n=1))
+    assert len([line for line in short.splitlines()
+                if line.startswith("@@")]) == 2, "the test needs two hunks"
+    assert "[profiles.acme]" in short
+    assert "[profiles.other]" not in short      # the second hunk has no header
+
+    mine = admin.views_activity.visible_diff(short, ("acme",))
+    text = " ".join(line["text"] for line in mine)
+    assert "Acme Repairs" in text                       # their own change
+    assert "other-co-secret-topic" not in text          # not the neighbour's
+    assert "changed-topic" not in text
+
+    everything = admin.views_activity.visible_diff(short, None)
+    assert any("changed-topic" in line["text"] for line in everything)
+
+
+def test_the_recorded_diff_is_one_hunk_so_the_walker_sees_every_header(line):
+    """The walker fails closed across `@@` either way, but this is the invariant
+    that keeps a whole-file diff readable: one hunk, every header in it."""
+    before = _config_text(line)
+    after = before.replace('greeting = "hi"', 'greeting = "Good day."')
+    diff = line.config_diff(before, after)
+
+    hunks = [row for row in diff.splitlines() if row.startswith("@@")]
+    assert len(hunks) == 1, f"config_diff emitted {len(hunks)} hunks"
+    # every line of both versions is in it, which is what makes a restore exact
+    assert line.config_from_diff(diff, side="before") == before
+    assert line.config_from_diff(diff, side="after") == after
+
+
+def test_a_table_header_inside_a_quoted_value_is_not_a_header():
+    """A triple-quoted TOML value can hold a line that reads exactly like a
+    profile header. Believing it would move the walker into a business that is
+    not there."""
+    admin = load_admin()
+    fence = '"' * 3
+    diff = "\n".join([
+        "--- businesses.toml (before)",
+        "+++ businesses.toml (after)",
+        "@@ -1,7 +1,7 @@",
+        " [profiles.acme]",
+        f" extra_instructions = {fence}",
+        " [profiles.other]",
+        ' ntfy_topic = "not-really-a-topic"',
+        f" {fence}",
+        '-greeting = "hi"',
+        '+greeting = "hello"',
+    ])
+    assert admin.views_activity.sections_touched(diff) == {"acme"}
+
+    mine = admin.views_activity.visible_diff(diff, ("acme",))
+    text = " ".join(row["text"] for row in mine)
+    assert "hello" in text
+    # the lines inside the quoted value are acme's own, and stay with acme
+    assert "not-really-a-topic" in text
+
+    # and the same lines are hidden from somebody who does not own acme
+    theirs = admin.views_activity.visible_diff(diff, ("other",))
+    assert theirs == [] or all("not-really-a-topic" not in row["text"]
+                               for row in theirs)
+
+
+def test_an_indented_table_header_still_ends_the_business_before_it():
+    admin = load_admin()
+    diff = "\n".join([
+        "@@ -1,4 +1,4 @@",
+        " [profiles.acme]",
+        '-greeting = "hi"',
+        '+greeting = "hello"',
+        "   [numbers]",
+        '+"+15550009999" = "acme"',
+    ])
+    # the indented table is not acme's, so the number line belongs to nobody
+    assert admin.views_activity.sections_touched(diff) == {"acme"}
+    assert admin.views_activity.line_wide(diff) is True
+
+
+# ================ what a scoped owner is TOLD a change was ==================
+
+async def test_a_scoped_owner_is_not_told_what_happened_to_anybody_else(
+        hand_written):
+    """The stored summary is written for whoever made the change and describes
+    the whole save. "Removed the business Other Co" is the truth, and it is not
+    this reader's truth to be told — but the save rewrote Acme's lines too, so
+    the change IS on her screen and the sentence has to be rebuilt."""
+    async with dashboard(hand_written) as dash:
+        await _signed_in(dash)
+        page = _text(await (await dash.client.get(
+            "/business/other/delete")).text())
+        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        version = page.split('name="version" value="', 1)[1].split('"', 1)[0]
+        removed = await dash.client.post("/business/other/delete", {
+            "csrf": csrf, "version": version, "confirm": "Other Co"})
+        assert removed.status == 303, await removed.text()
+
+    stored = hand_written.STORE.list_config_changes()[0]["summary"]
+    assert stored == "Removed the business Other Co"
+
+    async with dashboard(hand_written) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+    async with dashboard(hand_written) as dash:
+        await _signed_in(dash)
+        whole = _text(await (await dash.client.get("/activity")).text())
+
+    # the account that manages the line reads what was recorded
+    assert stored in whole
+    assert "Removed businesses" in whole
+
+    # the change reached her screen — the save rewrote her business's lines
+    assert "Settings changed for Acme Co" in scoped
+    assert "settings shared by the whole line" in scoped
+    # and told her nothing about the business next door, in any panel
+    assert stored not in scoped
+    assert "Other Co" not in scoped
+    assert "other-co-secret-topic" not in scoped
+    assert "Removed businesses" not in scoped
+
+
+async def test_a_scoped_owner_is_not_told_which_other_login_made_a_change(two):
+    two.apply_config(
+        dataclasses.replace(two.CONFIG, profiles=dict(
+            two.CONFIG.profiles,
+            acme=dict(two.CONFIG.profiles["acme"], greeting="Acme, hello"))),
+        "the_other_manager", "Changed the greeting callers hear for Acme Co")
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+    assert "the_other_manager" not in scoped
+    assert "somebody who manages this line" in scoped
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash)
+        whole = _text(await (await dash.client.get("/activity")).text())
+    assert "the_other_manager" in whole
+
+
+async def test_a_scoped_owner_is_not_handed_a_refusal_about_another_business(
+        two):
+    """A refusal names the field the validator stopped on, which on a save that
+    also touched somebody else is somebody else's field."""
+    two.STORE.record_config_change(
+        actor="line", summary="Changed the settings",
+        diff="\n".join([
+            "@@ -1,6 +1,6 @@",
+            " [profiles.acme]",
+            '-greeting = "hi"',
+            '+greeting = "hello"',
+            " [profiles.other]",
+            '-forward_to = "+15550003333"',
+            '+forward_to = "the shop mobile"',
+        ]),
+        applied=False,
+        reason="profile 'other' forward_to 'the shop mobile' is not an E.164 number")
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+    assert "the shop mobile" not in scoped
+    assert "profile 'other'" not in scoped
+    assert "Refused, so nothing changed" in scoped
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash)
+        whole = _text(await (await dash.client.get("/activity")).text())
+    assert "the shop mobile" in whole
+
+
+async def test_a_scoped_owner_still_sees_a_removed_business_that_was_theirs(
+        shared_login):
+    """Scoping the removed list is not "hide everything": a business Jo used to
+    work, removed, is hers to know about — that is what `owners` records."""
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash)
+        page = _text(await (await dash.client.get(
+            "/business/other/delete")).text())
+        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        version = page.split('name="version" value="', 1)[1].split('"', 1)[0]
+        await dash.client.post("/business/other/delete", {
+            "csrf": csrf, "version": version, "confirm": "Other Co"})
+
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+
+    assert "Removed businesses" in scoped
+    assert "Other Co" in scoped
+    # but putting it back is not hers to do, so it is not offered
+    assert "restore-business=other" not in scoped
