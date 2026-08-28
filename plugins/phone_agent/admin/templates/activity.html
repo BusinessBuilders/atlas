@@ -110,7 +110,15 @@
     {% if events_error %}
     <p class="notice notice-bad" role="alert">{{ events_error }}</p>
     {% elif not sign_ins %}
+    {# A sign-in belongs to the whole line, not to one business, so an owner of
+       one business is shown none of them. Saying "none have been recorded"
+       would be a lie — they signed in themselves to read this page. #}
+    {% if session and not session.sees_whole_line %}
+    <p class="muted flush">Sign-ins are kept for the whole line, so they are
+      only shown to the login that manages all of it.</p>
+    {% else %}
     <p class="muted flush">No sign-in has been recorded yet.</p>
+    {% endif %}
     {% else %}
     <ul class="alerts">
       {% for row in sign_ins %}

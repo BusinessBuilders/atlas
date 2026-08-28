@@ -104,6 +104,32 @@ def _numbers_check(numbers: dict, profiles) -> Check:
                  f"{len(mapped)} number{'' if len(mapped) == 1 else 's'} answering")
 
 
+# What the bridge pushes THROUGH, as the store writes it in `notify_log`.
+# These are our words, not the owner's: "the last message alert to ntfy_test"
+# is a sentence about the inside of the machine. A target that is not one of
+# these is a destination somebody configured, and it is named as it is.
+TRANSPORT_TARGETS = ("ntfy", "ntfy_urgent", "ntfy_test")
+
+
+def _named_target(row) -> str:
+    """The target, or "" when it is only the name of a transport."""
+    target = str((row or {}).get("target", "")).strip()
+    return "" if target in TRANSPORT_TARGETS else target
+
+
+def _alert_subject(row) -> str:
+    """What failed, as the sentence's subject.
+
+    A test gets said out loud: the owner pressed that button a moment ago, and
+    "the last message alert did not get through" would send them looking for a
+    caller's message that never existed.
+    """
+    if str((row or {}).get("target", "")).strip() == "ntfy_test":
+        return "The test alert you sent"
+    named = _named_target(row)
+    return f"The last message alert to {named}" if named else "The last message alert"
+
+
 def _notify_check(health: dict, notify_failure, whole_line: bool,
                   last_notify=None) -> Check:
     """Are this owner's message alerts getting through?
@@ -115,16 +141,12 @@ def _notify_check(health: dict, notify_failure, whole_line: bool,
     their OWN newest attempt, which the store scoped for us; the line-wide
     counters are for the account that owns the whole line.
     """
-    target = str((notify_failure or {}).get("target", "")).strip()
-    named = f" to {target}" if target else ""
+    named = _named_target(notify_failure)
     if not whole_line:
         newest = dict(last_notify or {})
         if newest and not newest.get("ok"):
-            failed_target = str(newest.get("target", "")).strip()
             return Check("notifications", "Message alerts", WARN,
-                         "The last message alert"
-                         + (f" to {failed_target}" if failed_target else "")
-                         + " did not get through")
+                         _alert_subject(newest) + " did not get through")
         if not newest:
             return Check("notifications", "Message alerts", OK,
                          "No message alerts sent yet")
@@ -133,11 +155,11 @@ def _notify_check(health: dict, notify_failure, whole_line: bool,
     last = dict(health.get("last_delivery") or {})
     if failures:
         return Check("notifications", "Message alerts", WARN,
-                     f"Message alerts{named} are failing "
-                     f"({failures} in a row)")
+                     f"Message alerts{f' to {named}' if named else ''} are "
+                     f"failing ({failures} in a row)")
     if last.get("ok") is False:
         return Check("notifications", "Message alerts", WARN,
-                     f"The last message alert{named} did not get through")
+                     _alert_subject(notify_failure) + " did not get through")
     return Check("notifications", "Message alerts", OK, "Alerts delivering")
 
 

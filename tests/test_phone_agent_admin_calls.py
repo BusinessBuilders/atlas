@@ -131,6 +131,21 @@ async def test_the_call_log_hides_test_calls_until_they_are_asked_for(line):
     assert "Test" in with_tests
 
 
+async def test_the_footnote_does_not_claim_to_hide_a_call_that_is_on_screen(line):
+    """It used to say "Blocked and test calls are hidden unless you ask for
+    them" on a page with a blocked call in the list. Only test calls are
+    hidden; a blocked call is a call the line took, and an owner who cannot see
+    it has no way to know a number on their block list is still ringing."""
+    _call(line, "CA000000000000000000000000block1", outcome="blocked",
+          reason="block_list", frm="+15550009000")
+
+    page = await _page(line, "/calls")
+    assert "•••••••9000" in page
+    assert "Blocked" in page
+    assert "Test calls are hidden unless you ask for them." in page
+    assert "Blocked and test calls are hidden" not in page
+
+
 async def test_the_call_log_searches_what_was_said(line):
     _call(line, "CA0000000000000000000000000roof1", turns=(
         ("caller", "my roof is leaking after the storm"),))

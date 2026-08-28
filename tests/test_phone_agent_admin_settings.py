@@ -773,6 +773,26 @@ async def test_activity_shows_sign_ins_and_what_the_line_reported(line):
     assert "The model that answers calls did not respond" in page
 
 
+async def test_an_owner_of_one_business_is_not_told_there_are_no_sign_ins(two):
+    """A sign-in belongs to the whole line, not to one business, so a scoped
+    owner is shown none of them. "No sign-in has been recorded yet" was a lie
+    to the very person who had just signed in to read that page."""
+    two.STORE.add_event(None, None, "warning", "dashboard_signin_failed",
+                        "wrong access code from 127.0.0.1")
+    async with dashboard(two) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+    assert "No sign-in has been recorded yet" not in scoped
+    assert "only shown to the login that manages all of it" in scoped
+    assert "wrong access code" not in scoped
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash)
+        whole = _text(await (await dash.client.get("/activity")).text())
+    assert "only shown to the login that manages all of it" not in whole
+    assert "Someone tried to sign in with the wrong access code" in whole
+
+
 async def test_a_scoped_owner_only_sees_changes_that_touched_their_business(two):
     two.apply_config(
         dataclasses.replace(two.CONFIG, profiles=dict(

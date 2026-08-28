@@ -91,7 +91,10 @@
   <p class="notice notice-bad pad-16" role="alert">{{ messages_error }}</p>
   {% endif %}
   <div class="list-foot">
-    <span class="subtle">Blocked and test calls are hidden unless you ask for them.</span>
+    {# Only TEST calls are hidden. A blocked call is in this list like any
+       other — it is a call your line took, and an owner who cannot see it has
+       no way to know a number on their block list is still ringing. #}
+    <span class="subtle">Test calls are hidden unless you ask for them.</span>
     <span class="row-gap">
       {% if filters.page > 1 %}
       <a class="btn btn-quiet" href="/calls{{ prev_query }}">Newer calls</a>

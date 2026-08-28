@@ -245,6 +245,31 @@ def test_failing_alerts_name_the_target_they_are_failing_to():
     assert "ntfy topic phone-acme" in band.summary
 
 
+def test_the_transport_a_push_rides_on_is_never_named_to_an_owner():
+    """`notify_log.target` is usually `ntfy` / `ntfy_urgent` / `ntfy_test` —
+    our word for the pipe, not a place the owner has ever heard of. Printing it
+    put "The last message alert to ntfy_test did not get through" on the
+    Overview."""
+    failed = {"ts": time.time(), "call_sid": "CAtest1", "ok": False,
+              "error": "TimeoutError"}
+    for transport in ("ntfy", "ntfy_urgent", "ntfy_test"):
+        row = dict(failed, target=transport)
+        whole = _status(health=_snapshot(last_delivery=dict(failed, ok=False)),
+                        notify_failure=row)
+        scoped = _status(whole_line=False, last_notify=row)
+        many = _status(health=_snapshot(ntfy_failures=3), notify_failure=row)
+        for band in (whole, scoped, many):
+            assert band.level == "warn"
+            assert transport not in band.summary, band.summary
+            assert "did not get through" in band.summary or "failing" in band.summary
+
+    # A test is still said out loud, because the owner pressed that button a
+    # moment ago and must not go hunting for a caller's message.
+    band = _status(whole_line=False,
+                   last_notify=dict(failed, target="ntfy_test"))
+    assert band.summary.count("The test alert you sent did not get through") == 1
+
+
 def test_a_delivery_that_never_landed_is_amber():
     band = _status(health=_snapshot(
         last_delivery={"ts": time.time(), "call_sid": "CAx", "ok": False,

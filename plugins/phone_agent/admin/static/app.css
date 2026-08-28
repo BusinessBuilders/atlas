@@ -204,6 +204,12 @@ p { margin: 0 0 var(--s-3); }
 .stat { display: flex; flex-direction: column; gap: var(--s-1); }
 .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s-4); }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-4); }
+/* Each card is as tall as its own contents. Grid rows stretch by default,
+   which made the seven-day chart a card of empty black as tall as whatever the
+   alert list beside it happened to be — up to twenty entries after a bad
+   night. Used where the two cards are unrelated, not where a row of cards
+   should line up. */
+.grid-3.grid-top { align-items: start; }
 .span-2 { grid-column: span 2; }
 .empty-first-run { display: flex; flex-direction: column; gap: var(--s-2); }
 
@@ -434,7 +440,10 @@ p { margin: 0 0 var(--s-3); }
   align-items: flex-end; padding: var(--s-4);
 }
 .filter-search { flex: 1 1 260px; min-width: 0; }
-.filter-field { flex: 0 1 170px; }
+/* `auto` rather than a fixed basis: a select is as wide as its longest option
+   needs, so "All of your businesses" is not cut off at "All of your busine".
+   The floor keeps a short list from collapsing into a stub. */
+.filter-field { flex: 0 1 auto; min-width: 170px; }
 .filter-check, .filter-go { align-self: center; }
 .filter-check .checkline { min-height: 44px; align-items: center; }
 .filter-tabs { display: flex; flex-wrap: wrap; gap: var(--s-2); }
@@ -459,7 +468,11 @@ p { margin: 0 0 var(--s-3); }
 .list-foot { border-top: 1px solid var(--line-soft); flex-wrap: wrap; }
 .table-calls td { vertical-align: top; }
 .table-calls .subtle { display: block; }
-.row-link { color: var(--fg); text-decoration: none; }
+/* The date on a call row IS the link that opens it — on a phone it is the
+   whole card's heading. 24px is the floor every target on this dashboard
+   keeps; without it this one was 20px, the only one under the line. */
+.row-link { color: var(--fg); text-decoration: none;
+            display: inline-flex; align-items: center; min-height: 24px; }
 .row-link:hover { text-decoration: underline; }
 .row-open {
   display: inline-flex; align-items: center; justify-content: center;
@@ -570,6 +583,10 @@ p { margin: 0 0 var(--s-3); }
   .banner .btn, .banner form { width: 100%; }
   .banner .btn { width: 100%; }
   .detail-grid { grid-template-columns: 1fr; }
+  /* The business picker gets the width the page has, instead of whatever is
+     left beside the heading — at 390px that was enough to cut "Acme Plumbing"
+     off at "Acme Plumbin". */
+  .page-head { flex-direction: column; align-items: stretch; gap: var(--s-4); }
   .filters { flex-direction: column; align-items: stretch; }
   .filter-field, .filter-search { flex: 1 1 auto; }
   .filter-go .btn { width: 100%; }
@@ -652,6 +669,25 @@ p { margin: 0 0 var(--s-3); }
 
 .advanced summary { cursor: pointer; min-height: 44px;
                     display: flex; align-items: center; }
+
+/* A `display` other than list-item takes the browser's own disclosure triangle
+   off a <summary> — which left two of these reading as dead sub-headings with
+   no sign that anything opens. The triangle is drawn here instead, as a shape
+   rather than a character: a stylesheet must not invent text. */
+.advanced summary::before,
+.change-diff summary::before {
+  content: ""; flex: none; margin-right: var(--s-2);
+  border-left: 6px solid currentColor;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  transition: transform 120ms ease;
+}
+.advanced[open] > summary::before,
+.change-diff[open] > summary::before { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) {
+  .advanced summary::before,
+  .change-diff summary::before { transition: none; }
+}
 .advanced-body { padding-top: var(--s-3); }
 textarea.tall { min-height: 200px; resize: vertical; }
 
