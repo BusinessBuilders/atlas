@@ -16,8 +16,15 @@
     {% if message.clamped %}
     {# The whole message is in the page either way — closed it is clamped to a
        few lines, open it is all there. Nothing is ever cut off. #}
+    {# The toggle's words are in the page, not in a stylesheet's `content`:
+       CSS text is not text a translator, a search or a copy-paste can reach.
+       Closed, CSS clamps the body and shows "Show more"; open, all of it is
+       there. Nothing is ever cut off. #}
     <details class="msg-text-wrap">
-      <summary><span class="msg-text">{{ message.body }}</span><span class="msg-expand"></span></summary>
+      <summary>
+        <span class="msg-text">{{ message.body }}</span>
+        <span class="msg-expand"><span class="msg-more">Show more</span><span class="msg-less">Show less</span></span>
+      </summary>
     </details>
     {% else %}
     <p class="flush">{{ message.body }}</p>
@@ -54,6 +61,6 @@
 {% if oob_waiting is defined %}
 {# htmx swaps these two out of band so the navigation's count agrees with the
    card that has just moved. Rendered only for an htmx status change. #}
-{{ waiting_badge(oob_waiting, badge_ceiling, oob=true) }}
-{{ waiting_count_tab(oob_waiting, badge_ceiling, oob=true) }}
+{{ waiting_badge(oob_waiting, oob=true) }}
+{{ waiting_count_tab(oob_waiting, oob=true) }}
 {% endif %}

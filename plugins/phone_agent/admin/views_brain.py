@@ -60,19 +60,19 @@ def brain_cards(deps) -> list:
     return cards
 
 
-def _require_whole_line(deps, request, session):
+async def _require_whole_line(deps, request, session):
     """The Brain screen changes the model for every business on the line."""
     if session.sees_whole_line:
         return None
-    return render.page(
+    return await render.page(
         request, deps, "refused.html", session=session, status=403,
         reason=("The model that answers calls is shared by every business on "
                 "this line, so only the account that manages the whole line "
                 "can change it."))
 
 
-def _page(request, deps, session, *, confirming=None, error="", switched="",
-          already="", status_code=200):
+async def _page(request, deps, session, *, confirming=None, error="",
+                switched="", already="", status_code=200):
     cards = brain_cards(deps)
     chosen = next((c for c in cards if c["key"] == confirming), None)
     # The confirmation names the model the owner recognises, not its key in the
@@ -82,7 +82,7 @@ def _page(request, deps, session, *, confirming=None, error="", switched="",
     # Same resolution for "you already have that one": the message appears only
     # for a model that really exists AND is really the one answering.
     already_active = any(c["key"] == already and c["active"] for c in cards)
-    return render.page(
+    return await render.page(
         request, deps, "brain.html", session=session, status=status_code,
         cards=cards, confirming=chosen, error=error, switched=just_switched,
         already=already_active, dialog_open=chosen is not None,
@@ -92,34 +92,35 @@ def _page(request, deps, session, *, confirming=None, error="", switched="",
 async def brain(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
-    refused = _require_whole_line(deps, request, session)
+    refused = await _require_whole_line(deps, request, session)
     if refused is not None:
         return refused
-    return _page(request, deps, session,
-                 confirming=request.query.get("switch", "") or None,
-                 switched=request.query.get("switched", ""),
-                 already=request.query.get("already", ""))
+    return await _page(request, deps, session,
+                       confirming=request.query.get("switch", "") or None,
+                       switched=request.query.get("switched", ""),
+                       already=request.query.get("already", ""))
 
 
 async def switch_brain(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
-    refused = _require_whole_line(deps, request, session)
+    refused = await _require_whole_line(deps, request, session)
     if refused is not None:
         return refused
     form = await request.post()
     reason = deps.auth.check_csrf(request, session, form)
     if reason:
-        return render.page(request, deps, "refused.html", session=session,
+        return await render.page(request, deps, "refused.html", session=session,
                            status=403, reason=reason)
 
     wanted = str(form.get("brain", "")).strip()
     override = str(form.get("override", "")) == "on"
     brains, active = deps.get_brains()
     if wanted not in brains:
-        return _page(request, deps, session, status_code=400,
-                     error="That model is not set up on this line any more. "
-                           "Reload the page and pick one of the models below.")
+        return await _page(
+            request, deps, session, status_code=400,
+            error="That model is not set up on this line any more. Reload the "
+                  "page and pick one of the models below.")
     if wanted == active:
         # A page left open while somebody else switched can still offer "use
         # this model" for the model that is already answering. Redirecting in
@@ -128,7 +129,7 @@ async def switch_brain(request: web.Request) -> web.Response:
 
     card = next(c for c in brain_cards(deps) if c["key"] == wanted)
     if card["health"]["reachable"] is False and not override:
-        return _page(
+        return await _page(
             request, deps, session, confirming=wanted,
             error=f"{card['label']} did not answer when it was last checked "
                   f"({card['health']['text']}). Switching to it now would mean "
@@ -137,8 +138,8 @@ async def switch_brain(request: web.Request) -> web.Response:
 
     errors = await asyncio.to_thread(_apply_switch, deps, session, wanted, active)
     if errors:
-        return _page(request, deps, session, confirming=wanted,
-                     error="Nothing was changed. " + " ".join(errors))
+        return await _page(request, deps, session, confirming=wanted,
+                           error="Nothing was changed. " + " ".join(errors))
     log.info("dashboard: %s switched the model that answers calls to %r",
              session.owner_key, wanted)
     raise web.HTTPSeeOther(f"/brain?switched={wanted}")

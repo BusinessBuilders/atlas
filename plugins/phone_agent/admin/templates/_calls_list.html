@@ -2,8 +2,10 @@
 {# The results half of the call log. htmx swaps this whole element when a
    filter changes, so every state the list can be in lives in here: the error,
    the never-rung empty, the nothing-matched empty, and the table itself. #}
-<section id="call-list" class="card flat stack-0" aria-live="polite"
-         aria-label="Your calls">
+<section id="call-list" class="card flat" aria-label="Your calls">
+  {# The live region is the indicator ALONE. Wrapping the whole list in one
+     makes a screen reader read every row again after a filter change. #}
+  <p class="list-loading subtle htmx-indicator" role="status">Updating the list…</p>
   {% if error %}
   <p class="notice notice-bad pad-16" role="alert">{{ error }}</p>
   {% elif first_run %}
@@ -19,6 +21,13 @@
       at it.</p>
     {% endif %}
   </div>
+  {% elif only_tests %}
+  <div class="empty-first-run pad-24">
+    <h2 class="display display-m flush">Only test calls so far</h2>
+    <p class="muted flush">Every call on your line so far was a test, and test
+      calls are hidden unless you ask for them. Tick "Show test calls" to see
+      them.</p>
+  </div>
   {% elif not rows %}
   <div class="empty-first-run pad-24">
     <h2 class="display display-m flush">No calls match those filters</h2>
@@ -30,7 +39,6 @@
   {% else %}
   <div class="list-head">
     <span class="subtle">Calls {{ first_row }}–{{ last_row }}, newest first</span>
-    <span class="subtle htmx-indicator" role="status">Updating the list…</span>
   </div>
   <table class="table table-calls">
     <caption class="visually-hidden">Every call your line answered, newest first</caption>

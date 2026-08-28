@@ -449,6 +449,9 @@ p { margin: 0 0 var(--s-3); }
              border-color: var(--brand-accent); }
 .filter.on:hover { color: var(--brand-bg); }
 
+/* The loading line sits above the list without pushing it down, so a filter
+   change does not make the results jump. */
+.list-loading { margin: 0; padding: var(--s-2) var(--s-4) 0; }
 .list-head, .list-foot {
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--s-3); padding: var(--s-3) var(--s-4);
@@ -495,12 +498,16 @@ p { margin: 0 0 var(--s-3); }
   display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3;
   -webkit-box-orient: vertical; overflow: hidden;
 }
-.msg-expand::after {
-  content: "Show more"; display: inline-block; margin-top: var(--s-1);
+/* The words themselves are in the markup; CSS only chooses which of the two
+   is on screen. Text a stylesheet invents cannot be translated, searched or
+   copied. */
+.msg-expand {
+  display: inline-block; margin-top: var(--s-1);
   color: var(--brand-accent-2); font-size: var(--t-meta);
   font-weight: var(--w-strong);
 }
-.msg-text-wrap[open] .msg-expand::after { content: "Show less"; }
+.msg-text-wrap:not([open]) .msg-less { display: none; }
+.msg-text-wrap[open] .msg-more { display: none; }
 
 /* --------------------------------------------------------- one call ------ */
 

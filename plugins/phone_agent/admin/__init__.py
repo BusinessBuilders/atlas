@@ -105,7 +105,7 @@ async def _loud_failures(request: web.Request, handler):
     except Exception as e:
         log.exception("dashboard: %s %s failed", request.method, request.path)
         deps = request.app[render.DEPS]
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", status=500,
             reason=f"Something went wrong on this page: {type(e).__name__}: {e}. "
                    "It has been written to the service log.")
@@ -143,21 +143,21 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
     async def sign_in_page(request: web.Request) -> web.Response:
         if deps.auth.session_for(request) is not None:
             raise web.HTTPFound("/")
-        return render.page(request, deps, "sign_in.html", error="", locked=0)
+        return await render.page(request, deps, "sign_in.html", error="", locked=0)
 
     async def sign_in(request: web.Request) -> web.Response:
         form = await request.post()
         ip = deps.auth.client_ip(request)
         locked = deps.auth.lock_remaining(ip)
         if locked:
-            return _locked_out(request, locked)
+            return await _locked_out(request, locked)
         owner = await asyncio.to_thread(deps.auth.owner_for_code,
                                         str(form.get("code", "")))
         if owner is None:
             locked = await asyncio.to_thread(deps.auth.note_failure, ip)
             if locked:
-                return _locked_out(request, locked)
-            return render.page(
+                return await _locked_out(request, locked)
+            return await render.page(
                 request, deps, "sign_in.html", status=401, locked=0,
                 error="That access code was not recognised. Check it and try "
                       "again.")
@@ -173,8 +173,8 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
         deps.auth.set_cookie(response, session_id)
         return response
 
-    def _locked_out(request: web.Request, seconds: int) -> web.Response:
-        response = render.page(
+    async def _locked_out(request: web.Request, seconds: int) -> web.Response:
+        response = await render.page(
             request, deps, "sign_in.html", status=429, locked=seconds,
             error=f"Too many wrong access codes. Try again in {seconds} "
                   f"second{'' if seconds == 1 else 's'}.")
@@ -186,7 +186,7 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
         form = await request.post()
         reason = deps.auth.check_csrf(request, session, form)
         if reason:
-            return render.page(request, deps, "refused.html", session=session,
+            return await render.page(request, deps, "refused.html", session=session,
                                status=403, reason=reason)
         await asyncio.to_thread(store.delete_session, session.id)
         response = web.HTTPSeeOther(auth_module.SIGN_IN_PATH)
@@ -198,7 +198,7 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
         form = await request.post()
         reason = deps.auth.check_csrf(request, session, form)
         if reason:
-            return render.page(request, deps, "refused.html", session=session,
+            return await render.page(request, deps, "refused.html", session=session,
                                status=403, reason=reason)
         gone = await asyncio.to_thread(store.delete_owner_sessions,
                                        session.owner_key)
@@ -247,16 +247,17 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
 
     app = web.Application(middlewares=[_security_headers, _loud_failures])
     app[render.DEPS] = deps
+    # One slot per session for the receipt a redirect has to carry across (see
+    # render.set_flash). Emptied by whoever reads it.
+    app[render.FLASH] = {}
     app.router.add_get("/", views_overview.overview)
     app.router.add_get("/overview/status", views_overview.status_band)
     app.router.add_get("/health/detail", views_overview.health_detail)
     app.router.add_post("/acknowledge-delivery",
                         views_overview.acknowledge_delivery)
     app.router.add_get("/calls", views_calls.calls)
-    # Before /calls/{sid}: a literal path and a pattern that would also match it
-    # are resolved in the order they are added.
-    app.router.add_post("/callers/delete", views_calls.delete_caller)
     app.router.add_get("/calls/{sid}", views_calls.call_detail)
+    app.router.add_post("/callers/delete", views_calls.delete_caller)
     app.router.add_post("/calls/{sid}/note", views_calls.add_note)
     app.router.add_post("/calls/{sid}/handled", views_calls.mark_handled)
     app.router.add_get("/messages", views_messages.messages)

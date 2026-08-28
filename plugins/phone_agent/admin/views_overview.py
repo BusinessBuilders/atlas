@@ -245,7 +245,7 @@ async def overview(request: web.Request) -> web.Response:
     stats = data["stats"] or {}
     per_day = stats.get("per_day") or []
     week_total = sum(int(d["calls"]) for d in per_day)
-    return render.page(
+    return await render.page(
         request, deps, "overview.html", session=session,
         band=band, health=health, data=data, numbers=numbers,
         stats=stats, chart=sparkline(per_day),
@@ -336,7 +336,7 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
     form = await request.post()
     reason = deps.auth.check_csrf(request, session, form)
     if reason:
-        return render.page(request, deps, "refused.html", session=session,
+        return await render.page(request, deps, "refused.html", session=session,
                            status=403, reason=reason)
     health, _model_ok = await deps.get_health()
     delivery = dict(health.get("last_delivery") or {})
@@ -346,7 +346,7 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
         log.warning("dashboard: %s tried to clear a failed message alert that "
                     "belongs to another business on this line",
                     session.owner_key)
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", session=session, status=403,
             reason=("That failed message alert belongs to another business on "
                     "this line, so it is not yours to mark as seen."))

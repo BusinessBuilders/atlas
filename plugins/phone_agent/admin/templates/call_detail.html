@@ -157,9 +157,9 @@
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <label class="eyebrow" for="note">Your note</label>
       <textarea class="input note-box" id="note" name="note" rows="3"
-                aria-describedby="note-hint">{{ message.note or "" }}</textarea>
-      <p class="hint" id="note-hint">Only you see this. Notes are kept even
-        after the words of the call are cleared out.</p>
+                maxlength="2000" aria-describedby="note-hint">{{ message.note or "" }}</textarea>
+      <p class="hint" id="note-hint">Only you see this, up to 2,000 characters.
+        Notes are kept even after the words of the call are cleared out.</p>
       <button class="btn btn-ghost self-start" type="submit"
               data-busy-label="Saving…">Save note</button>
     </form>

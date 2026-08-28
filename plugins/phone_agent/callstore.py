@@ -62,6 +62,13 @@ TURN_ROLES = ("caller", "agent", "keypress")
 
 DAY_SECONDS = 86400
 
+# Every read of a message joins the call, because the caller's number and
+# whether the call was a test live there. One string, so the list, the count and
+# the single-row read can never disagree about what a message row looks like.
+MESSAGE_SELECT = (
+    "SELECT m.*, c.from_number, c.is_test, c.started_at AS call_started_at "
+    "FROM messages m JOIN calls c ON c.call_sid = m.call_sid ")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     call_sid          TEXT PRIMARY KEY,
@@ -465,18 +472,45 @@ class CallStore:
             if cur.rowcount == 0:
                 raise KeyError(f"no message with id {id!r}")
 
-    def list_messages(self, profile_keys, status=None, include_test=False, *,
-                      call_sids=None, limit=None) -> list:
-        """The owner's message list, newest first, with the caller's number
-        joined in from the call.
+    def get_message(self, id: int):
+        """One message by id, with the caller's number joined in, or None.
 
-        `call_sids` narrows the query to specific calls and `limit` bounds it —
-        a caller that wants the status of ten calls must not read every message
-        this line has ever taken to find them.
+        Carries `profile_key`, which is how the dashboard checks the message
+        belongs to the login asking for it — one indexed read instead of
+        scanning the owner's whole message list to find one row.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                MESSAGE_SELECT + "WHERE m.id = ?", (int(id),)).fetchone()
+        return None if row is None else dict(row)
+
+    def count_messages(self, profile_keys, status=None,
+                       include_test=False) -> int:
+        """How many messages match, without reading them.
+
+        The dashboard asks this to say "12 waiting" in two places at once. A
+        count taken by listing the rows would grow without bound: messages are
+        never deleted, only aged of their words.
         """
         keys = [str(k) for k in profile_keys]
         if not keys:
-            return []
+            return 0
+        where, params = self._message_where(keys, status, include_test, None)
+        if where is None:
+            return 0
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM messages m JOIN calls c "
+                "ON c.call_sid = m.call_sid WHERE " + " AND ".join(where),
+                params).fetchone()
+        return int(row[0])
+
+    def _message_where(self, keys: list, status, include_test: bool, call_sids):
+        """(conditions, params) shared by the list and the count, so the two
+        can never drift into disagreeing about what they are counting.
+
+        Returns (None, []) when the filter selects nothing at all.
+        """
         where = ["m.profile_key IN (%s)" % ",".join("?" * len(keys))]
         params: list = list(keys)
         if status is not None:
@@ -489,16 +523,34 @@ class CallStore:
         if call_sids is not None:
             sids = [str(s) for s in call_sids]
             if not sids:
-                return []
+                return None, []
             where.append("m.call_sid IN (%s)" % ",".join("?" * len(sids)))
             params += sids
-        sql = ("SELECT m.*, c.from_number, c.is_test, c.started_at AS call_started_at "
-               "FROM messages m JOIN calls c ON c.call_sid = m.call_sid WHERE "
-               + " AND ".join(where)
+        return where, params
+
+    def list_messages(self, profile_keys, status=None, include_test=False, *,
+                      call_sids=None, limit=None, offset=0) -> list:
+        """The owner's message list, newest first, with the caller's number
+        joined in from the call.
+
+        `call_sids` narrows the query to specific calls, and `limit`/`offset`
+        page it — a caller that wants the status of ten calls must not read
+        every message this line has ever taken to find them, and neither must
+        the screen that lists them.
+        """
+        keys = [str(k) for k in profile_keys]
+        if not keys:
+            return []
+        where, params = self._message_where(keys, status, include_test, call_sids)
+        if where is None:
+            return []
+        sql = (MESSAGE_SELECT + "WHERE " + " AND ".join(where)
                + " ORDER BY m.created_at DESC, m.id DESC")
         if limit is not None:
-            sql += " LIMIT ?"
-            params.append(int(limit))
+            sql += " LIMIT ? OFFSET ?"
+            params += [int(limit), int(offset)]
+        elif offset:
+            raise ValueError("list_messages(offset=…) needs a limit as well")
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
@@ -707,9 +759,22 @@ class CallStore:
             )
         return int(deleted)
 
-    def delete_caller(self, from_number: str) -> Deletion:
+    def delete_caller(self, from_number: str, *, profile_keys=None) -> Deletion:
         """Remove every row this store holds for one caller — the CCPA/GDPR
         "delete my data" path.
+
+        The delete is BY NUMBER across the whole file, so `profile_keys` is what
+        keeps it inside one login's businesses: the rows for that number are
+        asked which businesses they belong to first, and if any of them is
+        outside the list the whole thing is refused with `PermissionError` and
+        NOTHING is deleted. That check lives here, not in the caller, because a
+        row whose business was removed from the config is invisible to anybody
+        enumerating the config — and it is exactly the row a scoped delete must
+        not take. `profile_keys=None` means the whole line, which is the
+        account that owns every business on it.
+
+        The refusal names how MANY other businesses hold rows and never which:
+        an owner asking about one caller must not learn the neighbours' keys.
 
         Returns the number of rows removed. The result also carries
         `.call_sids`: the Markdown message pad is append-only text this store
@@ -720,6 +785,17 @@ class CallStore:
         if not number:
             raise ValueError("delete_caller needs the caller's number in E.164 form")
         with self._lock, self.conn:
+            if profile_keys is not None:
+                allowed = {str(k) for k in profile_keys}
+                owners = {r[0] for r in self.conn.execute(
+                    "SELECT DISTINCT profile_key FROM calls WHERE from_number = ?",
+                    (number,))}
+                outside = owners - allowed
+                if outside:
+                    raise PermissionError(
+                        f"that number has also called {len(outside)} other "
+                        f"business{'' if len(outside) == 1 else 'es'} on this "
+                        "line")
             sids = [r[0] for r in self.conn.execute(
                 "SELECT call_sid FROM calls WHERE from_number = ? ORDER BY started_at",
                 (number,))]

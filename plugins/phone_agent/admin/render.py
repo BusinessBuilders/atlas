@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+import asyncio
+
 import jinja2
 from aiohttp import web
 
@@ -263,10 +265,7 @@ NAV = (
         NavItem("Brain", "cpu", "/brain", whole_line_only=True),
     )),
 )
-# The navigation badge stops counting here: past this the number is a shape,
-# not a fact, and reading every waiting row to draw it would cost more than it
-# tells the owner.
-BADGE_CEILING = 99
+
 
 
 def nav_for(session) -> list:
@@ -304,26 +303,23 @@ def guarded_read(what: str, fn, *args, **kwargs):
         return None, f"Could not read {what}: {type(e).__name__}: {e}"
 
 
-def waiting_badge(deps, session):
-    """A callable the page shell uses to draw the "messages waiting" count.
+def count_waiting(deps, session) -> int:
+    """How many messages are still waiting, for the navigation badge.
 
-    Lazy on purpose: only `base.html` asks for it, so the panels htmx swaps
-    every thirty seconds never pay for the query. A count that cannot be read
-    is left off the navigation — the Messages screen itself is where a store
-    that will not answer is reported, loudly, in words.
+    One indexed COUNT — never a list. Messages are never deleted, only aged of
+    their words, so counting them by reading them grows without bound.
+
+    A count that cannot be read leaves the badge off and logs the traceback:
+    the Messages screen itself is where a store that will not answer is
+    reported to the owner, loudly, in words.
     """
-    def count() -> int:
-        if session is None:
-            return 0
-        try:
-            waiting = deps.store.list_messages(session.profile_keys,
-                                               status="new",
-                                               limit=BADGE_CEILING + 1)
-        except Exception:
-            log.exception("dashboard: could not count the waiting messages")
-            return 0
-        return len(waiting)
-    return count
+    if session is None:
+        return 0
+    try:
+        return deps.store.count_messages(session.profile_keys, status="new")
+    except Exception:
+        log.exception("dashboard: could not count the waiting messages")
+        return 0
 
 
 @dataclass(frozen=True)
@@ -353,9 +349,24 @@ class Deps:
 
 # The one key the app stores on itself, typed so aiohttp can check it.
 DEPS = web.AppKey("deps", Deps)
+# Somewhere to leave ONE message for the next page this login asks for. It is
+# what lets a delete answer with a redirect instead of a rendered page: a
+# rendered POST comes back on refresh, and "refresh re-runs the delete" is not
+# something to leave in a product. In memory and per session, because it holds
+# what the owner has just been told once and never needs again.
+FLASH = web.AppKey("flash", dict)
 
 
-def base_context(request, deps: Deps, session=None) -> dict:
+def set_flash(request, session, value) -> None:
+    request.app[FLASH][session.id] = value
+
+
+def pop_flash(request, session):
+    """The message left for this login, once. Reading it clears it."""
+    return request.app[FLASH].pop(session.id, None)
+
+
+def base_context(request, deps: Deps, session=None, waiting: int = 0) -> dict:
     branding = deps.get_branding()
     return {
         "vendor_name": branding.vendor_name,
@@ -366,8 +377,9 @@ def base_context(request, deps: Deps, session=None) -> dict:
         "asset_version": deps.asset_version,
         "session": session,
         "nav": nav_for(session) if session is not None else [],
-        "waiting_count": waiting_badge(deps, session),
-        "badge_ceiling": BADGE_CEILING,
+        # Counted once, off the event loop, before the template runs: rendering
+        # is not a place to open the database that is carrying live calls.
+        "waiting": waiting,
         "csrf": deps.auth.csrf_token(session) if session is not None else "",
         "path": request.path,
         # A page that is asking a question in a <dialog> says so, and the
@@ -376,26 +388,38 @@ def base_context(request, deps: Deps, session=None) -> dict:
     }
 
 
-def page(request, deps: Deps, template: str, *, session=None, status: int = 200,
-         **context):
+async def page(request, deps: Deps, template: str, *, session=None,
+               status: int = 200, **context):
     """Render one whole page. The security headers are added by the app's
-    middleware, so nothing here can forget them."""
+    middleware, so nothing here can forget them.
+
+    Async because the page shell carries the "messages waiting" count, and that
+    is a SQLite read: it goes to a thread like every other one, never onto the
+    loop that is streaming a live call's audio.
+    """
+    waiting = (await asyncio.to_thread(count_waiting, deps, session)
+               if session is not None else 0)
     body = deps.env.get_template(template).render(
-        _context(request, deps, session, context))
+        _context(request, deps, session, context, waiting))
     return web.Response(text=body, status=status, content_type="text/html")
 
 
 def partial(request, deps: Deps, template: str, *, session=None, **context):
-    """Render one panel, for the pieces htmx swaps in place."""
+    """Render one panel, for the pieces htmx swaps in place.
+
+    Stays synchronous: a partial draws no navigation, so it never needs the
+    waiting count — which is the whole reason that count is not computed here.
+    """
     body = deps.env.get_template(template).render(
         _context(request, deps, session, context))
     return web.Response(text=body, content_type="text/html")
 
 
-def _context(request, deps: Deps, session, context: dict) -> dict:
+def _context(request, deps: Deps, session, context: dict,
+             waiting: int = 0) -> dict:
     """The page's own values on top of the ones every page has, so a view can
     override a default (`dialog_open`) instead of colliding with it."""
-    merged = base_context(request, deps, session)
+    merged = base_context(request, deps, session, waiting)
     merged.update(context)
     return merged
 

@@ -20,17 +20,20 @@
 # No real caller data anywhere: +1555…/CAtest… and invented names only.
 import csv
 import html
+import inspect
 import io
 import sqlite3
 import time
 
 import pytest
-from test_phone_agent_admin_auth import (ONE_BUSINESS, OTHER_BUSINESS,
-                                         dashboard, health_ok, load_admin)
+from test_phone_agent_admin_auth import (ADMIN_DIR, ONE_BUSINESS,
+                                         OTHER_BUSINESS, dashboard, health_ok,
+                                         load_admin)
 from test_phone_agent_plugin import _import_service
 
 DAY = 86400.0
 HTMX = {"HX-Request": "true"}
+ADMIN_STATIC = ADMIN_DIR / "static"
 
 
 @pytest.fixture
@@ -155,6 +158,17 @@ async def test_filtering_to_nothing_offers_to_clear_the_filters(line):
     assert "No calls match" in page
     assert "Clear filters" in page
     assert 'href="/calls"' in page
+
+
+async def test_a_line_whose_only_calls_are_tests_says_that(line):
+    """"No calls yet — ring your number to test it" is the wrong thing to say
+    to a line whose only calls ARE tests with the box unticked."""
+    _call(line, "CAtest0000000000000000000000demo1", is_test=True,
+          frm="+15550001999", turns=(("caller", "this is a demo"),))
+    page = await _page(line, "/calls", code="jo-code")
+    assert "Only test calls so far" in page
+    assert "No calls yet" not in page
+    assert "Show test calls" in page
 
 
 async def test_a_line_that_has_never_rung_says_what_to_dial(line):
@@ -405,6 +419,93 @@ async def test_an_empty_inbox_says_nothing_is_waiting(line):
     assert "Nothing waiting" in page
 
 
+async def test_the_message_list_pages_fifty_at_a_time(line):
+    """Messages are never deleted, only aged of their words, so an unpaged list
+    would eventually render every message a business has ever taken."""
+    for i in range(120):
+        sid = _call(line, f"CA0000000000000000000000000pg{i:03d}",
+                    frm=f"+1555000{i:04d}")
+        _message(line, sid, name=f"Caller {i:03d}")
+
+    first = await _page(line, "/messages", code="jo-code")
+    assert first.count("msg-card") == 50
+    assert "Messages 1–50" in first
+    assert "Older messages" in first
+    assert "Newer messages" not in first
+
+    third = await _page(line, "/messages?page=3", code="jo-code")
+    assert third.count("msg-card") == 20
+    assert "Messages 101–120" in third
+    assert "Newer messages" in third
+    assert "Older messages" not in third
+
+
+async def test_the_waiting_count_in_the_heading_is_the_one_in_the_badge(line):
+    """Two counts of the same thing that can disagree are worse than either.
+    The heading and the badge are the same value, from one bounded COUNT."""
+    for i in range(60):
+        sid = _call(line, f"CA0000000000000000000000000ct{i:03d}",
+                    frm=f"+1555001{i:04d}")
+        _message(line, sid, name=f"Caller {i:03d}")
+
+    page = await _page(line, "/messages", code="jo-code")
+    assert "60 waiting · newest first" in page
+    badge = page.split('id="nav-waiting"', 1)[1][:200]
+    assert ">60<" in badge
+
+
+async def test_counting_the_messages_never_reads_them_all(line):
+    """The count is a COUNT. Drawing any page must not list every message a
+    line has ever taken to find out how many are waiting."""
+    for i in range(60):
+        sid = _call(line, f"CA0000000000000000000000000cn{i:03d}",
+                    frm=f"+1555002{i:04d}")
+        _message(line, sid)
+    assert line.STORE.count_messages(["acme"], "new") == 60
+    assert line.STORE.count_messages(["acme"], "done") == 0
+    assert line.STORE.count_messages(["other"]) == 0
+
+    async with dashboard(line) as dash:
+        real, sizes = dash.store.list_messages, []
+
+        def counted(*a, **k):
+            sizes.append(k.get("limit"))
+            return real(*a, **k)
+
+        dash.store.list_messages = counted
+        await _text(dash, "/messages", code="jo-code")
+    # one listing, and it asked for a page, not the table
+    assert sizes == [51], sizes
+
+
+async def test_moving_a_message_reads_one_row_not_the_whole_table(line):
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    message_id = _message(line, sid)
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("jo-code")
+        csrf = await dash.client.csrf("/messages")
+        real_get, real_list = dash.store.get_message, dash.store.list_messages
+        reads, listings = [], []
+
+        def counted_get(mid):
+            reads.append(mid)
+            return real_get(mid)
+
+        def counted_list(*a, **k):
+            listings.append(k)
+            return real_list(*a, **k)
+
+        dash.store.get_message = counted_get
+        dash.store.list_messages = counted_list
+        response = await dash.client.post(
+            f"/messages/{message_id}/status", {"csrf": csrf, "status": "done"},
+            headers=HTMX)
+    assert response.status == 200
+    assert reads == [message_id]              # one indexed read by id
+    assert listings == []                     # and no table scan at all
+    assert line.STORE.list_messages(["acme"])[0]["status"] == "done"
+
+
 async def test_the_message_list_is_filtered_by_status(line):
     first = _call(line, "CA00000000000000000000000000mine1")
     second = _call(line, "CA00000000000000000000000000mine2",
@@ -612,6 +713,9 @@ async def test_the_export_needs_a_session(line):
 # ======================================================== deleting a caller ===
 
 async def test_deleting_a_caller_removes_every_row_and_names_the_calls(line):
+    """The receipt arrives after a redirect, not rendered onto the POST: a
+    rendered POST comes back on refresh, and refreshing must not try the delete
+    again."""
     sid = _call(line, "CA00000000000000000000000000mine1", turns=(
         ("caller", "hello"),))
     _message(line, sid)
@@ -621,13 +725,18 @@ async def test_deleting_a_caller_removes_every_row_and_names_the_calls(line):
         response = await dash.client.post(
             "/callers/delete",
             {"csrf": csrf, "number": "+15550000142", "call_sid": sid})
-        body = await response.text()
+        assert response.status == 303
+        assert response.headers["Location"] == "/calls?deleted=1"
+        body = await (await dash.client.get("/calls?deleted=1")).text()
+        again = await (await dash.client.get("/calls?deleted=1")).text()
 
-    assert response.status == 200
     assert sid in body                                   # which calls went
     assert "by hand" in body                             # the pad sentence
     assert line.STORE.list_calls(["acme"]) == []
     assert line.STORE.list_messages(["acme"]) == []
+    # the receipt is shown once; a reload is just the call log
+    assert sid not in again
+    assert "by hand" not in again
 
 
 async def test_deleting_a_caller_is_written_down_without_the_number(line):
@@ -655,8 +764,73 @@ async def test_a_mistyped_number_deletes_nothing(line):
             {"csrf": csrf, "number": "+15550000143", "call_sid": sid})
         body = await response.text()
     assert response.status == 400
-    assert "exactly" in body.lower() or "does not match" in body.lower()
+    assert "does not match this caller" in body
     assert len(line.STORE.list_calls(["acme"])) == 1
+
+
+async def test_a_delete_with_no_call_to_confirm_against_is_refused(line):
+    """The typed number is checked against the call the box was opened on. With
+    no call there is nothing to check it against, so there is no delete."""
+    _call(line, "CA00000000000000000000000000mine1")
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("jo-code")
+        csrf = await dash.client.csrf("/calls")
+        response = await dash.client.post(
+            "/callers/delete", {"csrf": csrf, "number": "+15550000142"})
+    assert response.status == 404
+    assert len(line.STORE.list_calls(["acme"])) == 1
+
+
+async def test_a_delete_against_another_businesss_call_is_not_found(line):
+    theirs = _call(line, "CA0000000000000000000000000theirs", profile="other",
+                   frm="+15550000142")
+    _call(line, "CA00000000000000000000000000mine1")
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("jo-code")
+        csrf = await dash.client.csrf("/calls")
+        response = await dash.client.post(
+            "/callers/delete",
+            {"csrf": csrf, "number": "+15550000142", "call_sid": theirs})
+    assert response.status == 404
+    assert len(line.STORE.list_calls(["acme"])) == 1
+    assert len(line.STORE.list_calls(["other"])) == 1
+
+
+async def test_a_caller_whose_business_left_the_config_blocks_the_delete(line):
+    """The cross-business check cannot be a walk of the config: a call row whose
+    business was removed from businesses.toml is invisible to that, and it is
+    exactly the row a scoped delete must not take. The STORE decides."""
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    _call(line, "CA00000000000000000000000000gone01", profile="retired_co",
+          frm="+15550000142")
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("jo-code")
+        csrf = await dash.client.csrf(f"/calls/{sid}")
+        response = await dash.client.post(
+            "/callers/delete",
+            {"csrf": csrf, "number": "+15550000142", "call_sid": sid})
+        body = await response.text()
+    assert response.status == 403
+    assert "1 other business on this line" in body
+    assert "retired_co" not in body         # counted, never named
+    assert len(line.STORE.list_calls(["acme"])) == 1
+    assert len(line.STORE.list_calls(["retired_co"])) == 1
+
+
+async def test_the_whole_line_owner_can_delete_a_caller_from_every_business(line):
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    _call(line, "CA0000000000000000000000000theirs", profile="other",
+          frm="+15550000142")
+    _call(line, "CA00000000000000000000000000gone01", profile="retired_co",
+          frm="+15550000142")
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("line-code")
+        csrf = await dash.client.csrf(f"/calls/{sid}")
+        response = await dash.client.post(
+            "/callers/delete",
+            {"csrf": csrf, "number": "+15550000142", "call_sid": sid})
+    assert response.status == 303
+    assert line.STORE.list_calls(["acme", "other", "retired_co"]) == []
 
 
 async def test_a_caller_who_also_rang_another_business_is_refused(line):
@@ -671,7 +845,8 @@ async def test_a_caller_who_also_rang_another_business_is_refused(line):
             {"csrf": csrf, "number": "+15550000142", "call_sid": sid})
         body = await response.text()
     assert response.status == 403
-    assert "another business" in body
+    assert "1 other business on this line" in body
+    assert "Other Co" not in body           # counted, never named
     assert len(line.STORE.list_calls(["acme"])) == 1
     assert len(line.STORE.list_calls(["other"])) == 1
 
@@ -688,6 +863,72 @@ async def test_deleting_a_caller_without_the_token_changes_nothing(line):
 
 
 # ================================================================ the shell ===
+
+async def test_the_loading_line_is_the_only_thing_that_speaks(line):
+    """A live region around the whole list makes a screen reader read every row
+    again after a filter change. It belongs on the indicator alone — and the
+    indicator has to exist in the empty and error states too."""
+    for path in ("/calls", "/calls?q=nothing-matches-this"):
+        page = await _page(line, path, code="jo-code")
+        section = page.split('id="call-list"', 1)[1]
+        assert 'aria-live' not in section.split(">", 1)[0]
+        assert 'class="list-loading subtle htmx-indicator" role="status"' in section
+
+    async with dashboard(line) as dash:
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        dash.store.list_calls = boom
+        broken = await _text(dash, "/calls")
+    assert 'class="list-loading subtle htmx-indicator" role="status"' in broken
+
+
+async def test_the_show_more_words_are_in_the_page_not_in_the_stylesheet(line):
+    """Text a stylesheet invents cannot be translated, searched or copied."""
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    _message(line, sid, need=("They described the whole job twice over. " * 12).strip())
+    page = await _page(line, "/messages", code="jo-code")
+    assert ">Show more<" in page
+    assert ">Show less<" in page
+    css = (ADMIN_STATIC / "app.css").read_text(encoding="utf-8")
+    assert 'content: "Show more"' not in css
+
+
+async def test_a_note_longer_than_the_box_allows_is_cut_by_the_server(line):
+    """A form's maxlength is a suggestion to a browser and nothing at all to
+    anything else."""
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    _message(line, sid)
+    async with dashboard(line) as dash:
+        await dash.client.sign_in("jo-code")
+        csrf = await dash.client.csrf(f"/calls/{sid}")
+        response = await dash.client.post(
+            f"/calls/{sid}/note", {"csrf": csrf, "note": "x" * 5000})
+        page = await (await dash.client.get(f"/calls/{sid}")).text()
+    assert response.status == 303
+    assert len(line.STORE.list_messages(["acme"])[0]["note"]) == 2000
+    assert 'maxlength="2000"' in page
+
+
+async def test_the_export_writes_its_byte_order_mark_as_an_escape(line):
+    """An invisible character in the source is a character nobody reviewing
+    this file can see."""
+    source = (ADMIN_DIR / "views_messages.py").read_text(encoding="utf-8")
+    assert '"\\ufeff"' in source
+    assert "\ufeff" not in source
+
+
+async def test_a_page_that_reads_no_messages_still_shows_the_waiting_count(line):
+    """The count comes from the page shell, off the event loop — not from a
+    store read the template does while it renders."""
+    sid = _call(line, "CA00000000000000000000000000mine1")
+    _message(line, sid)
+    overview = await _page(line, "/", code="jo-code")
+    badge = overview.split('id="nav-waiting"', 1)[1][:200]
+    assert ">1<" in badge
+    admin = load_admin()
+    assert inspect.iscoroutinefunction(admin.render.page)
+    assert not inspect.iscoroutinefunction(admin.render.partial)
+
 
 async def test_the_navigation_now_offers_calls_and_messages(line):
     page = await _page(line, "/", code="jo-code")

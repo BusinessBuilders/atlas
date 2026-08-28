@@ -31,9 +31,14 @@ from .views_overview import MESSAGE_STATUS_WORDS, _read
 log = logging.getLogger("atlas-phone")
 
 PAGE_SIZE = 50
-# The most calls from one number this page will look through when checking that
-# a delete is all one owner's. Past it the check refuses instead of guessing.
+# The most of one caller's calls this page reads back to decide whether the
+# owner has any at all. It is NOT the safety check — the store enforces the
+# scope of a delete itself, exactly and without a limit.
 SCAN_LIMIT = 1000
+# A note is the owner's own words about one job, not a document. The box says
+# so and the server holds to it, because a form field's maxlength is a
+# suggestion to a browser and nothing at all to anything else.
+NOTE_MAX_CHARS = 2000
 # Mirrors service.PROFILE_DEFAULTS["retention_days"]: what the line keeps when a
 # business has not chosen for itself. A test pins the two together, because a
 # dashboard promising "kept for 90 days" while the purge runs at 30 would be a
@@ -230,10 +235,20 @@ def gather_calls(deps, session, query) -> dict:
     names = business_names(deps)
     for row in rows:
         decorate_call(row, messages.get(row["call_sid"]), names)
+
+    # "No calls yet — ring your number to test it" is the wrong thing to say to
+    # a line whose only calls ARE tests with the box unticked. One extra
+    # bounded read settles it, and only ever on a page that came back empty.
+    empty_start = (not rows and not filters["any"] and not error
+                   and filters["page"] == 1)
+    only_tests = False
+    if empty_start and not filters["show_test"]:
+        probe, _probe_error = _read("your call log", deps.store.list_calls,
+                                    filters["keys"], include_test=True, limit=1)
+        only_tests = bool(probe)
     return {"filters": filters, "rows": rows, "error": error,
             "messages_error": messages_error, "has_next": has_next,
-            "first_run": not rows and not filters["any"] and not error
-            and filters["page"] == 1}
+            "only_tests": only_tests, "first_run": empty_start and not only_tests}
 
 
 def owner_numbers(deps, session) -> list:
@@ -250,6 +265,7 @@ def _list_context(deps, session, data: dict) -> dict:
         "rows": data["rows"], "error": data["error"],
         "messages_error": data["messages_error"], "filters": filters,
         "has_next": data["has_next"], "first_run": data["first_run"],
+        "only_tests": data["only_tests"],
         "next_query": filter_query(filters, page=filters["page"] + 1),
         "prev_query": filter_query(filters, page=filters["page"] - 1)
         if filters["page"] > 2 else filter_query(filters),
@@ -281,8 +297,12 @@ async def calls(request: web.Request) -> web.Response:
     if request.headers.get("HX-Request"):
         return render.partial(request, deps, "_calls_list.html",
                               session=session, **context)
-    return render.page(request, deps, "calls.html", session=session,
-                       deleted=None, **_page_context(deps, session), **context)
+    # The receipt a delete left for exactly one page load, if this is it.
+    deleted = (render.pop_flash(request, session)
+               if request.query.get("deleted") else None)
+    return await render.page(request, deps, "calls.html", session=session,
+                             deleted=deleted, **_page_context(deps, session),
+                             **context)
 
 
 # --------------------------------------------------------- one call in full --
@@ -341,10 +361,10 @@ def gather_call(deps, session, call_sid: str) -> dict:
     }
 
 
-def _not_found(request, deps, session) -> web.Response:
+async def _not_found(request, deps, session) -> web.Response:
     """The same answer for a call that never existed and one that is not
     theirs. Anything else would let a stranger enumerate the line's calls."""
-    return render.page(
+    return await render.page(
         request, deps, "refused.html", session=session, status=404,
         reason=("That call is not on your line. It may have been deleted, or "
                 "aged out of your records."))
@@ -356,11 +376,11 @@ async def call_detail(request: web.Request) -> web.Response:
     call_sid = request.match_info["sid"]
     data = await asyncio.to_thread(gather_call, deps, session, call_sid)
     if data.get("refused"):
-        return render.page(request, deps, "refused.html", session=session,
+        return await render.page(request, deps, "refused.html", session=session,
                            status=503, reason=data["refused"])
     if data.get("missing"):
-        return _not_found(request, deps, session)
-    return render.page(
+        return await _not_found(request, deps, session)
+    return await render.page(
         request, deps, "call_detail.html", session=session,
         saved=str(request.query.get("saved", "")), delete_error="",
         deleting=request.query.get("delete") == "1", **data)
@@ -393,7 +413,7 @@ async def _guard(request, deps, session):
     form = await request.post()
     reason = deps.auth.check_csrf(request, session, form)
     if reason:
-        return form, render.page(request, deps, "refused.html", session=session,
+        return form, await render.page(request, deps, "refused.html", session=session,
                                  status=403, reason=reason)
     return form, None
 
@@ -408,10 +428,10 @@ async def mark_handled(request: web.Request) -> web.Response:
     call_sid = request.match_info["sid"]
     call = await _call_in_scope(deps, session, call_sid)
     if call is None:
-        return _not_found(request, deps, session)
+        return await _not_found(request, deps, session)
     message = await _message_of(deps, call)
     if message is None:
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", session=session, status=400,
             reason=("This call did not leave a message, so there is nothing to "
                     "mark as handled."))
@@ -436,70 +456,70 @@ async def add_note(request: web.Request) -> web.Response:
     call_sid = request.match_info["sid"]
     call = await _call_in_scope(deps, session, call_sid)
     if call is None:
-        return _not_found(request, deps, session)
+        return await _not_found(request, deps, session)
     message = await _message_of(deps, call)
     if message is None:
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", session=session, status=400,
             reason=("Notes are kept with the message a call leaves, and this "
                     "call did not leave one."))
     await asyncio.to_thread(deps.store.set_message_status, message["id"],
-                            message["status"], str(form.get("note", "")))
+                            message["status"],
+                            str(form.get("note", ""))[:NOTE_MAX_CHARS])
     raise web.HTTPSeeOther(f"/calls/{call_sid}?saved=note")
 
 
 # ------------------------------------------------------- deleting a caller ---
 
-def caller_calls(deps, session, number: str) -> dict:
-    """What this owner has for one number, and whether anybody else has any.
+def caller_calls(deps, session, number: str) -> list:
+    """This owner's calls from one number.
 
-    `mine` is every call of theirs from that number; `elsewhere` is True when
-    another business on this line also has one. The store's delete is by number
-    across the whole file, so a number two businesses share is not one owner's
-    to erase.
+    Used to answer "do you have any of these at all" and to tag the event with
+    the business they belong to. It is deliberately NOT the safety check: the
+    store decides whether a delete is inside this login's businesses, because a
+    call row whose business was removed from the config is invisible to
+    anything that enumerates the config — and that is precisely the row a
+    scoped delete must not take.
     """
     number = str(number or "").strip()
-    _numbers, profiles = deps.get_state()
-    # One past the ceiling, so a scan that could not see everything SAYS so
-    # rather than answering "nobody else has any" from a truncated read.
-    mine_rows = deps.store.list_calls(session.profile_keys, q=number,
-                                      include_test=True, limit=SCAN_LIMIT + 1)
-    too_many = len(mine_rows) > SCAN_LIMIT
-    mine = [row for row in mine_rows[:SCAN_LIMIT]
-            if str(row["from_number"]) == number]
-    if session.sees_whole_line:
-        return {"mine": mine, "elsewhere": False, "too_many": too_many}
-    others = tuple(k for k in profiles if k not in set(session.profile_keys))
-    theirs = deps.store.list_calls(others, q=number, include_test=True,
-                                   limit=SCAN_LIMIT + 1) if others else []
-    too_many = too_many or len(theirs) > SCAN_LIMIT
-    elsewhere = any(str(row["from_number"]) == number
-                    for row in theirs[:SCAN_LIMIT])
-    return {"mine": mine, "elsewhere": elsewhere, "too_many": too_many}
+    rows = deps.store.list_calls(session.profile_keys, q=number,
+                                 include_test=True, limit=SCAN_LIMIT)
+    return [row for row in rows if str(row["from_number"]) == number]
+
+
+# Why a delete did not happen, and the answer each reason earns. A key, not a
+# sentence: matching on the words of a message is how a rewording quietly turns
+# a 403 into a 400.
+REFUSAL_STATUS = {"not_yours": 403, "unknown": 400}
 
 
 def _delete_caller(deps, session, number: str) -> dict:
-    """The whole delete, in one blocking call: check the scope, remove the
-    rows, write down that it happened."""
-    found = caller_calls(deps, session, number)
-    if found["too_many"] and not session.sees_whole_line:
-        # Refusing is the only honest answer: this delete is by number across
-        # the whole file, and the check that it is all yours could not finish.
-        return {"error": (f"There are more than {SCAN_LIMIT} calls from that "
-                          "number on this line, which is more than this page "
-                          "can check in one go. Ask whoever manages the whole "
-                          "line to remove them.")}
-    if found["elsewhere"]:
-        return {"error": ("That number has also called another business on this "
-                          "line, so deleting its records is not yours to do. "
-                          "Ask whoever manages the whole line.")}
-    if not found["mine"]:
-        return {"error": ("No calls from that number are on your line. Type it "
-                          "exactly as it appears on the call, including the "
-                          "country code.")}
-    profiles = ({row["profile_key"] for row in found["mine"]}
-                if not found["too_many"] else set())
-    removed = deps.store.delete_caller(number)
+    """The whole delete, in one blocking call: check, remove, write it down.
+
+    Returns `{"reason": key, "text": sentence}` when nothing was deleted, or
+    the receipt when something was.
+    """
+    mine = caller_calls(deps, session, number)
+    if not mine:
+        return {"reason": "unknown",
+                "text": ("No calls from that number are on your line. Type it "
+                         "exactly as it appears on the call, including the "
+                         "country code.")}
+    profiles = {row["profile_key"] for row in mine}
+    # None means the whole line — the account that owns every business on it.
+    scope = None if session.sees_whole_line else session.profile_keys
+    try:
+        removed = deps.store.delete_caller(number, profile_keys=scope)
+    except PermissionError as refusal:
+        # The store counted the other businesses and named no key; neither do
+        # we. Nothing was deleted.
+        log.warning("dashboard: %s tried to delete a caller who has also rung "
+                    "another business on this line", session.owner_key)
+        said = str(refusal)
+        return {"reason": "not_yours",
+                "text": (said[0].upper() + said[1:] + ", so deleting its "
+                         "records is not yours to do. Ask whoever manages the "
+                         "whole line.")}
     try:
         # The kind and the counts, never the number: this row outlives the
         # delete, and a "deleted this caller" event naming them would be the
@@ -513,14 +533,19 @@ def _delete_caller(deps, session, number: str) -> dict:
         log.exception("call store: could not record the caller deletion")
     log.warning("dashboard: %s deleted %d rows for one caller (%d calls)",
                 session.owner_key, int(removed), len(removed.call_sids))
-    return {"rows": int(removed), "call_sids": list(removed.call_sids)}
+    return {"reason": "", "rows": int(removed),
+            "call_sids": list(removed.call_sids)}
 
 
 async def delete_caller(request: web.Request) -> web.Response:
     """Erase every record of one caller — the "delete my data" request.
 
     The owner types the number back, exactly, because there is no undo: the
-    calls, the words, the messages and the alert history all go.
+    calls, the words, the messages and the alert history all go. That
+    confirmation is MANDATORY, so this always starts from the call it was asked
+    from: no call, or a call that is not theirs, and there is nothing to
+    confirm the number against — which is a 404, the same answer as a call that
+    never existed.
     """
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
@@ -530,35 +555,35 @@ async def delete_caller(request: web.Request) -> web.Response:
     typed = str(form.get("number", "")).strip()
     call_sid = str(form.get("call_sid", "")).strip()
     call = await _call_in_scope(deps, session, call_sid) if call_sid else None
+    if call is None:
+        return await _not_found(request, deps, session)
 
-    if call is not None and typed != str(call["from_number"]):
-        data = await asyncio.to_thread(gather_call, deps, session, call_sid)
-        if data.get("missing") or data.get("refused"):
-            return _not_found(request, deps, session)
-        return render.page(
-            request, deps, "call_detail.html", session=session, status=400,
-            saved="", deleting=True,
-            delete_error=("That is not the number on this call. Type it exactly "
-                          "as it appears above, including the country code."),
-            **data)
+    if typed != str(call["from_number"]):
+        return await _refused_delete(
+            request, deps, session, call_sid, 400,
+            "The number you typed does not match this caller. Type it exactly "
+            "as it appears above, including the country code.")
 
     result = await asyncio.to_thread(_delete_caller, deps, session, typed)
-    if result.get("error"):
-        status_code = 403 if "another business" in result["error"] else 400
-        if call is not None:
-            data = await asyncio.to_thread(gather_call, deps, session, call_sid)
-            if not (data.get("missing") or data.get("refused")):
-                return render.page(request, deps, "call_detail.html",
-                                   session=session, status=status_code,
-                                   saved="", deleting=True,
-                                   delete_error=result["error"], **data)
-        return render.page(request, deps, "refused.html", session=session,
-                           status=status_code, reason=result["error"])
+    if result["reason"]:
+        return await _refused_delete(request, deps, session, call_sid,
+                                     REFUSAL_STATUS[result["reason"]],
+                                     result["text"])
 
-    # The call that was open is gone, so the answer is the log with the receipt
-    # on top of it — including the CallSids, which are what a person needs to
-    # find the pad entries this store cannot edit.
-    data = await asyncio.to_thread(gather_calls, deps, session, request.query)
-    return render.page(request, deps, "calls.html", session=session,
-                       deleted=result, **_page_context(deps, session),
-                       **_list_context(deps, session, data))
+    # Redirect, don't render: a receipt rendered straight onto the POST comes
+    # back when the owner refreshes, and "refresh re-runs the delete" is not
+    # something to leave in a product. The receipt waits one page for them.
+    render.set_flash(request, session, result)
+    raise web.HTTPSeeOther("/calls?deleted=1")
+
+
+async def _refused_delete(request, deps, session, call_sid: str,
+                          status_code: int, sentence: str) -> web.Response:
+    """The call's own page again, with the delete box open and the reason in
+    it. Nothing was deleted."""
+    data = await asyncio.to_thread(gather_call, deps, session, call_sid)
+    if data.get("missing") or data.get("refused"):
+        return await _not_found(request, deps, session)
+    return await render.page(request, deps, "call_detail.html", session=session,
+                             status=status_code, saved="", deleting=True,
+                             delete_error=sentence, **data)

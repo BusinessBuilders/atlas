@@ -28,6 +28,10 @@ from .views_overview import MESSAGE_STATUS_WORDS, _read
 log = logging.getLogger("atlas-phone")
 
 STATUSES = ("new", "in_progress", "done")
+# The same page size as the call log. Messages are never deleted — only aged of
+# their words — so a line two years old has thousands of them and an unpaged
+# list would render every one of them into the page.
+PAGE_SIZE = 50
 STATUS_TABS = (("new", "New"), ("in_progress", "In progress"), ("done", "Done"),
                ("", "All"))
 # Longer than this and the card clamps the body behind a "Show more" the owner
@@ -68,28 +72,52 @@ def decorate_message(message: dict, names: dict) -> dict:
     return message
 
 
-def gather_messages(deps, session, wanted: str) -> dict:
-    """The owner's messages, newest first, in one read."""
+def gather_messages(deps, session, wanted: str, page: int) -> dict:
+    """One page of the owner's messages, newest first.
+
+    One read for the rows, asking for one more than fits so "is there another
+    page" needs no count query. The unfiltered heading's number is the SAME
+    `waiting` the navigation badge draws — one value, so the two cannot
+    disagree; a filtered heading takes one bounded COUNT of its own.
+    """
     from . import views_calls          # for the business names, one source only
 
     chosen = wanted if wanted in STATUSES else None
     rows, error = _read("your messages", deps.store.list_messages,
-                        session.profile_keys, status=chosen)
+                        session.profile_keys, status=chosen,
+                        limit=PAGE_SIZE + 1, offset=(page - 1) * PAGE_SIZE)
+    rows = list(rows or [])
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     names = views_calls.business_names(deps)
-    for message in rows or []:
+    for message in rows:
         decorate_message(message, names)
+    total, total_error = (
+        _read("your messages", deps.store.count_messages,
+              session.profile_keys, chosen) if chosen else (None, ""))
     # `chosen`, never `status`: render.page() takes `status` for the HTTP code.
-    return {"messages": rows or [], "error": error, "chosen": chosen or "",
-            "wanted": wanted}
+    return {"messages": rows, "error": error or total_error,
+            "chosen": chosen or "", "wanted": wanted, "page": page,
+            "has_next": has_next, "total": total,
+            "first_row": (page - 1) * PAGE_SIZE + 1,
+            "last_row": (page - 1) * PAGE_SIZE + len(rows)}
+
+
+def _page_number(query) -> int:
+    try:
+        return max(1, int(str(query.get("page", "1")).strip() or 1))
+    except ValueError:
+        return 1
 
 
 async def messages(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
     wanted = str(request.query.get("status", "")).strip()
-    data = await asyncio.to_thread(gather_messages, deps, session, wanted)
+    page = _page_number(request.query)
+    data = await asyncio.to_thread(gather_messages, deps, session, wanted, page)
     unknown = bool(wanted) and wanted not in STATUSES
-    return render.page(
+    return await render.page(
         request, deps, "messages.html", session=session, tabs=STATUS_TABS,
         many_businesses=len(session.profile_keys) > 1,
         unknown_status=unknown, **data)
@@ -98,29 +126,35 @@ async def messages(request: web.Request) -> web.Response:
 def _message_in_scope(deps, session, message_id: int):
     """One message this owner owns, or None.
 
-    There is no read-one-message-by-id in the store, and adding one that did
-    not take the owner's businesses would be a hole. This asks the scoped
-    query — the same one the list uses — and picks the row out of it.
+    ONE indexed read by id, then the scope check on the row's own
+    `profile_key`. It used to walk the owner's whole message list looking for
+    the id, which is a table scan for every button press on a list that only
+    ever grows.
     """
-    for message in deps.store.list_messages(session.profile_keys,
-                                            include_test=True):
-        if int(message["id"]) == int(message_id):
-            return message
-    return None
+    message = deps.store.get_message(message_id)
+    if message is None:
+        return None
+    if str(message["profile_key"]) not in set(session.profile_keys):
+        return None
+    return message
 
 
 def _set_status(deps, session, message_id: int, wanted: str):
     """(the card, how many are still waiting), or (None, 0) when it is not
-    theirs. One blocking call: these are SQLite reads on the loop that carries
-    live calls."""
+    theirs.
+
+    One blocking call, one read: the row comes back once, the write is applied
+    to it in memory rather than read again. These are SQLite reads on the loop
+    that carries live calls.
+    """
     message = _message_in_scope(deps, session, message_id)
     if message is None:
         return None, 0
     deps.store.set_message_status(message["id"], wanted)
-    updated = _message_in_scope(deps, session, message_id)
+    message["status"], message["updated_at"] = wanted, time.time()
     from . import views_calls
-    card = decorate_message(updated, views_calls.business_names(deps))
-    return card, render.waiting_badge(deps, session)()
+    card = decorate_message(message, views_calls.business_names(deps))
+    return card, render.count_waiting(deps, session)
 
 
 async def message_status(request: web.Request) -> web.Response:
@@ -131,11 +165,11 @@ async def message_status(request: web.Request) -> web.Response:
     form = await request.post()
     reason = deps.auth.check_csrf(request, session, form)
     if reason:
-        return render.page(request, deps, "refused.html", session=session,
+        return await render.page(request, deps, "refused.html", session=session,
                            status=403, reason=reason)
     wanted = str(form.get("status", "")).strip()
     if wanted not in STATUSES:
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", session=session, status=400,
             reason=("That is not a state a message can be in, so nothing was "
                     "changed. Reload the page and try again."))
@@ -147,7 +181,7 @@ async def message_status(request: web.Request) -> web.Response:
                                                message_id, wanted)
     if updated is None:
         # Not theirs, or gone. The same answer either way.
-        return render.page(
+        return await render.page(
             request, deps, "refused.html", session=session, status=404,
             reason=("That message is not on your line. It may have been "
                     "deleted, or aged out of your records."))
@@ -223,7 +257,7 @@ async def messages_csv(request: web.Request) -> web.Response:
         # The byte-order mark is here on purpose: without it Excel on Windows
         # reads a UTF-8 file as Windows-1252 and turns an accented name into
         # mojibake. Every other spreadsheet skips it.
-        body=("﻿" + body).encode("utf-8"),
+        body=("\ufeff" + body).encode("utf-8"),
         content_type="text/csv", charset="utf-8",
         headers={"Content-Disposition":
                  f'attachment; filename="messages-{stamp}.csv"'})
