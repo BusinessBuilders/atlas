@@ -87,6 +87,89 @@ async def _page(svc, path="/", *, code="line-code", health=health_ok):
         return await response.text()
 
 
+# ====================================================== the design system ===
+
+def _luminance(hex_colour: str) -> float:
+    raw = hex_colour.lstrip("#")
+    channels = [int(raw[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+              for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    high, low = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def _mix(a: str, b: str, part: float) -> str:
+    """What CSS color-mix(in srgb, a <part>%, b) produces."""
+    a, b = a.lstrip("#"), b.lstrip("#")
+    return "#" + "".join(
+        f"{round(int(a[i:i + 2], 16) * part + int(b[i:i + 2], 16) * (1 - part)):02x}"
+        for i in (0, 2, 4))
+
+
+def test_the_unbranded_palette_is_readable():
+    """An install with no [branding] is the product's own face. These are the
+    ratios WCAG 2.2 AA asks for: 4.5:1 for text, 3:1 for a control's outline
+    and the focus ring."""
+    colors = load_admin().render.DEFAULT_COLORS
+    bg, card, fg = colors["bg"], colors["bg_elevated"], colors["fg"]
+
+    assert _contrast(fg, bg) >= 4.5                       # body text
+    assert _contrast(fg, card) >= 4.5
+    assert _contrast(colors["fg_muted"], card) >= 4.5     # hint text
+    assert _contrast(colors["fg_muted"], bg) >= 4.5
+    # the button's label is the page colour on the accent, at 13px — small text
+    assert _contrast(bg, colors["accent"]) >= 4.5
+    assert _contrast(colors["accent"], card) >= 3.0       # the focus ring
+    assert _contrast(_mix(fg, bg, 0.62), card) >= 3.0     # control borders
+    for state in ("ok", "warn", "danger"):
+        text = _mix(colors[state], fg, 0.5)
+        assert _contrast(text, card) >= 4.5, state
+
+
+def test_branding_becomes_css_custom_properties(two_brains):
+    """Every colour and font on the page comes from the config, so a reseller's
+    look is a setting and this vendor's is not compiled in."""
+    admin = load_admin()
+    branding = two_brains.Branding(
+        vendor_name="Acme Digital", product_name="Front Desk",
+        colors={"bg": "#101010", "accent": "#ff8800", "gold": "#ddaa22"},
+        fonts={"body": "Inter"})
+    css = admin.render.brand_css(branding)
+
+    assert "--brand-bg: #101010;" in css
+    assert "--brand-accent: #ff8800;" in css
+    assert "--brand-warn: #ddaa22;" in css        # a brand's gold IS its amber
+    assert "--brand-fg: #e8e8e8;" in css          # untouched keys keep default
+    assert "--font-body: 'Inter'," in css
+    assert "--font-display: system-ui" in css     # unnamed roles stay system
+    assert admin.render.google_fonts_url(branding) == (
+        "https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700"
+        "&display=swap")
+
+
+def test_a_colour_that_is_not_a_colour_is_refused_loudly(two_brains, caplog):
+    """These values are written into a stylesheet this server hands out."""
+    import logging
+
+    admin = load_admin()
+    branding = two_brains.Branding(
+        colors={"accent": "red; } body { display: none"},
+        fonts={"body": "Inter'); @import url(https://evil.example/x.css"})
+    with caplog.at_level(logging.WARNING, logger="atlas-phone"):
+        css = admin.render.brand_css(branding)
+
+    assert "display: none" not in css
+    assert "evil.example" not in css
+    assert "--brand-accent: #3b82f6;" in css      # the default, instead
+    assert "is not a colour" in caplog.text
+    assert "is not a font family name" in caplog.text
+    assert admin.render.google_fonts_url(branding) == ""
+
+
 # ================================================== the line-status band ====
 # Pure: the verdict is computed from what the page already read, so it can be
 # checked without a browser or a server.

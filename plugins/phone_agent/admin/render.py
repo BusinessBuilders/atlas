@@ -26,12 +26,18 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # The product's own look when nobody has branded it. Deliberately neutral: a
 # reseller's palette is a setting, not a value compiled into this file.
+#
+# Measured against WCAG 2.2 AA on these surfaces: body text 15.4:1, secondary
+# 9.3:1, hint 7.7:1, control borders 5.9:1, the focus ring 4.7:1 on a card, and
+# the primary button's label 5.1:1 on the accent. The accent is a step lighter
+# than the plan's #2563eb, which put that label at 3.66:1 — under the 4.5:1
+# small text needs.
 DEFAULT_COLORS = {
     "bg": "#0f1115",
     "bg_elevated": "#171a21",
     "fg": "#e8e8e8",
     "fg_muted": "#a6adb8",
-    "accent": "#2563eb",
+    "accent": "#3b82f6",
     "accent_2": "#0e9f8a",
     "danger": "#dc2626",
     "warn": "#d97706",
