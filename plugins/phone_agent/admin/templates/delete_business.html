@@ -28,6 +28,11 @@
       {% else %}
       <li>No phone number points at it, so no number changes.</li>
       {% endif %}
+      {% if losing_logins %}
+      <li>These sign-ins will lose this business until it is restored:
+        {{ losing_logins | join(', ') }}. They keep their other businesses, and
+        get this one back with it.</li>
+      {% endif %}
       <li>Its calls, messages and notes stay in your records, exactly as they
         are.</li>
       <li>You can put the whole thing back from Activity for the next

@@ -1508,8 +1508,10 @@ _TOP_LEVEL_KNOWN_KEYS = ("numbers", "profiles", "brains", "active_brain",
 
 # How long a removed business can still be put back from the dashboard.
 DELETED_PROFILE_RECOVERY_DAYS = 30
-# The one key this file adds to a business when it is put away.
+# The two keys this file adds to a business when it is put away: when it went,
+# and which dashboard logins covered it at the time.
 DELETED_AT_KEY = "deleted_at"
+DELETED_OWNERS_KEY = "owners"
 
 
 @dataclass
@@ -1576,6 +1578,23 @@ def parse_deleted_profiles(data: dict, profiles: dict) -> dict:
                 f"removed business {key!r} has {DELETED_AT_KEY} = {stamp!r}, "
                 "which is not a date and time this bridge can read"
             )
+        # Which dashboard logins covered it when it went. Removing a business
+        # takes it out of every `[owners.*]` list — without this, putting the
+        # business back would leave the people who used to see it locked out of
+        # it, which is not what "restorable for 30 days" says.
+        listed = profile.get(DELETED_OWNERS_KEY, [])
+        if isinstance(listed, str) or not isinstance(listed, (list, tuple)):
+            raise ValueError(
+                f"removed business {key!r} {DELETED_OWNERS_KEY} must be a list "
+                'of login names, like ["jo"]'
+            )
+        for name in listed:
+            if not isinstance(name, str) or not re.match(r"^[A-Za-z0-9_-]+$",
+                                                         name):
+                raise ValueError(
+                    f"removed business {key!r} {DELETED_OWNERS_KEY} entry "
+                    f"{name!r} is not a login name"
+                )
     return removed
 
 
@@ -2236,6 +2255,52 @@ def delivery_targets(profile: dict) -> DeliveryTargets:
     )
 
 
+# How long ONE push is given. The dashboard's test alert and a caller's real
+# message wait exactly the same amount of time, because they are the same
+# request — see push_ntfy.
+NTFY_TIMEOUT_SECONDS = 10
+
+
+async def push_ntfy(target: DeliveryTargets, *, title: str, body: str,
+                    priority: str | None = None, session=None) -> tuple:
+    """Send one push to a business's topic. Returns (it worked, why it did not).
+
+    THE push. A caller's message, the last-resort urgent escalation and the
+    dashboard's "send a test alert" all come through here, so the test an owner
+    presses is byte-for-byte the request their customers' messages ride on: the
+    same address, the same headers, the same ten seconds, and the same rule that
+    anything but 200 is a failure. A test that took an easier path than the real
+    thing would be a test of nothing.
+
+    Never raises: the reason comes back as a sentence, because every caller has
+    something different to do with it (degrade the line's health, escalate, or
+    put it on the screen the owner is looking at).
+
+    `session` reuses a connection the caller already has open; without one a
+    session is opened and closed around the single request.
+    """
+    if not (target.ntfy_url and target.ntfy_topic):
+        return False, "no push address is set up for this business or this line"
+    headers = {"Title": title}
+    if priority:
+        headers["Priority"] = priority
+    http = aiohttp.ClientSession() if session is None else session
+    try:
+        async with http.post(
+            f"{target.ntfy_url}/{target.ntfy_topic}", data=body.encode(),
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=NTFY_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status != 200:
+                return False, f"the push server answered HTTP {response.status}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        if session is None:
+            await http.close()
+    return True, ""
+
+
 def profile_now(profile: dict, profile_key: str = "") -> datetime:
     """The current moment in the BUSINESS's timezone.
 
@@ -2353,6 +2418,7 @@ PRODUCT_DEFAULTS = {
     "number_limits": tuple(_PROFILE_NUMBER_LIMITS),
     "recovery_days": DELETED_PROFILE_RECOVERY_DAYS,
     "deleted_at_key": DELETED_AT_KEY,
+    "deleted_owners_key": DELETED_OWNERS_KEY,
     "known_profile_keys": tuple(_PROFILE_KNOWN_KEYS),
 }
 
@@ -2918,34 +2984,29 @@ async def deliver_note(http: aiohttp.ClientSession, *, call_sid: str,
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "off")
         return True
-    try:
-        async with http.post(
-            f"{targets.ntfy_url}/{targets.ntfy_topic}", data=push_body.encode(),
-            headers={"Title": title},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"ntfy returned HTTP {resp.status}")
+    sent, failure = await push_ntfy(targets, title=title, body=push_body,
+                                    session=http)
+    if sent:
         NTFY_FAILURES = 0
         log.info("message pad: ntfy push sent (%s)", call_sid)
         _store_write("log_notify", call_sid, profile_key,
                      profile_key, "ntfy", True, call_sid=call_sid)
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "sent")
-    except Exception as e:
+    else:
         # The pad entry survives, but the owner learns about messages FROM
         # the push. A dead push channel means messages piling up in a file
         # nobody is watching — degrade /health until one succeeds (H-2).
         NTFY_FAILURES += 1
         log.error("ntfy push FAILED (%s), %d in a row — the pad entry is saved but "
-                  "the owner has not been told: %s: %s",
-                  call_sid, NTFY_FAILURES, type(e).__name__, e)
+                  "the owner has not been told: %s",
+                  call_sid, NTFY_FAILURES, failure)
         record_event("error", "ntfy_push_failed",
-                     f"{NTFY_FAILURES} consecutive: {type(e).__name__}: {e}",
+                     f"{NTFY_FAILURES} consecutive: {failure}",
                      call_sid, profile_key)
         _store_write("log_notify", call_sid, profile_key,
-                     profile_key, "ntfy", False,
-                     error=f"{type(e).__name__}: {e}"[:200], call_sid=call_sid)
+                     profile_key, "ntfy", False, error=failure[:200],
+                     call_sid=call_sid)
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "failed")
     return True
@@ -2979,28 +3040,22 @@ async def _escalate_undelivered(http: aiohttp.ClientSession, *, call_sid: str,
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "off")
         return
-    try:
-        async with http.post(
-            f"{targets.ntfy_url}/{targets.ntfy_topic}", data=note.encode(),
-            headers={"Title": f"UNDELIVERED phone message - {profile['business_name']} line",
-                     "Priority": "urgent"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"ntfy returned HTTP {resp.status}")
+    sent, failure = await push_ntfy(
+        targets, priority="urgent", body=note, session=http,
+        title=f"UNDELIVERED phone message - {profile['business_name']} line")
+    if sent:
         log.error("message pad UNWRITABLE — urgent push sent instead (%s)", call_sid)
         _store_write("log_notify", call_sid, profile_key,
                      profile_key, "ntfy_urgent", True, call_sid=call_sid)
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "escalated")
-    except Exception as e:
-        log.exception("urgent push FAILED (%s) — the message reached NOTHING but the "
-                      "fallback file", call_sid)
-        record_event("error", "urgent_push_failed", f"{type(e).__name__}: {e}",
-                     call_sid, profile_key)
+    else:
+        log.error("urgent push FAILED (%s) — the message reached NOTHING but the "
+                  "fallback file: %s", call_sid, failure)
+        record_event("error", "urgent_push_failed", failure, call_sid, profile_key)
         _store_write("log_notify", call_sid, profile_key,
-                     profile_key, "ntfy_urgent", False,
-                     error=f"{type(e).__name__}: {e}"[:200], call_sid=call_sid)
+                     profile_key, "ntfy_urgent", False, error=failure[:200],
+                     call_sid=call_sid)
         _store_write("set_notify_status", call_sid, profile_key,
                      call_sid, "failed")
 
@@ -4654,6 +4709,7 @@ async def _serve() -> None:
             get_brain_health=lambda: BRAIN_HEALTH,
             apply_config=apply_config,
             delivery_targets=delivery_targets,
+            push_ntfy=push_ntfy,
             profile_setting=profile_setting,
             opening_line=opening_line,
             parse_config=parse_config,

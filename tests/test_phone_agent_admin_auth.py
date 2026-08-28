@@ -150,6 +150,7 @@ def dashboard_kwargs(svc, *, health=health_ok, brain_health=None, store=True):
         else (lambda: brain_health),
         apply_config=svc.apply_config,
         delivery_targets=svc.delivery_targets,
+        push_ntfy=svc.push_ntfy,
         profile_setting=svc.profile_setting,
         opening_line=svc.opening_line,
         parse_config=svc.parse_config,

@@ -18,8 +18,9 @@
   <a class="filter on" href="/activity" aria-current="page">Activity</a>
 </nav>
 
-{% if flash %}
-<p class="notice" role="status" aria-live="polite">{{ flash }}</p>
+{% if note %}
+<p class="notice {{ 'notice-ok' if note.ok else 'notice-bad' }}"
+   role="{{ 'status' if note.ok else 'alert' }}" aria-live="polite">{{ note.text }}</p>
 {% endif %}
 
 {% if removed %}
@@ -39,12 +40,7 @@
         <span class="subtle">{% if row.at %}Removed {{ row.at | fmt_local }}{% else %}Removed — the date was not recorded{% endif %}{% if row.restorable %} · {{ row.window_days - row.age_days }} day{{ '' if (row.window_days - row.age_days) == 1 else 's' }} left to put it back{% else %} · past the {{ row.window_days }}-day window{% endif %}</span>
       </span>
       {% if row.restorable and whole_line %}
-      <form method="post" action="/activity/restore-business">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="business" value="{{ row.key }}">
-        <button class="btn btn-ghost btn-small" type="submit"
-                data-busy-label="Putting back…">{{ icon("undo", 16) }}Put it back</button>
-      </form>
+      <a class="btn btn-ghost btn-small" href="/activity?restore-business={{ row.key }}">{{ icon("undo", 16) }}Put it back…</a>
       {% endif %}
     </li>
     {% endfor %}
@@ -99,12 +95,8 @@
       </details>
       {% endif %}
       {% if change.can_restore and whole_line %}
-      <form method="post" action="/activity/restore" class="change-restore">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="change_id" value="{{ change.id }}">
-        <button class="btn btn-quiet btn-small" type="submit"
-                data-busy-label="Putting back…">{{ icon("undo", 16) }}Put the settings back to before this</button>
-      </form>
+      <a class="btn btn-quiet btn-small change-restore"
+         href="/activity?restore={{ change.id }}">{{ icon("undo", 16) }}Put the settings back to before this…</a>
       {% endif %}
     </li>
     {% endfor %}
@@ -157,4 +149,56 @@
     {% endif %}
   </section>
 </div>
+{% endblock %}
+
+{% block overlay %}
+{# Server-rendered open dialogs, the same pattern the model switch uses: the
+   confirm works with or without JavaScript, which this page's CSP would not
+   let us add inline anyway. They live OUTSIDE the shell, which base.html marks
+   `inert` while one is open, and say `aria-modal` because `inert` has now made
+   that true. Both are resolved against the rows really on this page, so the
+   URL cannot put a summary or a business name of its own in front of anybody. #}
+{% if confirming %}
+<dialog class="confirm" open aria-modal="true" aria-labelledby="restore-title">
+  <form method="post" action="/activity/restore" class="stack-16">
+    <h2 class="display display-m flush" id="restore-title">Restore the settings
+      from just before {{ confirming.ts | fmt_local }}?</h2>
+    <p class="muted flush">Everything changed since then will be undone — that
+      is “{{ confirming.summary }}”, and anything saved after it. The new
+      settings take effect on the next call.</p>
+    <p class="muted flush">The settings are checked before they are applied. If
+      that version is no longer valid — a model it names has been removed, say
+      — nothing changes and you are told why.</p>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="change_id" value="{{ confirming.id }}">
+    <input type="hidden" name="confirm" value="on">
+    <div class="row-gap">
+      <button class="btn btn-primary" type="submit" data-busy-label="Putting back…">Put the settings back</button>
+      <a class="btn btn-quiet" href="/activity" autofocus>Cancel</a>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% if confirming_business %}
+<dialog class="confirm" open aria-modal="true" aria-labelledby="restore-business-title">
+  <form method="post" action="/activity/restore-business" class="stack-16">
+    <h2 class="display display-m flush" id="restore-business-title">Bring
+      {{ confirming_business.name }} back?</h2>
+    <p class="muted flush">Its settings return exactly as they were when it was
+      removed{% if confirming_business.at %}, on {{ confirming_business.at | fmt_local }}{% endif %}.
+      No phone number answers for it until you set one on the Numbers screen.</p>
+    {% if confirming_business.owners %}
+    <p class="muted flush">These sign-ins get it back:
+      {{ confirming_business.owners | join(', ') }}.</p>
+    {% endif %}
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="business" value="{{ confirming_business.key }}">
+    <input type="hidden" name="confirm" value="on">
+    <div class="row-gap">
+      <button class="btn btn-primary" type="submit" data-busy-label="Putting back…">Bring it back</button>
+      <a class="btn btn-quiet" href="/activity" autofocus>Cancel</a>
+    </div>
+  </form>
+</dialog>
+{% endif %}
 {% endblock %}

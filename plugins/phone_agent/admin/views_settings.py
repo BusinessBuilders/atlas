@@ -469,6 +469,7 @@ def page_context(deps, session, key: str) -> dict:
         "business_key": key,
         "business": edit.business_name(deps, key),
         "businesses": edit.businesses(deps, session),
+        "recovery_days": int(deps.product_defaults.get("recovery_days", 30)),
         "main_sections": [drawn[name] for name in MAIN_COLUMN],
         "side_sections": [drawn[name] for name in SIDE_COLUMN],
     }
@@ -603,6 +604,13 @@ def _page_with(deps, session, key: str, section: str, refused: dict) -> dict:
 
 # ---------------------------------------------------- removing a business --
 
+def _logins_covering(deps, key: str) -> list:
+    """Every sign-in that can currently see this business (the whole-line ones
+    excluded — they are not narrowed by it and cannot lose it)."""
+    return sorted(name for name, owner in (deps.get_owners() or {}).items()
+                  if key in list(owner.profiles))
+
+
 def _logins_left_with_nothing(deps, key: str) -> list:
     """Sign-ins that cover ONLY this business, and would be left covering none.
 
@@ -622,6 +630,7 @@ def _deletion(deps, key: str) -> dict:
     left = [name for name in profiles if name != key]
     remaining_numbers = [n for n in numbers if n not in set(mapped)]
     orphaned = _logins_left_with_nothing(deps, key)
+    losing = [name for name in _logins_covering(deps, key) if name not in orphaned]
     blocked = ""
     if not left:
         blocked = ("This is the only business on your line, and a phone line "
@@ -637,7 +646,7 @@ def _deletion(deps, key: str) -> dict:
                    "else, so removing it would leave that login with nothing to "
                    "open. Whoever set your line up has to give that sign-in "
                    "another business, or take it away, first.")
-    return {"numbers": mapped, "blocked": blocked,
+    return {"numbers": mapped, "blocked": blocked, "losing_logins": losing,
             "recovery_days": int(deps.product_defaults.get("recovery_days", 30))}
 
 
@@ -707,14 +716,22 @@ def _remove(deps, session, key: str, name: str):
     config = deps.get_config()
     profiles = {k: v for k, v in config.profiles.items() if k != key}
     numbers = {n: owner for n, owner in config.numbers.items() if owner != key}
+    losing = _logins_covering(deps, key)
     put_away = dict(config.profiles[key])
     put_away[str(deps.product_defaults.get("deleted_at_key", "deleted_at"))] = (
         datetime.now().astimezone().replace(microsecond=0).isoformat())
+    if losing:
+        # Which logins covered it, kept WITH it. Every sign-in stops covering a
+        # removed business (an owner list naming one the config no longer has is
+        # refused), so without this note, putting the business back would leave
+        # the people who used to work it locked out of it — and "restorable for
+        # 30 days" would be a promise about the settings only.
+        put_away[str(deps.product_defaults.get("deleted_owners_key",
+                                               "owners"))] = list(losing)
     removed = dict(config.deleted_profiles)
     removed[key] = put_away
-    # Every sign-in stops covering it too. One that named ONLY this business is
-    # refused before we get here (`_deletion`), so nobody is left with a login
-    # that opens nothing.
+    # A login that named ONLY this business is refused before we get here
+    # (`_deletion`), so nobody is left with a sign-in that opens nothing.
     owners = {
         owner_key: dataclasses.replace(
             owner, profiles=[p for p in owner.profiles if p != key])

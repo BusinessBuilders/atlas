@@ -19,7 +19,6 @@ import asyncio
 import logging
 import time
 
-import aiohttp
 from aiohttp import web
 
 from . import config_edit as edit
@@ -27,8 +26,6 @@ from . import render
 
 log = logging.getLogger("atlas-phone")
 
-# The same ten seconds service.deliver_note gives a real message's push.
-PUSH_TIMEOUT_SECONDS = 10
 # The name this attempt is written down under, so a test is never mistaken for
 # a caller's message in the delivery log.
 TEST_TARGET = "ntfy_test"
@@ -168,29 +165,6 @@ def _check(deps, values: dict, profile: dict, form) -> dict:
 
 # ------------------------------------------------------------- send a test --
 
-async def push(url: str, topic: str, body: str, title: str) -> str:
-    """Send one push exactly the way a caller's message is sent. "" or the
-    reason it failed.
-
-    Deliberately the same request as `service.deliver_note` makes: same
-    address shape, same Title header, same ten-second cap, same "anything but
-    200 is a failure" rule. A test that took an easier path than the real thing
-    would be a test of nothing.
-    """
-    try:
-        async with aiohttp.ClientSession() as http:
-            async with http.post(
-                f"{url.rstrip('/')}/{topic}", data=body.encode(),
-                headers={"Title": title},
-                timeout=aiohttp.ClientTimeout(total=PUSH_TIMEOUT_SECONDS),
-            ) as response:
-                if response.status != 200:
-                    return f"the push server answered HTTP {response.status}"
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"
-    return ""
-
-
 async def send_test(request: web.Request) -> web.Response:
     deps = request.app[render.DEPS]
     session = deps.auth.require(request)
@@ -212,28 +186,32 @@ async def send_test(request: web.Request) -> web.Response:
                    "the line has a push address set up. Fill in the address "
                    "and the topic below, save, then try again."))
     stamp = time.strftime("%-I:%M %p on %A")
-    failure = await push(
-        targets["live_url"], targets["live_topic"],
-        f"This is a test alert from your phone line's settings screen, sent at "
-        f"{stamp}. A real message from a caller arrives the same way.",
-        f"{name} — test alert")
+    # THE push — service.push_ntfy, the one a caller's message rides on. Same
+    # address, same headers, same timeout, same "anything but 200 is a failure"
+    # rule. The target is resolved by the service's own delivery_targets, so a
+    # business with no address of its own is tested on the line's.
+    sent, failure = await deps.push_ntfy(
+        deps.delivery_targets(profile), title=f"{name} — test alert",
+        body=f"This is a test alert from your phone line's settings screen, "
+             f"sent at {stamp}. A real message from a caller arrives the same "
+             f"way.")
     try:
         await asyncio.to_thread(deps.store.log_notify, key, TEST_TARGET,
-                                not failure, failure or None)
+                                sent, failure or None)
     except Exception:
         log.exception("call store: could not record the test alert")
-    if failure:
+    if sent:
+        log.info("dashboard: %s sent a test alert for %s", session.owner_key, key)
+    else:
         log.warning("dashboard: %s sent a test alert for %s and it FAILED: %s",
                     session.owner_key, key, failure)
-    else:
-        log.info("dashboard: %s sent a test alert for %s", session.owner_key, key)
     result = {
-        "ok": not failure,
+        "ok": sent,
         "target": f"{targets['live_url'].rstrip('/')}/{targets['live_topic']}",
         "text": ("Sent. It should be on your phone now — if it is not, the push "
                  "server took it but your device is not subscribed to this "
-                 "topic.") if not failure
+                 "topic.") if sent
         else f"It did not go through: {failure}",
     }
     return await _page(request, deps, session, key,
-                       status=200 if not failure else 400, result=result)
+                       status=200 if sent else 400, result=result)

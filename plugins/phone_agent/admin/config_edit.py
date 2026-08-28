@@ -27,10 +27,18 @@ log = logging.getLogger("atlas-phone")
 STALE_MESSAGE = ("This page is out of date — reload to see the latest settings. "
                  "Nothing was changed.")
 # What a phone number has to look like once the dashboard has tidied it up.
-E164 = re.compile(r"^\+[0-9]{7,15}$")
+# Eight digits at the shortest: below that it is a local number, not something
+# the phone network can route to.
+E164 = re.compile(r"^\+[0-9]{8,15}$")
+NOT_A_NUMBER = ("Enter a full phone number with area code, like "
+                "(774) 555-0100, or an international number starting with +.")
 # Room for a sentence somebody reads out loud, not a document. The server holds
 # to these: a maxlength attribute is a suggestion to a browser and nothing at
 # all to anything else.
+# The dashboard's own caps on how long a typed value may be. They are NOT the
+# service's — the config file itself has no limits on these fields — they are
+# what stops somebody pasting a document into a sentence a caller has to sit
+# through. Refused with the count, never truncated.
 LIMITS = {
     "business_name": 120,
     "services": 240,
@@ -175,12 +183,15 @@ def default_or_none(deps, name: str, value):
 
 # -------------------------------------------------------------- the input --
 
-def text_of(form, name: str, limit: int = 0) -> str:
-    """One typed field, tidied but never silently shortened."""
-    value = str(form.get(name, "")).replace("\r\n", "\n").strip()
-    if limit and len(value) > limit:
-        return value[:limit * 2]      # kept for redisplay; the check refuses it
-    return value
+def text_of(form, name: str) -> str:
+    """One typed field, tidied but never silently shortened.
+
+    Nothing is truncated here on purpose: a value too long for its field is
+    REFUSED with the count, and comes back in the box exactly as typed. Cutting
+    it down quietly would be the same data loss this whole screen exists to
+    remove, applied one field at a time.
+    """
+    return str(form.get(name, "")).replace("\r\n", "\n").strip()
 
 
 def rows_of(form, name: str) -> list:
@@ -200,6 +211,17 @@ def e164(text: str) -> tuple:
     brackets and hyphens; the phone network wants it as a plus, a country code
     and nothing else. Doing that for them here is the difference between a
     setting that works and a form that keeps saying no.
+
+    Three shapes are accepted and NOTHING else:
+
+      * ten digits, which is a North American number as it is dialled;
+      * eleven digits starting with 1, the same number with its country code;
+      * an explicit `+` and 8 to 15 digits, which is the international form.
+
+    Anything else is refused rather than padded with a plus. A seven-digit
+    local number is not a number this line can be reached on — turning it into
+    `+5550001` would save a setting that can never match an incoming call, and
+    the owner would find out when somebody could not get through.
     """
     typed = str(text or "").strip()
     if not typed:
@@ -208,15 +230,13 @@ def e164(text: str) -> tuple:
     if typed.startswith("+"):
         candidate = "+" + digits
     elif len(digits) == 10:
-        candidate = "+1" + digits          # a North American number as dialled
+        candidate = "+1" + digits
     elif len(digits) == 11 and digits.startswith("1"):
         candidate = "+" + digits
     else:
-        candidate = "+" + digits if digits else ""
+        return typed, NOT_A_NUMBER
     if not E164.match(candidate):
-        return typed, ("That is not a phone number this line can dial. Write it "
-                       "as you would dial it — (555) 000-0001 — or with the "
-                       "country code, like +15550000001.")
+        return typed, NOT_A_NUMBER
     return candidate, ""
 
 

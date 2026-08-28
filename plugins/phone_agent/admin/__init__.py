@@ -115,7 +115,7 @@ async def _loud_failures(request: web.Request, handler):
 
 def build_admin_app(*, get_state, get_config, get_brains, get_branding,
                     get_owners, get_health, get_brain_health, apply_config,
-                    delivery_targets, profile_setting, opening_line,
+                    delivery_targets, push_ntfy, profile_setting, opening_line,
                     parse_config, config_from_diff,
                     acknowledge_delivery_failure, store, public_base="",
                     product_defaults=None) -> web.Application:
@@ -138,6 +138,7 @@ def build_admin_app(*, get_state, get_config, get_brains, get_branding,
         get_brains=get_brains, get_branding=get_branding, get_owners=get_owners,
         get_health=get_health, get_brain_health=get_brain_health,
         apply_config=apply_config, delivery_targets=delivery_targets,
+        push_ntfy=push_ntfy,
         profile_setting=profile_setting, opening_line=opening_line,
         parse_config=parse_config, config_from_diff=config_from_diff,
         acknowledge_delivery_failure=acknowledge_delivery_failure,

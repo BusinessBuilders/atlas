@@ -386,7 +386,7 @@ async def test_a_number_that_is_not_a_number_keeps_what_was_typed(line):
 
     assert response.status == 400
     assert "ring my mobile" in body
-    assert "not a phone number this line can dial" in body
+    assert "Enter a full phone number with area code" in body
     assert "forward_to" not in line.PROFILES["acme"]
 
 
@@ -596,7 +596,7 @@ async def test_a_number_that_is_not_a_number_is_refused(line):
 
     assert response.status == 400
     assert "the shop phone" in page
-    assert "not a phone number this line can dial" in page
+    assert "Enter a full phone number with area code" in page
     assert len(line.NUMBERS) == 1
 
 
@@ -636,14 +636,14 @@ async def test_a_scoped_owner_sees_their_numbers_read_only(two):
 
 async def test_the_send_test_button_really_sends_and_says_what_happened(
         line, monkeypatch):
-    admin = load_admin()
     sent = {}
 
-    async def fake_push(url, topic, body, title):
-        sent.update(url=url, topic=topic, body=body, title=title)
-        return ""
+    async def fake_push(target, *, title, body, priority=None, session=None):
+        sent.update(url=target.ntfy_url, topic=target.ntfy_topic, body=body,
+                    title=title, priority=priority)
+        return True, ""
 
-    monkeypatch.setattr(admin.views_notifications, "push", fake_push)
+    monkeypatch.setattr(line, "push_ntfy", fake_push)
     line.apply_config(
         dataclasses.replace(
             line.CONFIG,
@@ -670,12 +670,10 @@ async def test_the_send_test_button_really_sends_and_says_what_happened(
 
 
 async def test_a_test_that_failed_says_so_loudly(line, monkeypatch):
-    admin = load_admin()
+    async def fake_push(target, *, title, body, priority=None, session=None):
+        return False, "ConnectionError: name or service not known"
 
-    async def fake_push(url, topic, body, title):
-        return "ConnectionError: name or service not known"
-
-    monkeypatch.setattr(admin.views_notifications, "push", fake_push)
+    monkeypatch.setattr(line, "push_ntfy", fake_push)
     line.apply_config(
         dataclasses.replace(
             line.CONFIG,
@@ -743,10 +741,18 @@ async def test_activity_lists_the_change_with_its_diff_and_puts_it_back(line):
         page = _text(await (await dash.client.get("/activity")).text())
         assert "Changed the greeting callers hear for Acme Co" in page
         assert "Good morning, Acme." in page          # the diff on expand
-        change_id = page.split('name="change_id" value="', 1)[1].split('"', 1)[0]
-        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
-        response = await dash.client.post("/activity/restore",
-                                          {"csrf": csrf, "change_id": change_id})
+        change_id = str(line.STORE.list_config_changes()[0]["id"])
+        assert f'href="/activity?restore={change_id}"' in page
+
+        # the button opens a confirm; the confirm is what posts
+        dialog = _text(await (await dash.client.get(
+            f"/activity?restore={change_id}")).text())
+        assert "Everything changed since then will be undone" in dialog
+        assert 'name="confirm" value="on"' in dialog
+        csrf = dialog.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        response = await dash.client.post(
+            "/activity/restore",
+            {"csrf": csrf, "change_id": change_id, "confirm": "on"})
         assert response.status == 303, await response.text()
 
     assert line.PROFILES["acme"]["greeting"] == "hi"
@@ -804,7 +810,8 @@ async def test_a_scoped_owner_cannot_restore_a_whole_version(two):
         body = _text(await (await dash.client.get("/settings/acme")).text())
         csrf = body.split('name="csrf" value="', 1)[1].split('"', 1)[0]
         response = await dash.client.post(
-            "/activity/restore", {"csrf": csrf, "change_id": str(change_id)})
+            "/activity/restore",
+            {"csrf": csrf, "change_id": str(change_id), "confirm": "on"})
 
     assert response.status == 403
     assert two.PROFILES["acme"]["greeting"] == "Acme, hello"
@@ -857,9 +864,14 @@ async def test_removing_a_business_is_reversible_and_unhooks_its_numbers(two):
         activity = _text(await (await dash.client.get("/activity")).text())
         assert "Removed businesses" in activity
         assert "Other Co" in activity
-        csrf = activity.split('name="csrf" value="', 1)[1].split('"', 1)[0]
-        back = await dash.client.post("/activity/restore-business",
-                                      {"csrf": csrf, "business": "other"})
+        assert 'href="/activity?restore-business=other"' in activity
+        dialog = _text(await (await dash.client.get(
+            "/activity?restore-business=other")).text())
+        assert "Bring Other Co back?" in dialog
+        csrf = dialog.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        back = await dash.client.post(
+            "/activity/restore-business",
+            {"csrf": csrf, "business": "other", "confirm": "on"})
         assert back.status == 303, await back.text()
 
     assert two.PROFILES["other"]["business_name"] == "Other Co"
@@ -891,9 +903,11 @@ async def test_a_business_removed_too_long_ago_is_not_offered_back(tmp_path,
         await _signed_in(dash)
         page = _text(await (await dash.client.get("/activity")).text())
         assert "past the 30-day window" in page
+        assert 'restore-business=oldco' not in page   # not even offered
         csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
-        response = await dash.client.post("/activity/restore-business",
-                                          {"csrf": csrf, "business": "oldco"})
+        response = await dash.client.post(
+            "/activity/restore-business",
+            {"csrf": csrf, "business": "oldco", "confirm": "on"})
         assert response.status == 303
     assert "oldco" not in svc.PROFILES
 
@@ -1291,7 +1305,385 @@ async def test_a_refusal_keeps_your_typing_with_javascript_off_too(line):
     # the whole page came back, with what was typed still in the boxes
     assert "ring the shop" in page
     assert 'value="put me through"' in page
-    assert "not a phone number this line can dial" in page
+    assert "Enter a full phone number with area code" in page
     # and every other section is still drawn, from the live settings
     assert 'id="section-greeting"' in page and 'id="section-facts"' in page
     assert "forward_to" not in line.PROFILES["acme"]
+
+
+# ============================== what a scoped owner may read in a diff =======
+
+HAND_WRITTEN = '''[numbers]
+"+15550001111" = "acme"
+"+15550002222" = "other"
+
+[owners.jo]
+token_env = "PHONE_OWNER_JO_TOKEN"
+profiles = ["acme"]
+
+[profiles.acme]
+business_name = "Acme Co"
+services = "widget repair"
+owner_name = "Jo"
+greeting = "hi"
+
+[profiles.other]
+ntfy_url = "https://push.other.test"
+ntfy_topic = "other-co-secret-topic"
+greeting = "hello"
+owner_name = "Sam"
+business_name = "Other Co"
+services = "other work"
+'''
+
+
+@pytest.fixture
+def hand_written(tmp_path, monkeypatch):
+    """Two businesses in a file nobody has saved from the dashboard yet — so
+    the FIRST save rewrites the whole thing, which is the case that leaked."""
+    monkeypatch.setenv("PHONE_OWNER_JO_TOKEN", "jo-code")
+    return _import_service(tmp_path, monkeypatch,
+                           extra_env={"ADMIN_TOKEN": "line-code"},
+                           cfg_text=HAND_WRITTEN)
+
+
+async def test_a_scoped_owner_never_reads_another_business_out_of_a_diff(
+        hand_written):
+    """The stored diff carries every line of BOTH versions so a restore can be
+    exact. A first save on a hand-written config therefore rewrites the whole
+    file — and the rendered diff has to be filtered to this owner's own
+    businesses BEFORE the context window is worked out, or three lines of
+    "context" around their own change hand them the neighbour's push topic."""
+    hand_written.apply_config(
+        dataclasses.replace(hand_written.CONFIG, profiles=dict(
+            hand_written.CONFIG.profiles,
+            acme=dict(hand_written.CONFIG.profiles["acme"],
+                      greeting="Good morning, Acme."))),
+        "line", "Changed the greeting callers hear for Acme Co")
+
+    async with dashboard(hand_written) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+
+    # their own change is there, in full
+    assert "Changed the greeting callers hear for Acme Co" in scoped
+    assert "Good morning, Acme." in scoped
+    # and not one line of the business next door
+    assert "other-co-secret-topic" not in scoped
+    assert "push.other.test" not in scoped
+    assert "[profiles.other]" not in scoped
+    assert "Other Co" not in scoped
+    assert "Sam" not in scoped
+    # said out loud, rather than silently trimmed
+    assert "other businesses on this line changed in the same save" in scoped
+
+    async with dashboard(hand_written) as dash:
+        await _signed_in(dash, "line-code")
+        whole = _text(await (await dash.client.get("/activity")).text())
+
+    # the account that manages the line sees all of it
+    assert "other-co-secret-topic" in whole
+    assert "[profiles.other]" in whole
+
+
+def test_the_diff_filter_is_pure_and_keeps_the_owners_own_lines(hand_written):
+    """The exact shape of the first save on a hand-written file: the emitter
+    puts every key in its own order, so the neighbour's whole section moves and
+    lands in the diff as changed lines."""
+    admin = load_admin()
+    with open(hand_written.BUSINESS_CONFIG, encoding="utf-8") as f:
+        before = f.read()
+    after = hand_written.config_toml(hand_written.CONFIG).replace(
+        'greeting = "hi"', 'greeting = "Good morning."')
+    diff = hand_written.config_diff(before, after)
+
+    # unfiltered, the neighbour IS in there — which is what had to be filtered
+    everything = admin.views_activity.visible_diff(diff, None)
+    assert any("other-co-secret-topic" in line["text"] for line in everything)
+
+    mine = admin.views_activity.visible_diff(diff, ("acme",))
+    text = " ".join(line["text"] for line in mine)
+    assert "Good morning." in text and "Acme Co" in text
+    assert "other-co-secret-topic" not in text
+    assert "push.other.test" not in text
+    assert "Sam" not in text
+    assert admin.views_activity.OTHER_BUSINESSES in text
+
+
+# ==================================== a removed business and its sign-ins ====
+
+TWO_LOGINS = TWO_BUSINESSES.replace(
+    'profiles = ["acme"]', 'profiles = ["acme", "other"]')
+
+
+@pytest.fixture
+def shared_login(tmp_path, monkeypatch):
+    """One scoped login that covers BOTH businesses, so removing one leaves it
+    with something and the delete is allowed."""
+    monkeypatch.setenv("PHONE_OWNER_JO_TOKEN", "jo-code")
+    return _import_service(tmp_path, monkeypatch,
+                           extra_env={"ADMIN_TOKEN": "line-code"},
+                           cfg_text=TWO_LOGINS)
+
+
+async def test_a_removed_business_gives_its_logins_back_when_it_returns(
+        shared_login):
+    """Removing a business takes it out of every sign-in's list, because a list
+    naming a business the config no longer has is refused. Putting it back has
+    to put THAT back too, or "restorable for 30 days" is a promise about the
+    settings only and Jo quietly loses a business she used to work."""
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash)
+        page = _text(await (await dash.client.get(
+            "/business/other/delete")).text())
+        # the consequence is named before the button, not discovered afterwards
+        assert "These sign-ins will lose this business until it is restored: jo" \
+            in page
+        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        version = page.split('name="version" value="', 1)[1].split('"', 1)[0]
+        response = await dash.client.post("/business/other/delete", {
+            "csrf": csrf, "version": version, "confirm": "Other Co"})
+        assert response.status == 303, await response.text()
+
+    assert list(shared_login.OWNERS["jo"].profiles) == ["acme"]
+    put_away = shared_login.CONFIG.deleted_profiles["other"]
+    assert put_away["owners"] == ["jo"]
+    # and it survives a round trip through the file
+    reparsed = shared_login.parse_config(
+        tomllib.loads(shared_login.config_toml(shared_login.CONFIG)))
+    assert reparsed.deleted_profiles["other"]["owners"] == ["jo"]
+
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash)
+        dialog = _text(await (await dash.client.get(
+            "/activity?restore-business=other")).text())
+        assert "These sign-ins get it back: jo." in dialog
+        csrf = dialog.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        back = await dash.client.post(
+            "/activity/restore-business",
+            {"csrf": csrf, "business": "other", "confirm": "on"})
+        assert back.status == 303, await back.text()
+        after = _text(await (await dash.client.get("/activity")).text())
+
+    assert sorted(shared_login.OWNERS["jo"].profiles) == ["acme", "other"]
+    assert "These sign-ins can see it again: jo." in after
+    # the bookkeeping key does not come back as a business setting
+    assert "owners" not in shared_login.PROFILES["other"]
+    assert "deleted_at" not in shared_login.PROFILES["other"]
+
+
+async def test_a_scoped_login_really_gets_the_business_back(shared_login):
+    """Not just the config text — Jo can open it again."""
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash)
+        page = _text(await (await dash.client.get(
+            "/business/other/delete")).text())
+        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        version = page.split('name="version" value="', 1)[1].split('"', 1)[0]
+        await dash.client.post("/business/other/delete", {
+            "csrf": csrf, "version": version, "confirm": "Other Co"})
+
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash, "jo-code")
+        assert (await dash.client.get("/settings/other")).status == 404
+
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash)
+        dialog = _text(await (await dash.client.get(
+            "/activity?restore-business=other")).text())
+        csrf = dialog.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        await dash.client.post("/activity/restore-business",
+                               {"csrf": csrf, "business": "other",
+                                "confirm": "on"})
+
+    async with dashboard(shared_login) as dash:
+        await _signed_in(dash, "jo-code")
+        assert (await dash.client.get("/settings/other")).status == 200
+
+
+def test_a_removed_business_may_name_the_logins_that_had_it(tmp_path,
+                                                            monkeypatch):
+    with_owners = DELETED_CONFIG.replace(
+        'deleted_at = "2026-08-01T09:00:00-04:00"',
+        'deleted_at = "2026-08-01T09:00:00-04:00"\nowners = ["jo"]')
+    svc = _import_service(tmp_path, monkeypatch, cfg_text=with_owners)
+    assert svc.CONFIG.deleted_profiles["oldco"]["owners"] == ["jo"]
+    assert 'owners = ["jo"]' in svc.config_toml(svc.CONFIG)
+
+    with pytest.raises(SystemExit):
+        _import_service(tmp_path, monkeypatch,
+                        cfg_text=with_owners.replace('owners = ["jo"]',
+                                                     'owners = "jo"'))
+
+
+# =========================================== a number this line can dial =====
+
+def test_only_a_number_the_phone_network_can_route_is_accepted():
+    """A seven-digit local number padded to `+5550001` would save a setting that
+    can never match an incoming call, and the owner would find out when
+    somebody could not get through."""
+    e164 = load_admin().config_edit.e164
+
+    assert e164("(774) 555-0100") == ("+17745550100", "")
+    assert e164("7745550100") == ("+17745550100", "")
+    assert e164("1 (774) 555-0100") == ("+17745550100", "")
+    assert e164("+44 20 7946 0018") == ("+442079460018", "")
+    assert e164("") == ("", "")
+
+    for refused in ("555-0001", "1234-5678", "12345", "+123", "ring my mobile",
+                    "+1234567890123456"):
+        kept, why = e164(refused)
+        assert kept == refused, refused          # what was typed comes back
+        assert "Enter a full phone number with area code" in why, refused
+
+
+async def test_a_local_number_is_refused_on_the_transfer_field(line):
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        response = await _save(dash.client, "/settings/acme/transfer", {
+            "transfer_on": "on", "forward_to": "555-0001",
+            "phrase": ["operator"]})
+        body = _text(await response.text())
+
+    assert response.status == 400
+    assert "555-0001" in body                     # still in the box
+    assert "Enter a full phone number with area code" in body
+    assert "forward_to" not in line.PROFILES["acme"]
+
+
+# ============================================= restoring is confirmed =======
+
+async def test_neither_restore_happens_without_the_confirm(line):
+    """A stale tab, or a form somebody rebuilt, must not put a whole version of
+    the settings back on one unconfirmed POST."""
+    line.apply_config(
+        dataclasses.replace(line.CONFIG, profiles={
+            "acme": dict(line.CONFIG.profiles["acme"], greeting="Changed.")}),
+        "line", "Changed the greeting callers hear for Acme Co")
+    change_id = str(line.STORE.list_config_changes()[0]["id"])
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        body = _text(await (await dash.client.get("/settings/acme")).text())
+        csrf = body.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+
+        unconfirmed = await dash.client.post(
+            "/activity/restore", {"csrf": csrf, "change_id": change_id})
+        assert unconfirmed.status == 400
+        assert "was not confirmed" in _text(await unconfirmed.text())
+
+        no_business = await dash.client.post(
+            "/activity/restore-business", {"csrf": csrf, "business": "acme"})
+        assert no_business.status == 400
+        assert "was not confirmed" in _text(await no_business.text())
+
+    assert line.PROFILES["acme"]["greeting"] == "Changed."
+
+
+async def test_the_restore_confirm_is_really_modal(line):
+    line.apply_config(
+        dataclasses.replace(line.CONFIG, profiles={
+            "acme": dict(line.CONFIG.profiles["acme"], greeting="Changed.")}),
+        "line", "Changed the greeting callers hear for Acme Co")
+    change_id = str(line.STORE.list_config_changes()[0]["id"])
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        page = await (await dash.client.get(
+            f"/activity?restore={change_id}")).text()
+
+    assert "<dialog" in page and 'aria-modal="true"' in page
+    # the page behind it is out of reach, which is what makes aria-modal true
+    assert '<div class="shell" inert>' in page
+    # and the URL cannot put words of its own on the page
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        invented = await (await dash.client.get(
+            "/activity?restore=999999")).text()
+    assert "<dialog" not in invented
+
+
+async def test_a_refused_restore_is_not_dressed_as_a_success(line):
+    """"Nothing was changed" in the colour of a done job is the screen lying
+    about what happened."""
+    line.apply_config(
+        dataclasses.replace(line.CONFIG, profiles={
+            "acme": dict(line.CONFIG.profiles["acme"], greeting="Changed.")}),
+        "line", "Changed the greeting callers hear for Acme Co")
+
+    async with dashboard(line) as dash:
+        await _signed_in(dash)
+        body = _text(await (await dash.client.get("/settings/acme")).text())
+        csrf = body.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        # a change id that is not on this line any more
+        await dash.client.post("/activity/restore",
+                               {"csrf": csrf, "change_id": "424242",
+                                "confirm": "on"})
+        page = await (await dash.client.get("/activity")).text()
+
+    assert "notice notice-bad" in page
+    assert 'role="alert"' in page
+    assert "Nothing was changed." in _text(page)
+
+
+# ================================ one push, for the test and the message =====
+
+async def test_the_test_alert_and_a_real_message_are_the_same_request(line):
+    """The button an owner presses has to ride on the request their customers'
+    messages ride on, or it is a test of something else."""
+    seen = []
+
+    class Recorder:
+        def post(self, url, **kwargs):
+            seen.append({"url": url, "headers": dict(kwargs["headers"]),
+                         "timeout": kwargs["timeout"].total,
+                         "body": kwargs["data"]})
+            return self
+
+        async def __aenter__(self):
+            class Response:
+                status = 200
+            return Response()
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def close(self):
+            return None
+
+    targets = line.DeliveryTargets(messages_file="/dev/null",
+                                   ntfy_url="https://push.acme.test",
+                                   ntfy_topic="acme-phone")
+    session = Recorder()
+
+    # what a caller's message sends
+    ok, why = await line.push_ntfy(targets, title="Acme Co — new message",
+                                   body="a message", session=session)
+    assert (ok, why) == (True, "")
+    # what the dashboard's test button sends
+    ok, why = await line.push_ntfy(targets, title="Acme Co — test alert",
+                                   body="a test", session=session)
+    assert (ok, why) == (True, "")
+
+    message, test = seen
+    assert message["url"] == test["url"] == "https://push.acme.test/acme-phone"
+    assert message["timeout"] == test["timeout"] == line.NTFY_TIMEOUT_SECONDS
+    assert set(message["headers"]) == set(test["headers"]) == {"Title"}
+
+    # and the dashboard really calls it — same function, not a copy
+    admin = load_admin()
+    assert not hasattr(admin.views_notifications, "push")
+    source = (admin.views_notifications.__file__)
+    with open(source, encoding="utf-8") as f:
+        body = f.read()
+    assert "deps.push_ntfy(" in body
+    assert "aiohttp.ClientSession" not in body
+
+
+async def test_a_push_with_nowhere_to_go_says_so_instead_of_raising(line):
+    ok, why = await line.push_ntfy(
+        line.DeliveryTargets(messages_file="/dev/null", ntfy_url="",
+                             ntfy_topic=""),
+        title="t", body="b")
+    assert ok is False
+    assert "no push address is set up" in why

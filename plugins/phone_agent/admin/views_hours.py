@@ -258,14 +258,14 @@ def open_now(deps, profile: dict) -> dict:
 # -------------------------------------------------------------- the screen --
 
 def page_context(deps, session, key: str, *, values=None, errors=None,
-                 error: str = "", saved: bool = False) -> dict:
+                 error: str = "") -> dict:
     profile = edit.profile_of(deps, key)
     values = read_hours(deps, profile) if values is None else values
     return {
         "business_key": key, "business": edit.business_name(deps, key),
         "businesses": edit.businesses(deps, session),
         "values": values, "errors": dict(errors or {}), "error": error,
-        "saved": saved, "version": edit.version(deps),
+        "version": edit.version(deps),
         "zones": zone_choices(values["timezone"]),
         "after_hours_choices": AFTER_HOURS_WORDS,
         "forward_to": str(profile.get("forward_to", "")),

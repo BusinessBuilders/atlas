@@ -351,8 +351,11 @@ class Deps:
     # hot-apply, write the audit row. Returns None, or the sentence saying why
     # nothing changed.
     apply_config: object
-    # Where one business's messages go, line-wide defaults filled in.
+    # Where one business's messages go, line-wide defaults filled in, and THE
+    # push — the same request a caller's message rides on, so "send a test
+    # alert" cannot drift into being a test of something else.
     delivery_targets: object
+    push_ntfy: object
     # One business setting, or the product's own default when the profile is
     # silent. Every settings screen reads through it rather than keeping a
     # second copy of what "unset" means.
