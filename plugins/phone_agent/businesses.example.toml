@@ -139,11 +139,12 @@ after_hours_greeting = "Thanks for calling Acme Plumbing. We're closed right now
 # given here — never in this file. An owner sees only the businesses listed;
 # ["*"] means every business on this line.
 #
-# WHAT THIS DOES TODAY: these sections are validated at boot and on every save,
-# and a save can never drop them. The dashboard that READS them is the admin/
-# package being built on this branch; until it is installed, sign-in still uses
-# the single ADMIN_TOKEN env var (which counts as an owner of every business),
-# so adding [owners.jo] here does not yet give Jo a login of her own.
+# These sections are validated at boot and on every save, and a save can never
+# drop them: a login written in here by hand cannot be lost by pressing Save on
+# an unrelated screen. Adding [owners.jo] (and her token in the env file) gives
+# Jo her own sign-in, seeing only the businesses listed. The single ADMIN_TOKEN
+# env var still works alongside them and counts as an owner of every business;
+# the dashboard shows it as "Line owner".
 #
 # [owners.jo]
 # token_env = "PHONE_OWNER_JO_TOKEN"

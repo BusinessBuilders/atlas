@@ -57,11 +57,15 @@ Config file (systemd loads it via EnvironmentFile): ~/.config/atlas-phone/env
                        https://magiccat.tail09c6c9.ts.net:10000/phone
   WS_TOKEN             legacy shared secret in the wss URL. Still required,
                        but only ACCEPTED while WS_SECRET is unset.
-  WS_SECRET            any long random string. When set, every call gets its
-                       own short-lived, single-use websocket token signed with
-                       this (and the shared WS_TOKEN stops being accepted) —
-                       so a relay URL read out of the public nginx access log
-                       is worthless minutes later. Set it.
+  WS_SECRET            a long random string, AT LEAST 16 characters (a shorter
+                       one is refused at boot: a one-byte secret signing every
+                       per-call token is worse than the static token it
+                       replaces, and it looks like a fix). When set, every call
+                       gets its own short-lived, single-use websocket token
+                       signed with this (and the shared WS_TOKEN stops being
+                       accepted) — so a relay URL read out of the public nginx
+                       access log is worthless minutes later. Set it:
+                       openssl rand -hex 32.
   OLLAMA_URL           OpenAI-compatible base, e.g. http://127.0.0.1:11434/v1
   MODEL                default model name — MUST be non-thinking (see above)
   BUSINESS_CONFIG      optional path to businesses.toml (default: next to
