@@ -10,36 +10,53 @@ the things a human eye misses on the twentieth read of the same page.
     # in another
     python tests/e2e/phone_dashboard_checks.py http://127.0.0.1:8931
 
-Standard library only — no pytest, no Playwright, no requests. The filename
-does not start with `test_`, so pytest never collects it; it is a tool you run
-and read, and it exits non-zero when a check fails.
+No pytest, no Playwright, no requests. The filename does not start with
+`test_`, so pytest never collects it; it is a tool you run and read, and it
+exits non-zero when a check fails. It is standard library only bar one import:
+it loads `run_dashboard_fixture` (beside it) to ask the dashboard app itself
+which routes it serves, so the screen list cannot drift away from the router.
 
 What it checks, and why each one is worth a machine's time:
 
-  1. **Owner vocabulary.** No screen may say `journalctl`, `TOML`, `env file`,
+  1. **Every GET screen is walked.** The list is not written out by hand: it
+     comes from `app.router.routes()`, with the fixture's own business keys and
+     CallSid put into `{profile}` and `{sid}`. A route that is neither walked
+     nor in the commented skip list is a FAILURE — otherwise a screen added
+     tomorrow is unchecked and the table still says PASS.
+  2. **Owner vocabulary.** No screen may say `journalctl`, `TOML`, `env file`,
      `profile key`, `hot-apply` or `non-thinking`. Those are words from inside
      the machine; the person reading this dashboard owns a plumbing company.
-  2. **Every control has a label.** Every `input`, `select` and `textarea`
+  3. **Every control has a label.** Every `input`, `select` and `textarea`
      must be reachable by name — a `<label for=>`, a wrapping `<label>`, or an
      `aria-label`. A screen reader cannot guess.
-  3. **Contrast.** Hint text must clear 4.5:1 and the outline of anything you
+  4. **Contrast.** Hint text must clear 4.5:1 and the outline of anything you
      can click must clear 3:1, computed from the CSS custom properties the
      browser actually resolves — including `color-mix()`, which is how this
-     stylesheet derives most of its palette from two brand colours.
-  4. **No inline script and no `style=` attributes.** The dashboard serves a
+     stylesheet derives most of its palette from two brand colours. The rules
+     that USE those tokens are checked too: a `.hint` repointed at another
+     custom property would otherwise leave this measuring a colour nothing on
+     the page is painted with, and passing.
+  5. **No inline script and no `style=` attributes.** The dashboard serves a
      Content-Security-Policy with no `unsafe-inline`; anything inline is
      refused by the browser, which means it is a feature that silently is not
      there.
-  5. **Every link answers.** Every internal link on every screen is fetched
+  6. **Every link answers.** Every internal link on every screen is fetched
      and must come back 200. A link into a 404 is something a customer finds,
      not something we should.
+  7. **The other business is invisible.** Every value belonging to the business
+     the scoped login does not own, hunted for in the RAW HTML of that login's
+     screens — not in the visible text. Most of a business's data reaches the
+     page inside `value=` attributes, and a text-only view is blind to exactly
+     the leak this check exists to catch.
 
 It prints one PASS/FAIL line per check with the failures underneath.
 """
 from __future__ import annotations
 
+import pathlib
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -201,15 +218,22 @@ class Palette:
 class Page(HTMLParser):
     """One rendered screen, pulled apart into the things worth checking."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, body: str = "") -> None:
         super().__init__(convert_charrefs=True)
         self.url = url
+        # The bytes the browser was served, kept whole. The tenancy check reads
+        # THIS, not `text`: a leak arrives in an input's `value=`, a hidden
+        # field or an `href` far more often than in a text node.
+        self.body = body
         self.text_parts: list = []
         self.controls: list = []       # (tag, attrs dict, wrapped_in_label)
         self.label_targets: set = set()
         self.inline_scripts = 0
         self.style_attrs: list = []
         self.links: set = set()
+        # The same links in the order they appear, so "the first row's link"
+        # means the first row and not the alphabetically-first CallSid.
+        self.link_order: list = []
         self._skip = 0
         self._label_depth: list = []
         self._open: list = []
@@ -237,6 +261,7 @@ class Page(HTMLParser):
             self.controls.append((tag, a, bool(self._label_depth)))
         elif tag == "a" and a.get("href"):
             self.links.add(a["href"])
+            self.link_order.append(a["href"])
         # Words a person reads that are not text nodes.
         for key in ("placeholder", "aria-label", "title", "alt"):
             if a.get(key):
@@ -349,7 +374,7 @@ class Client:
         status, body, headers = self.request(path)
         if status != 200:
             raise SystemExit(f"{path} answered {status}")
-        page = Page(path)
+        page = Page(path, body)
         page.feed(body)
         return page
 
@@ -381,39 +406,167 @@ class Report:
         return 1 if broken else 0
 
 
-def screens(client: Client, whole_line: bool) -> list:
-    """Every screen this sign-in can reach, plus the detail pages the
-    navigation does not list."""
-    paths = ["/", "/calls", "/calls?show_test=on", "/messages",
-             "/messages?status=new", "/settings", "/settings/acme",
-             "/hours", "/hours/acme", "/numbers", "/notifications",
-             "/notifications/acme", "/activity",
-             "/business/acme/delete"]
-    if whole_line:
-        paths += ["/brain", "/settings/riverside", "/hours/riverside",
-                  "/notifications/riverside"]
-    # The newest call, whatever it is, so Call detail is checked with real
-    # content rather than a guessed CallSid.
-    calls = client.page("/calls")
-    for href in sorted(calls.links):
+# GET routes that are not screens. Everything here is deliberate and stays
+# short: a route is walked unless there is a reason in writing.
+#
+#   * the three bundled assets and the two generated ones are files, not pages
+#     — no words a person reads, no controls to label. `app.css` and
+#     `brand.css` ARE fetched, by the contrast check, which is where a
+#     stylesheet belongs;
+#   * `/static/logo` answers 404 unless the line configures a logo, and this
+#     fixture does not;
+#   * `/favicon.ico` is the same image as `/static/icon.svg`.
+SKIPPED_ROUTES = {
+    "/static/app.css", "/static/app.js", "/static/htmx.min.js",
+    "/static/brand.css", "/static/icon.svg", "/static/logo", "/favicon.ico",
+}
+# The placeholders this knows how to fill. A route with any other placeholder
+# is left un-walked ON PURPOSE, so the route-coverage check fails and says so
+# rather than this guessing a value and reporting a pass.
+KNOWN_PLACEHOLDERS = {"profile", "sid"}
+# The businesses the fixture gives each sign-in. `riverside` belongs to the
+# whole line only — asking for it as the scoped owner is a 404, which is the
+# tenancy control working and not a screen to check.
+PROFILES = {True: ("acme", "riverside"), False: ("acme",)}
+# Screens that are a query away from a route rather than a route of their own.
+# These are states a customer really reaches, so they are walked too; they are
+# not part of route coverage, because the router does not know about them.
+QUERY_STATES = ("/calls?show_test=on", "/messages?status=new")
+
+
+def newest_call_path(client: Client) -> str:
+    """The link on the first row of the call log — the newest call.
+
+    The order is the page's, not `sorted()`: the log is newest first, so the
+    first `/calls/<sid>` link in the document is the newest call. A fixture
+    with no calls, or a link shape that has changed, stops this dead rather
+    than quietly dropping Call detail out of the walk and still saying PASS.
+    """
+    for href in client.page("/calls").link_order:
         if re.fullmatch(r"/calls/[A-Za-z0-9]+", href):
-            paths.append(href)
-            break
+            return href
+    raise SystemExit("no call-detail link on /calls — the fixture is not seeded")
+
+
+def restore_dialog_path(client: Client) -> str:
+    """The Activity screen with a restore confirm open on it."""
+    for href in client.page("/activity").link_order:
+        if re.fullmatch(r"/activity\?restore=\d+", href):
+            return href
+    raise SystemExit("no restore link on /activity — the fixture is not seeded")
+
+
+def screens(client: Client, whole_line: bool, routes) -> list:
+    """Every screen this sign-in can reach, derived from the app's own routes.
+
+    Nothing here is a hand-written path. `{profile}` becomes each business this
+    login owns and `{sid}` becomes the newest call; the query-string states go
+    on the end. `/sign-in` is walked signed OUT, by `main`.
+    """
+    sid_path = newest_call_path(client)
+    paths = []
+    for canonical in routes:
+        if canonical in SKIPPED_ROUTES or canonical == "/sign-in":
+            continue
+        if not whole_line and canonical == "/brain":
+            # Choosing the model is the line's to do, so this login gets a 403.
+            # That refusal is a tenancy control with its own test; it is not a
+            # screen, and walking it here would only stop the checker.
+            continue
+        placeholders = set(re.findall(r"\{(\w+)\}", canonical))
+        if not placeholders <= KNOWN_PLACEHOLDERS:
+            continue
+        if "{profile}" in canonical:
+            paths += [canonical.replace("{profile}", key)
+                      for key in PROFILES[whole_line]]
+        elif "{sid}" in canonical:
+            paths.append(sid_path)
+        else:
+            paths.append(canonical)
+    paths += list(QUERY_STATES)
+    if whole_line:
+        paths.append(restore_dialog_path(client))
     return paths
+
+
+def route_coverage(routes, walked) -> list:
+    """Routes that were neither walked nor skipped, in writing.
+
+    This is the check that keeps the rest honest: add a screen tomorrow and,
+    without this, every other row still prints PASS over a list that never
+    heard of it.
+    """
+    patterns = []
+    for path in walked:
+        bare = path.split("?", 1)[0]
+        patterns.append(bare)
+    missed = []
+    for canonical in routes:
+        if canonical in SKIPPED_ROUTES:
+            continue
+        shape = re.escape(canonical)
+        for name in re.findall(r"\{(\w+)\}", canonical):
+            shape = shape.replace(re.escape("{" + name + "}"), r"[^/]+")
+        if not any(re.fullmatch(shape, bare) for bare in patterns):
+            missed.append(f"{canonical} — never walked, and not in the "
+                          f"skip list")
+    return missed
+
+
+def rule_declares(css: str, selector: str, token: str) -> bool:
+    """Does the rule for exactly `selector` mention `token`?
+
+    The contrast figures below are computed from custom properties. This is
+    what ties them to the page: if `.hint` is ever repointed at a different
+    property, measuring `--fg-quiet` would keep passing while the hint text on
+    screen went unmeasured.
+    """
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    for selectors, block in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+        names = [s.strip() for s in selectors.split(",")]
+        if selector in names and token in block:
+            return True
+    return False
+
+
+def dashboard_get_routes() -> list:
+    """The GET routes the dashboard serves, from the app itself.
+
+    Built in a throwaway directory beside the running fixture, which is why
+    this file is not quite standard-library-only. Cheap next to being wrong:
+    the alternative is a list of screens typed out by hand that stops matching
+    the router the first time somebody adds one.
+    """
+    here = pathlib.Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import run_dashboard_fixture
+
+    with tempfile.TemporaryDirectory(prefix="dashboard-routes-") as tmp:
+        return run_dashboard_fixture.get_routes(pathlib.Path(tmp))
 
 
 def main(argv) -> int:
     base = argv[1] if len(argv) > 1 else "http://127.0.0.1:8931"
     report = Report()
+    routes = dashboard_get_routes()
 
+    # The sign-in screen is the first thing every customer sees and the only
+    # thing a stranger sees, so it is walked with no session at all.
+    stranger = Client(base)
     line = Client(base)
     line.sign_in("line-code")
     scoped = Client(base)
     scoped.sign_in("acme-code")
 
+    walks = (("stranger", stranger, ["/sign-in"]),
+             ("line", line, screens(line, True, routes)),
+             ("acme", scoped, screens(scoped, False, routes)))
+    walked = [path for _who, _client, paths in walks for path in paths]
+
     pages, banned, unlabelled, inline, styles = {}, [], [], [], []
-    for who, client, whole in (("line", line, True), ("acme", scoped, False)):
-        for path in screens(client, whole):
+    for who, client, paths in walks:
+        for path in paths:
             page = client.page(path)
             pages[(who, path)] = page
             for word in sorted({m.group(0) for m in BANNED.finditer(page.text)}):
@@ -426,6 +579,8 @@ def main(argv) -> int:
             for tag, cls, value in page.style_attrs:
                 styles.append(f"{who} {path}: <{tag} class={cls!r} style={value!r}>")
 
+    report.add("every GET route walked", route_coverage(routes, walked),
+               f"{len(routes)} routes, {len(SKIPPED_ROUTES)} of them assets")
     report.add("owner vocabulary", banned,
                f"{len(pages)} screens, none of the six words")
     report.add("every control labelled", unlabelled,
@@ -434,9 +589,10 @@ def main(argv) -> int:
     report.add("no style= attributes (CSP)", styles)
 
     # -- links
+    clients = {"stranger": stranger, "line": line, "acme": scoped}
     seen, dead = set(), []
     for (who, path), page in pages.items():
-        client = line if who == "line" else scoped
+        client = clients[who]
         for href in sorted(page.links):
             target = urllib.parse.urljoin(path, href)
             if not target.startswith("/") or (who, target) in seen:
@@ -471,17 +627,31 @@ def main(argv) -> int:
                     f"needs {minimum}:1")
     report.add("contrast", contrast_fails, "; ".join(measured[:2]))
 
-    # -- tenancy: the other business is nowhere on the scoped owner's screens
+    # -- and the rules those tokens are measured FOR still use them
+    unused = [f"{selector} does not use {token}"
+              for selector, token in ((".hint", "var(--fg-quiet)"),
+                                      (".btn-ghost", "var(--line-control)"),
+                                      (".input", "var(--line-control)"),
+                                      (".tag-ghost", "var(--line-control)"),
+                                      (".filter", "var(--line-control)"))
+              if not rule_declares(app_css, selector, token)]
+    report.add("the measured tokens are the painted ones", unused,
+               "hint text and four control outlines")
+
+    # -- tenancy: the other business is nowhere on the scoped owner's screens.
+    # The RAW body, not the visible text: settings, hours and notifications
+    # render most of a business's data into `value=` attributes, which a
+    # text-only view never sees — and an attribute is where a leak lands.
     leaks = []
     for (who, path), page in pages.items():
         if who != "acme":
             continue
         for secret in ("Riverside", "riverside", "Toni Vasquez",
                        "+15550002222", "(555) 000-2222", "Sam Okafor"):
-            if secret in page.text:
+            if secret in page.body:
                 leaks.append(f"acme {path}: says {secret!r}")
     report.add("the other business is invisible", leaks,
-               "no Riverside Dental value on any Acme screen")
+               "no Riverside Dental value in the HTML of any Acme screen")
 
     print("\nmeasured contrast (from the served CSS, color-mix resolved):")
     for line_text in measured:

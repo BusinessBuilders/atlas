@@ -15,6 +15,11 @@ The first argument is a working directory it creates (settings file + database
 go inside it); the second is a port on 127.0.0.1. It prints the two access
 codes and stays in the foreground until you stop it.
 
+It also prints its own **pid**, and that is the handle to stop it with:
+`kill <pid>`. Matching on the command line instead (`pkill -f
+run_dashboard_fixture`) matches the shell that started it — and, in an agent
+session, the agent's own command line.
+
 Two sign-ins:
 
   * `line-code`  — sees the whole line (both businesses, plus the Brain screen)
@@ -38,6 +43,12 @@ What it seeds, and why each row exists:
     see anywhere;
   * a failed message alert, so the Overview's "Mark as seen" button is real;
   * four settings changes, one of which touched both businesses.
+
+Every call is then moved back across the last seven days and given a length to
+match (`CALL_SCHEDULE` and `backdate`), because the store stamps its own clock
+and a store seeded in one second would otherwise show every call at the same
+minute, `0:00` long, under a chart with one bar. Those moments and those
+lengths are invented like everything else here.
 """
 from __future__ import annotations
 
@@ -115,16 +126,25 @@ def build(work: pathlib.Path):
     config = work / "businesses.toml"
     config.write_text(CONFIG_TEXT, encoding="utf-8")
 
-    # Anything inherited from the shell that would point the fixture at a real
-    # push target or a real message pad is cleared, not overridden.
-    for key in ("NTFY_URL", "NTFY_TOPIC", "MESSAGES_FILE", "PHONE_DB"):
+    # A push target inherited from the shell is CLEARED: with neither set, the
+    # fixture has nowhere to push, which is what we want.
+    for key in ("NTFY_URL", "NTFY_TOPIC"):
         os.environ.pop(key, None)
+    # A path is a different matter, and clearing one is the opposite of safe:
+    # `service.MESSAGES_FILE` falls back to `~/atlas-phone-messages.md` when the
+    # variable is empty, which is the LIVE line's message pad on the machine
+    # this is developed on. So it is SET, to a file inside the work directory.
+    # `PHONE_DB` is set for the same reason and not because this build reads it
+    # — today the store's path comes from `PHONE_DATA_DIR` — so that the name
+    # can never resolve to somewhere else if it ever starts being read.
     os.environ.update(
         TWILIO_ACCOUNT_SID="ACtestfixture", TWILIO_AUTH_TOKEN="fixture",
         BRIDGE_PORT="1", WS_TOKEN="fixture",
         PUBLIC_BASE="https://phone.example.invalid/phone",
         OLLAMA_URL="http://127.0.0.1:11434/v1", MODEL="qwen2.5:7b-instruct",
         BUSINESS_CONFIG=str(config), PHONE_DATA_DIR=str(work / "data"),
+        MESSAGES_FILE=str(work / "messages.md"),
+        PHONE_DB=str(work / "data" / "calls.db"),
         ADMIN_TOKEN="line-code", FIXTURE_ACME_TOKEN="acme-code",
         FIXTURE_CLOUD_KEY="not-a-real-key",
     )
@@ -169,8 +189,87 @@ def build(work: pathlib.Path):
     return svc, app, config
 
 
+DAY = 86400.0
+
+# When each seeded call happened and how long it ran:
+# (CallSid, days ago, hour, minute, never-newer-than N minutes ago, seconds).
+#
+# `CallStore.start_call` and `end_call` stamp `time.time()` themselves, so a
+# store seeded in one second holds every call at the same moment with no length
+# at all — which is what put "AVERAGE CALL · 7 DAYS 0:00" and a chart with one
+# bar on the reference screenshots. These moments are fiction like the rest of
+# the fixture; they exist so the seven-day chart has seven days in it and the
+# call log has lengths a person would recognise. `backdate()` writes them.
+#
+# The hour is what you get on a fixture started in the afternoon. The
+# minutes-ago floor is what you get on one started at four in the morning: it
+# keeps every call in the past, and it is always at least the whole days it
+# stands for, so a clamped call stays on the day it belongs to.
+CALL_SCHEDULE = (
+    ("CAtest0000000000000000000000quote",     0,  9, 12,    46, 168.0),
+    ("CAtest00000000000000000000alertbad",    0, 11, 47,   185,  63.0),
+    ("CAtest0000000000000000000000demo1",     0,  8,  5,   320,  41.0),
+    ("CAtest000000000000000000000fitting",    1, 15, 26,  1500,  96.0),
+    # A text has no call to time, so it has no length either — the list shows
+    # it as Text, and it must not drag the average call length about.
+    ("SMtest00000000000000000000000text",     2, 10,  3,  2900,  None),
+    ("CAtest00000000000000000000riverside",   3, 13, 38,  4400,  92.0),
+    ("CAtest00000000000000000000blocked",     4,  7, 55,  5800,   3.0),
+    ("CAtest0000000000000000000000leak",      5, 16, 19,  7200, 214.0),
+    ("CAtest000000000000000000000wrongno",    6, 12, 41,  8700,  11.0),
+)
+
+
+def _moment(now: float, days_ago: int, hour: int, minute: int,
+            floor_minutes: int) -> float:
+    """That clock time on that day, and never in the future."""
+    day = time.localtime(now - days_ago * DAY)
+    stamp = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, hour, minute, 0,
+                         0, 0, -1))
+    return min(stamp, now - floor_minutes * 60)
+
+
+def backdate(store, now: float) -> None:
+    """Move the seeded calls back across the last seven days.
+
+    One `UPDATE` per call over the store's own connection, plus the rows that
+    hang off it — the transcript, the message, the events and the delivery
+    attempts — so nothing on any screen contradicts anything else. Every call
+    listed here is invented, and so is every one of these moments.
+    """
+    with store.conn:
+        for sid, days_ago, hour, minute, floor_minutes, seconds in CALL_SCHEDULE:
+            started = _moment(now, days_ago, hour, minute, floor_minutes)
+            ended = started + (seconds or 0.0)
+            changed = store.conn.execute(
+                "UPDATE calls SET started_at = ?, ended_at = ?, duration_s = ? "
+                "WHERE call_sid = ?", (started, ended, seconds, sid)).rowcount
+            if changed != 1:
+                # Loud: a renamed CallSid in the seed would otherwise leave one
+                # call sitting at "now" with no length, which is exactly the
+                # picture this exists to stop.
+                raise SystemExit(
+                    f"backdate: {sid} is not in the seeded store — the seed and "
+                    f"CALL_SCHEDULE have drifted apart")
+            store.conn.execute(
+                "UPDATE turns SET ts = ? + n * 6.0 WHERE call_sid = ?",
+                (started, sid))
+            store.conn.execute(
+                "UPDATE messages SET created_at = ?, updated_at = ? "
+                "WHERE call_sid = ?", (ended, ended, sid))
+            store.conn.execute("UPDATE events SET ts = ? WHERE call_sid = ?",
+                               (ended, sid))
+            store.conn.execute("UPDATE notify_log SET ts = ? WHERE call_sid = ?",
+                               (ended, sid))
+
+
 def seed(svc) -> None:
-    """Write the fixture history. Every value here is invented."""
+    """Write the fixture history. Every value here is invented.
+
+    The calls are written through the real store and then moved back across the
+    last seven days by `backdate()` — see `CALL_SCHEDULE` for the when and the
+    how long, both of which are made up.
+    """
     store = svc.STORE
     now = time.time()
 
@@ -356,11 +455,47 @@ def seed(svc) -> None:
         diff="", applied=False,
         reason="forward_to must be a phone number in the +15551234567 form")
 
+    # Last: give the calls their real spread and their lengths.
+    backdate(store, now)
+    # The banner over the Overview names when the delivery failed, and the
+    # delivery log names the same attempt. They have to agree.
+    attempt = store.conn.execute(
+        "SELECT ts FROM notify_log WHERE call_sid = ? AND ok = 0", (failed,)
+    ).fetchone()
+    svc.LAST_DELIVERY["ts"] = float(attempt["ts"])
+
+
+def get_routes(work: pathlib.Path) -> list:
+    """Every GET path the dashboard serves, from the app's own router.
+
+    Canonical paths, so a route with a placeholder comes back as
+    `/settings/{profile}` and whoever asked decides what to put in it. This is
+    what keeps `phone_dashboard_checks.py` from carrying a hand-written list of
+    screens that quietly stops matching the router.
+
+    It builds the app in `work` — the same fixture, config and seeded store as
+    a real run — and never binds a socket.
+    """
+    _svc, app, _config = build(work)
+    paths = set()
+    for route in app.router.routes():
+        canonical = getattr(route.resource, "canonical", None)
+        if route.method == "GET" and canonical:
+            paths.add(canonical)
+    return sorted(paths)
+
 
 def main(argv) -> int:
+    if len(argv) == 3 and argv[1] == "--routes":
+        # The same list `phone_dashboard_checks.py` walks, for a person.
+        for path in get_routes(pathlib.Path(argv[2])):
+            print(path)
+        return 0
     if len(argv) != 3:
         print(__doc__)
         print("usage: run_dashboard_fixture.py <work-dir> <port>",
+              file=sys.stderr)
+        print("       run_dashboard_fixture.py --routes <work-dir>",
               file=sys.stderr)
         return 2
     work, port = pathlib.Path(argv[1]), int(argv[2])
@@ -370,6 +505,10 @@ def main(argv) -> int:
     print(f"settings file: {config}", flush=True)
     print(f"database:      {work / 'data'}", flush=True)
     print(f"dashboard:     http://127.0.0.1:{port}/", flush=True)
+    # The handle to stop this with. A pattern match on the command line finds
+    # the shell that started it as well as this process — and the caller's own
+    # command line, if the pattern happens to appear there.
+    print(f"pid:           {os.getpid()}", flush=True)
     print("access codes:  line-code (whole line) · acme-code (Acme Plumbing "
           "only)", flush=True)
     web.run_app(app, host="127.0.0.1", port=port, access_log=None)

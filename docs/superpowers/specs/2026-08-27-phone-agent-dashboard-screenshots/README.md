@@ -13,7 +13,17 @@ starts the product against a throwaway settings file and a throwaway database:
 * a model whose label says "test only", which is why the orange safety banner
   is on the Overview — that banner is a real feature, not a mock-up;
 * a message alert that really failed to send to `push.acme.invalid`, a domain
-  that does not exist, which is why "Mark as seen" is on screen.
+  that does not exist, which is why "Mark as seen" is on screen;
+* calls spread across the last seven days, each with a length — invented
+  dates and invented lengths, written by the fixture's own `backdate()` so
+  that the seven-day chart has seven days in it and the call log shows
+  lengths a person would recognise. The store stamps its own clock, so
+  without this every call would sit at the same minute, `0:00` long.
+
+`calls-pagination-desktop` is the one picture with more in it than the fixture
+seeds: 55 extra "Name not given / hung up / 1:35" rows were added to the
+throwaway database by hand to make a second page exist, and deleted again
+afterwards. They are invented like everything else.
 
 Nothing in these pictures was read from the live line, and nothing in the
 fixture is written anywhere near it.
@@ -56,7 +66,7 @@ which is a lie about where it actually sits.
 ## Taking them again
 
 ```
-# terminal 1
+# terminal 1 — it prints the pid to stop it with
 cd <worktree>
 PYTHONPATH=<worktree>:<worktree>/src \
   python tests/e2e/run_dashboard_fixture.py /tmp/dash-work 8931
