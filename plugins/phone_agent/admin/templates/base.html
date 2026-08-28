@@ -35,12 +35,12 @@
     <nav class="nav">
       {% for item in nav %}
         {% if item.url %}
-      <a class="nav-item{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{{ ' aria-current=page' | safe if path == item.url else '' }}>{{ icon(item.icon) }}<span>{{ item.label }}</span></a>
+      <a class="nav-item{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon) }}<span>{{ item.label }}</span></a>
         {% else %}
       <span class="nav-item nav-group">{{ icon(item.icon) }}<span>{{ item.label }}</span></span>
         {% endif %}
         {% for child in item.children %}
-      <a class="nav-item nav-sub{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{{ ' aria-current=page' | safe if path == child.url else '' }}><span>{{ child.label }}</span></a>
+      <a class="nav-item nav-sub{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{% if path == child.url %} aria-current="page"{% endif %}><span>{{ child.label }}</span></a>
         {% endfor %}
       {% endfor %}
     </nav>
@@ -69,10 +69,10 @@
 <nav class="tabbar" aria-label="Sections">
   {% for item in nav %}
     {% if item.url %}
-  <a class="tab{{ ' active' if path == item.url else '' }}" href="{{ item.url }}">{{ icon(item.icon, 22) }}<span>{{ item.label }}</span></a>
+  <a class="tab{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon, 22) }}<span>{{ item.label }}</span></a>
     {% endif %}
     {% for child in item.children %}
-  <a class="tab{{ ' active' if path == child.url else '' }}" href="{{ child.url }}">{{ icon(child.icon, 22) }}<span>{{ child.label }}</span></a>
+  <a class="tab{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{% if path == child.url %} aria-current="page"{% endif %}>{{ icon(child.icon, 22) }}<span>{{ child.label }}</span></a>
     {% endfor %}
   {% endfor %}
 </nav>
