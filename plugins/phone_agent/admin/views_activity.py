@@ -53,21 +53,48 @@ CONTEXT_LINES = 3
 _HEADER = re.compile(
     r"^[ +-]\s*\[(profiles|deleted_profiles)\.([A-Za-z0-9_-]+)\]\s*$")
 _ANY_TABLE = re.compile(r"^[ +-]\s*\[")
-# TOML's multi-line string fence. A line inside one is text somebody wrote, not
-# a table header, however much it looks like one.
-_FENCE = '"' * 3
+# TOML's two multi-line string fences. Their presence anywhere in a diff means
+# a line that looks like a table header might be somebody's prose — see
+# `attribution_is_certain`.
+_FENCES = ('"' * 3, "'" * 3)
+
+# What a scoped reader is told about a change this module cannot safely take
+# apart. It is deliberately dull: the honest content is "something changed, and
+# it is not mine to show you".
+UNCERTAIN_SUMMARY = ("Settings on this line changed (the line owner can see "
+                     "the details)")
+UNKNOWN_ACTOR = "somebody who manages this line"
+
+
+def attribution_is_certain(diff: str) -> bool:
+    """Can this diff be split up by business at all?
+
+    False as soon as `\"\"\"` or `'''` appears ANYWHERE in it, on either side or
+    in context. Inside a multi-line TOML string a line reading exactly like
+    `[profiles.other]` is somebody's prose, and no amount of tracking makes
+    that decidable from a diff: the two sides are two different files, a fence
+    opened on one side may never close on the other, and one missed header
+    means a business's settings are attributed to its neighbour. So this does
+    not try. A diff with a fence in it is not split at all — a scoped reader
+    gets one dull sentence saying something changed.
+
+    The cost is nothing in practice: `emit_business_toml` escapes newlines and
+    only ever writes single-line basic strings, so every diff recorded after
+    the first dashboard save is certain. Only a config still carrying a
+    hand-written multi-line value can be uncertain, and only until it is saved.
+    """
+    text = str(diff or "")
+    return not any(fence in text for fence in _FENCES)
 
 
 def _walk(diff: str):
     """(the business each line belongs to, the line) — "" outside any profile.
 
-    This is a tenancy control, not a formatting nicety: `visible_diff` drops
-    every line it cannot attribute to the reader's own businesses, so anything
-    mis-attributed here is one business's settings shown to another. It is
-    written to fail CLOSED — a line it is unsure about belongs to no business,
-    and a scoped reader does not see it.
-
-    Three things it has to get right, in the order they bite:
+    A tenancy control, not a formatting nicety: `visible_diff` drops every line
+    it cannot attribute to the reader's own businesses, so a line mis-attributed
+    here is one business's settings shown to another. Two rules, both failing
+    CLOSED — a line it is unsure about belongs to no business, and a scoped
+    reader does not see it:
 
       * **A hunk boundary resets the table.** `@@` means the next line comes
         from somewhere else in the file entirely, so a hunk starting in the
@@ -76,56 +103,82 @@ def _walk(diff: str):
         hunk today, but that is an invariant of one function — carrying the
         current table across `@@` would silently become a leak the day
         anything shortened it.
-      * **A header inside a multi-line string is not a header.** A triple-quoted
-        TOML value can hold a line reading exactly like a profile header. The
-        two sides of a diff are two different files, so the fence state is
-        tracked for each: a removed line is read against the old file's state,
-        an added one against the new file's, and a context line counts as
-        inside a string if EITHER thinks so — the direction that hides rather
-        than reveals.
       * **Any other table ends the current one**, indented or not.
+
+    It does NOT try to work out whether a header is really prose inside a
+    multi-line string. That question is settled before this runs, for the whole
+    diff at once, by `attribution_is_certain` — because a walker that gets it
+    wrong gets it wrong in the direction that shows one customer another's
+    settings.
     """
     current = ""
-    in_old = in_new = False
     for line in str(diff).splitlines():
         if line.startswith(("---", "+++", "\\")):
             continue
         if line.startswith("@@"):
-            current, in_old, in_new = "", False, False
+            current = ""
             continue
-        mark, text = line[:1], line[1:]
-        inside = (in_old or in_new) if mark == " " else (
-            in_old if mark == "-" else in_new)
-        if text.count(_FENCE) % 2:
-            if mark in " -":
-                in_old = not in_old
-            if mark in " +":
-                in_new = not in_new
-        if not inside:
-            header = _HEADER.match(line)
-            if header:
-                current = header.group(2)
-                yield current, line
-                continue
-            if _ANY_TABLE.match(line):
-                current = ""                   # some other table
+        header = _HEADER.match(line)
+        if header:
+            current = header.group(2)
+            yield current, line
+            continue
+        if _ANY_TABLE.match(line):
+            current = ""                       # some other table
         yield current, line
+
+
+@dataclasses.dataclass(frozen=True)
+class Reading:
+    """One recorded diff, walked ONCE and asked everything at the same time.
+
+    A row on the Activity screen needs the body, the businesses it touched,
+    whether it touched anything shared, and the lines to draw. Working each of
+    those out from the raw text meant walking the same diff seven times per
+    row; this walks it once.
+    """
+    certain: bool
+    walked: tuple
+
+    @property
+    def body(self) -> list:
+        return [line for _key, line in self.walked]
+
+    @property
+    def touched(self) -> set:
+        """The businesses this change altered — EMPTY when the diff cannot be
+        split up safely, so nothing downstream can act on a guess."""
+        if not self.certain:
+            return set()
+        return {key for key, line in self.walked if key and line[:1] in "+-"}
+
+    @property
+    def touches_shared(self) -> bool:
+        """Something outside any one business changed — the numbers, the
+        models, the branding, the logins. Only meaningful when `certain`."""
+        return any(line[:1] in "+-" for key, line in self.walked if not key)
+
+
+def read_diff(diff) -> Reading:
+    text = str(diff or "")
+    return Reading(certain=attribution_is_certain(text),
+                   walked=tuple(_walk(text)))
 
 
 def _diff_body(diff: str) -> list:
     """Every content line of a diff, hunk and file headers dropped."""
-    return [line for _key, line in _walk(diff)]
+    return read_diff(diff).body
 
 
 def sections_touched(diff: str) -> set:
-    """Which businesses this change actually altered."""
-    return {key for key, line in _walk(diff) if key and line[:1] in "+-"}
+    """Which businesses this change altered, or nothing when it cannot be
+    told."""
+    return read_diff(diff).touched
 
 
 def line_wide(diff: str) -> bool:
-    """True when it altered something outside any one business — the numbers,
-    the models, the branding, the logins."""
-    return any(line[:1] in "+-" for key, line in _walk(diff) if not key)
+    """True when it altered something outside any one business."""
+    return read_diff(diff).touches_shared
 
 
 # What is said in place of the lines a scoped owner may not read. The change is
@@ -135,30 +188,30 @@ OTHER_BUSINESSES = "…other businesses on this line changed in the same save"
 LINE_WIDE = "…settings shared by the whole line changed in the same save"
 
 
-def visible_diff(diff: str, keys=None) -> list:
+def _visible(reading: Reading, keys=None) -> list:
     """The changed lines and a few either side, for the panel that expands.
 
-    `keys` is None for an owner of the whole line: they see every line. For an
-    owner of one business it is their profile keys, and every line belonging to
-    anybody else — another business, or a table that belongs to the line rather
-    than to any business — is dropped BEFORE the context window is worked out.
+    `keys` is None for an owner of the whole line: they see every line, always,
+    whether or not the diff can be split up. For anybody else, a diff that
+    cannot be split up yields NOTHING — the row still appears, saying only that
+    something changed.
 
-    That order matters and is the whole fix: filtering afterwards would still
-    pull a neighbour's `ntfy_topic` onto the screen as three lines of "context"
-    around a change of their own. The stored diff carries every line of both
-    versions so a restore can be exact, which means a first save on a
-    hand-written config rewrites the entire file — and without this, one
-    business's owner read the whole line's settings.
+    When it can be split up, every line belonging to somebody else is dropped
+    BEFORE the context window is worked out. That order is the whole point:
+    filtering afterwards would still pull a neighbour's `ntfy_topic` onto the
+    screen as three lines of "context" around a change of the reader's own.
     """
-    walked = list(_walk(diff))
     if keys is None:
-        body, elsewhere, others = [line for _key, line in walked], False, False
+        body, elsewhere, others = reading.body, False, False
+    elif not reading.certain:
+        return []
     else:
         allowed = set(keys)
-        body = [line for key, line in walked if key in allowed]
+        body = [line for key, line in reading.walked if key in allowed]
         others = any(line[:1] in "+-" and key and key not in allowed
-                     for key, line in walked)
-        elsewhere = any(line[:1] in "+-" and not key for key, line in walked)
+                     for key, line in reading.walked)
+        elsewhere = any(line[:1] in "+-" and not key
+                        for key, line in reading.walked)
 
     wanted: set = set()
     for index, line in enumerate(body):
@@ -179,6 +232,10 @@ def visible_diff(diff: str, keys=None) -> list:
     return shown
 
 
+def visible_diff(diff: str, keys=None) -> list:
+    return _visible(read_diff(diff), keys)
+
+
 def _named(names: list) -> str:
     """"Acme Co", "Acme Co and Riverside", "Acme Co, Riverside and Third"."""
     listed = list(names)
@@ -187,18 +244,17 @@ def _named(names: list) -> str:
     return ", ".join(listed[:-1]) + " and " + listed[-1]
 
 
-def scoped_summary(deps, diff: str, keys) -> str:
+def scoped_summary(deps, reading: Reading, keys) -> str:
     """What this change did TO THIS OWNER'S businesses, in the owner's words.
 
     The stored summary is written for whoever made the change and describes the
     whole save: "Removed the business Other Co" is the truth, and it is not
     this reader's truth to be told. So a scoped reader gets a sentence built
-    from the same filtered lines their diff is built from — never the stored
-    one — and the names come from the live config, not from the diff.
+    from the same lines their diff is built from — never the stored one — and
+    the names come from the live config, not from the diff.
     """
     _numbers, profiles = deps.get_state()
-    mine = set(keys)
-    touched = sorted(sections_touched(diff) & mine)
+    touched = sorted(reading.touched & set(keys))
     names = [str((profiles.get(key) or {}).get("business_name", "")).strip()
              or key for key in touched]
     if names:
@@ -207,37 +263,48 @@ def scoped_summary(deps, diff: str, keys) -> str:
         # It is on their screen because it touched one of theirs; if nothing
         # names one now, say only that something on the line changed.
         sentence = "Settings on this line changed"
-    if line_wide(diff):
+    if reading.touches_shared:
         sentence += ", and settings shared by the whole line"
     return sentence
 
 
-def decorate_change(deps, change: dict, session=None) -> dict:
+def decorate_change(deps, change: dict, session=None, reading=None) -> dict:
     """One change as the reader in front of it may see it.
 
     `session` is None for an owner of the whole line: they get the change
     exactly as it was recorded. For anybody else every field is rebuilt from
     the part of the diff that is theirs — the lines, the sentence, who did it,
     and why it was refused — because each of those was written about the whole
-    save and each of them can name a business next door.
+    save and each of them can name a business next door. And when the diff
+    cannot be split up at all, they get none of it: one sentence saying
+    something changed, and nothing derived from a guess.
     """
-    diff = change.get("diff") or ""
+    if reading is None:
+        reading = read_diff(change.get("diff") or "")
     scoped = session is not None and not session.sees_whole_line
     keys = tuple(session.profile_keys) if scoped else None
-    change["lines"] = visible_diff(diff, keys)
+    change["lines"] = _visible(reading, keys)
     # Read off the WHOLE diff, never the filtered view: whether a version can
     # be put back is a fact about the change, not about who is looking at it.
-    change["can_restore"] = bool(change.get("applied")) and bool(_diff_body(diff))
+    change["can_restore"] = bool(change.get("applied")) and bool(reading.body)
     actor = str(change.get("actor") or "")
     if not scoped:
         change["actor_label"] = actor or "somebody on this line"
         return change
-    change["summary"] = scoped_summary(deps, diff, keys)
     # A login name is a fact about who else manages this line.
     change["actor_label"] = ("you" if actor and actor == session.owner_key
-                             else "somebody who manages this line")
+                             else UNKNOWN_ACTOR)
+    if not reading.certain:
+        change["summary"] = UNCERTAIN_SUMMARY
+        change["actor_label"] = UNKNOWN_ACTOR
+        change["lines"] = []
+        change["reason"] = ""
+        change["can_restore"] = False
+        change.pop("diff", None)
+        return change
+    change["summary"] = scoped_summary(deps, reading, keys)
     if change.get("reason") and (
-            sections_touched(diff) - set(keys) or line_wide(diff)):
+            reading.touched - set(keys) or reading.touches_shared):
         # The validator names the field it refused, which on a save that also
         # touched another business is that business's field.
         change["reason"] = ""
@@ -257,12 +324,16 @@ def changes_for(deps, session) -> tuple:
     mine = set(session.profile_keys)
     kept = []
     for change in rows or []:
-        if not session.sees_whole_line:
+        reading = read_diff(change.get("diff") or "")
+        if not session.sees_whole_line and reading.certain:
             # A diff names other customers' numbers, greetings and push
             # targets. An owner of one business reads only what touched theirs.
-            if not (sections_touched(change.get("diff") or "") & mine):
+            # A diff that cannot be split up is NOT filtered out here — it is
+            # listed, as one dull sentence, because "was I affected?" is not a
+            # question this can answer either.
+            if not (reading.touched & mine):
                 continue
-        kept.append(decorate_change(deps, dict(change), session))
+        kept.append(decorate_change(deps, dict(change), session, reading))
         if len(kept) >= CHANGES_SHOWN:
             break
     return kept, ""

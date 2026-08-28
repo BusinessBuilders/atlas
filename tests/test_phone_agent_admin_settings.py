@@ -1741,36 +1741,125 @@ def test_the_recorded_diff_is_one_hunk_so_the_walker_sees_every_header(line):
     assert line.config_from_diff(diff, side="after") == after
 
 
-def test_a_table_header_inside_a_quoted_value_is_not_a_header():
-    """A triple-quoted TOML value can hold a line that reads exactly like a
-    profile header. Believing it would move the walker into a business that is
-    not there."""
+FENCE = '"' * 3
+LITERAL_FENCE = "'" * 3
+
+# Probe (a): a literal (single-quoted) TOML string whose CONTENT ends in a
+# triple quote. The emitter rewrites it on the new side with each quote
+# escaped, so the fence appears an odd number of times and only on the old
+# side — which is what desynchronised the tracker this replaced, leaving every
+# later header unrecognised and the neighbour's lines attributed to Acme.
+ODD_FENCE_DIFF = "\n".join([
+    "--- businesses.toml (before)",
+    "+++ businesses.toml (after)",
+    "@@ -1,9 +1,9 @@",
+    " [profiles.acme]",
+    ' business_name = "Acme Co"',
+    f"-notes = {LITERAL_FENCE[0]}ends with {FENCE}{LITERAL_FENCE[0]}",
+    '+notes = "ends with \\"\\"\\""',
+    '-greeting = "hi"',
+    '+greeting = "hello"',
+    " [profiles.other]",
+    ' ntfy_topic = "other-co-secret-topic"',
+    ' business_name = "Other Co"',
+])
+
+# Probe (b): a multi-line literal body that CONTAINS a line reading exactly
+# like a table header. Nothing tracked these at all, so the fake header moved
+# attribution and Acme's own change landed under the business next door.
+FENCE_BODY_DIFF = "\n".join([
+    "@@ -1,9 +1,9 @@",
+    " [profiles.acme]",
+    ' business_name = "Acme Co"',
+    f" extra_instructions = {LITERAL_FENCE}",
+    " [profiles.other]",
+    ' ntfy_topic = "other-co-secret-topic"',
+    f" {LITERAL_FENCE}",
+    '-greeting = "hi"',
+    '+greeting = "hello"',
+])
+
+
+def test_a_diff_with_a_multi_line_string_cannot_be_split_up_at_all():
+    """Inside a multi-line TOML value, a line reading like `[profiles.other]`
+    is somebody's prose — and a diff cannot tell. So it is not split: a scoped
+    reader gets nothing derived from a guess."""
     admin = load_admin()
-    fence = '"' * 3
-    diff = "\n".join([
-        "--- businesses.toml (before)",
-        "+++ businesses.toml (after)",
-        "@@ -1,7 +1,7 @@",
+    certain = admin.views_activity.attribution_is_certain
+
+    for probe in (ODD_FENCE_DIFF, FENCE_BODY_DIFF):
+        assert certain(probe) is False
+        # nothing downstream may act on an attribution nobody can make
+        assert admin.views_activity.sections_touched(probe) == set()
+        assert admin.views_activity.visible_diff(probe, ("acme",)) == []
+        assert admin.views_activity.visible_diff(probe, ("other",)) == []
+        # the account that manages the line still sees the whole thing
+        whole = admin.views_activity.visible_diff(probe, None)
+        assert any("other-co-secret-topic" in row["text"] for row in whole)
+
+    # a diff the emitter wrote has no fence in it, so it is split as before
+    plain = "\n".join([
+        "@@ -1,5 +1,5 @@",
         " [profiles.acme]",
-        f" extra_instructions = {fence}",
-        " [profiles.other]",
-        ' ntfy_topic = "not-really-a-topic"',
-        f" {fence}",
         '-greeting = "hi"',
         '+greeting = "hello"',
+        " [profiles.other]",
+        ' ntfy_topic = "other-co-secret-topic"',
     ])
-    assert admin.views_activity.sections_touched(diff) == {"acme"}
-
-    mine = admin.views_activity.visible_diff(diff, ("acme",))
+    assert certain(plain) is True
+    assert admin.views_activity.sections_touched(plain) == {"acme"}
+    mine = admin.views_activity.visible_diff(plain, ("acme",))
     text = " ".join(row["text"] for row in mine)
-    assert "hello" in text
-    # the lines inside the quoted value are acme's own, and stay with acme
-    assert "not-really-a-topic" in text
+    assert "hello" in text and "other-co-secret-topic" not in text
 
-    # and the same lines are hidden from somebody who does not own acme
-    theirs = admin.views_activity.visible_diff(diff, ("other",))
-    assert theirs == [] or all("not-really-a-topic" not in row["text"]
-                               for row in theirs)
+
+async def test_a_scoped_owner_gets_one_dull_sentence_for_an_unsplittable_diff(
+        two):
+    """Both probe shapes, through the real screen: none of the neighbour's
+    topic, key or name reaches a scoped owner, and the row still appears so
+    they are not told a change never happened."""
+    for probe in (ODD_FENCE_DIFF, FENCE_BODY_DIFF):
+        two.STORE.record_config_change(
+            actor="the_other_manager", summary="Removed the business Other Co",
+            diff=probe, applied=True, reason="")
+
+    async with dashboard(two) as dash:
+        await _signed_in(dash, "jo-code")
+        scoped = _text(await (await dash.client.get("/activity")).text())
+    async with dashboard(two) as dash:
+        await _signed_in(dash)
+        whole = _text(await (await dash.client.get("/activity")).text())
+
+    # the reader who owns one business learns only that something changed
+    assert scoped.count(
+        "Settings on this line changed (the line owner can see the details)") == 2
+    assert "somebody who manages this line" in scoped
+    for secret in ("other-co-secret-topic", "[profiles.other]", "Other Co",
+                   "Removed the business", "the_other_manager", "ends with"):
+        assert secret not in scoped, secret
+    # no diff panel at all, and nothing to put back
+    assert "What changed" not in scoped
+    assert "restore=" not in scoped
+
+    # the account that manages the line sees every one of them
+    assert "Removed the business Other Co" in whole
+    assert "other-co-secret-topic" in whole
+    assert "the_other_manager" in whole
+
+
+def test_believing_a_header_inside_a_quoted_body_moves_the_wrong_lines():
+    """Why the certainty rule is not paranoia: with the fence body believed,
+    Acme's own change lands under the business next door — which is a leak in
+    whichever direction the reader happens to own."""
+    admin = load_admin()
+    walked = list(admin.views_activity._walk(FENCE_BODY_DIFF))
+    changed = {key for key, line in walked if line[:1] in "+-"}
+
+    # the walker on its own really is fooled — the greeting change reads as
+    # `other`'s, not Acme's
+    assert changed == {"other"}
+    # which is exactly why nothing is allowed to use it here
+    assert admin.views_activity.sections_touched(FENCE_BODY_DIFF) == set()
 
 
 def test_an_indented_table_header_still_ends_the_business_before_it():
