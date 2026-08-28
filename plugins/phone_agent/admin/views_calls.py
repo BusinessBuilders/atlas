@@ -241,14 +241,19 @@ def gather_calls(deps, session, query) -> dict:
     # bounded read settles it, and only ever on a page that came back empty.
     empty_start = (not rows and not filters["any"] and not error
                    and filters["page"] == 1)
-    only_tests = False
+    only_tests, probe_error = False, ""
     if empty_start and not filters["show_test"]:
-        probe, _probe_error = _read("your call log", deps.store.list_calls,
-                                    filters["keys"], include_test=True, limit=1)
+        probe, probe_error = _read("your call log", deps.store.list_calls,
+                                   filters["keys"], include_test=True, limit=1)
         only_tests = bool(probe)
-    return {"filters": filters, "rows": rows, "error": error,
+    return {"filters": filters, "rows": rows,
+            # A probe that could not run must not leave the page saying "no
+            # calls yet — ring your number to test it" as though that were a
+            # fact somebody checked.
+            "error": error or probe_error,
             "messages_error": messages_error, "has_next": has_next,
-            "only_tests": only_tests, "first_run": empty_start and not only_tests}
+            "only_tests": only_tests,
+            "first_run": (empty_start and not only_tests and not probe_error)}
 
 
 def owner_numbers(deps, session) -> list:
@@ -383,6 +388,7 @@ async def call_detail(request: web.Request) -> web.Response:
     return await render.page(
         request, deps, "call_detail.html", session=session,
         saved=str(request.query.get("saved", "")), delete_error="",
+        note_max=NOTE_MAX_CHARS,
         deleting=request.query.get("delete") == "1", **data)
 
 
@@ -463,16 +469,26 @@ async def add_note(request: web.Request) -> web.Response:
             request, deps, "refused.html", session=session, status=400,
             reason=("Notes are kept with the message a call leaves, and this "
                     "call did not leave one."))
+    typed = str(form.get("note", ""))
+    # A note longer than the box holds used to be cut off in silence, so the
+    # owner's last two sentences were simply gone and nothing said so. It is
+    # still cut — the store's column is not a document — but the page says it
+    # happened, with the number, so the rest can be written down somewhere else.
+    cut = len(typed) > NOTE_MAX_CHARS
     await asyncio.to_thread(deps.store.set_message_status, message["id"],
-                            message["status"],
-                            str(form.get("note", ""))[:NOTE_MAX_CHARS])
-    raise web.HTTPSeeOther(f"/calls/{call_sid}?saved=note")
+                            message["status"], typed[:NOTE_MAX_CHARS])
+    if cut:
+        log.warning("dashboard: %s wrote a note of %d characters on %s; the "
+                    "last %d were not kept", session.owner_key, len(typed),
+                    call_sid, len(typed) - NOTE_MAX_CHARS)
+    raise web.HTTPSeeOther(
+        f"/calls/{call_sid}?saved={'note_cut' if cut else 'note'}")
 
 
 # ------------------------------------------------------- deleting a caller ---
 
-def caller_calls(deps, session, number: str) -> list:
-    """This owner's calls from one number.
+def caller_calls(deps, session, number: str) -> tuple:
+    """(this owner's calls from one number, whether the scan hit its ceiling).
 
     Used to answer "do you have any of these at all" and to tag the event with
     the business they belong to. It is deliberately NOT the safety check: the
@@ -484,7 +500,8 @@ def caller_calls(deps, session, number: str) -> list:
     number = str(number or "").strip()
     rows = deps.store.list_calls(session.profile_keys, q=number,
                                  include_test=True, limit=SCAN_LIMIT)
-    return [row for row in rows if str(row["from_number"]) == number]
+    return ([row for row in rows if str(row["from_number"]) == number],
+            len(rows) >= SCAN_LIMIT)
 
 
 # Why a delete did not happen, and the answer each reason earns. A key, not a
@@ -499,7 +516,7 @@ def _delete_caller(deps, session, number: str) -> dict:
     Returns `{"reason": key, "text": sentence}` when nothing was deleted, or
     the receipt when something was.
     """
-    mine = caller_calls(deps, session, number)
+    mine, truncated = caller_calls(deps, session, number)
     if not mine:
         return {"reason": "unknown",
                 "text": ("No calls from that number are on your line. Type it "
@@ -525,8 +542,12 @@ def _delete_caller(deps, session, number: str) -> dict:
         # delete, and a "deleted this caller" event naming them would be the
         # record the owner just asked us to destroy.
         deps.store.add_event(
-            profiles.pop() if len(profiles) == 1 else None, None, "warning",
-            "caller_deleted",
+            # None whenever the scan stopped at its ceiling: the businesses it
+            # saw are then only the ones it got to, and an event filed against
+            # ONE of them would be a scoped owner's evidence that the delete
+            # touched only theirs — which is exactly what nobody knows.
+            profiles.pop() if len(profiles) == 1 and not truncated else None,
+            None, "warning", "caller_deleted",
             f"{session.owner_key} deleted every record of one caller: "
             f"{int(removed)} rows across {len(removed.call_sids)} calls")
     except Exception:
@@ -586,4 +607,5 @@ async def _refused_delete(request, deps, session, call_sid: str,
         return await _not_found(request, deps, session)
     return await render.page(request, deps, "call_detail.html", session=session,
                              status=status_code, saved="", deleting=True,
+                             note_max=NOTE_MAX_CHARS,
                              delete_error=sentence, **data)

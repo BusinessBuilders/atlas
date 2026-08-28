@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import asyncio
@@ -255,14 +255,19 @@ class NavItem:
     badge: bool = False
 
 
-# Only screens that exist are listed. Hours, Numbers, Notifications and
-# Activity join this list in the tasks that build them.
+# Only screens that exist are listed: `_check_nav` refuses to start a build
+# whose navigation points at a route it does not serve.
 NAV = (
     NavItem("Overview", "grid", "/"),
     NavItem("Calls", "phone", "/calls"),
     NavItem("Messages", "inbox", "/messages", badge=True),
-    NavItem("Settings", "sliders", None, children=(
+    NavItem("Settings", "sliders", "/settings", children=(
+        NavItem("Business", "sliders", "/settings"),
+        NavItem("Hours", "clock", "/hours"),
+        NavItem("Numbers", "hash", "/numbers"),
+        NavItem("Notifications", "bell", "/notifications"),
         NavItem("Brain", "cpu", "/brain", whole_line_only=True),
+        NavItem("Activity", "history", "/activity"),
     )),
 )
 
@@ -334,14 +339,41 @@ class Deps:
     env: jinja2.Environment
     store: object
     get_state: object
+    # The whole validated config, so a settings save can rebuild the file it
+    # came from without the dashboard keeping a copy of anything.
+    get_config: object
     get_brains: object
     get_branding: object
     get_owners: object
     get_health: object
     get_brain_health: object
-    apply_config_text: object
-    emit_business_toml: object
+    # The one path every settings save goes through: emit, validate, back up,
+    # hot-apply, write the audit row. Returns None, or the sentence saying why
+    # nothing changed.
+    apply_config: object
+    # Where one business's messages go, line-wide defaults filled in.
+    delivery_targets: object
+    # One business setting, or the product's own default when the profile is
+    # silent. Every settings screen reads through it rather than keeping a
+    # second copy of what "unset" means.
+    profile_setting: object
+    # The service's own validator, and the reader for the diffs its audit rows
+    # hold. Activity's "put this back" re-validates a stored version before it
+    # is allowed anywhere near a live phone line.
+    parse_config: object
+    config_from_diff: object
+    # Exactly what a caller hears first, notices composed in. The Greeting
+    # screen previews the caller's experience by calling the caller's own code.
+    opening_line: object
     acknowledge_delivery_failure: object
+    # The product's own constants the settings screens have to show: the
+    # standard transfer/end phrases, the phrase caps, how long a removed
+    # business can be put back. Passed in for the same reason as everything
+    # else here — so there is one copy of them, in the service.
+    product_defaults: dict = field(default_factory=dict)
+    # The address the phone network is told to call. Shown on Numbers, so the
+    # owner can paste it into their Twilio console.
+    public_base: str = ""
     # Stamped into every asset URL so an upgraded dashboard is never rendered
     # with the browser's copy of the previous build's stylesheet.
     asset_version: str = ""
@@ -404,15 +436,21 @@ async def page(request, deps: Deps, template: str, *, session=None,
     return web.Response(text=body, status=status, content_type="text/html")
 
 
-def partial(request, deps: Deps, template: str, *, session=None, **context):
+def partial(request, deps: Deps, template: str, *, session=None,
+            status: int = 200, **context):
     """Render one panel, for the pieces htmx swaps in place.
 
     Stays synchronous: a partial draws no navigation, so it never needs the
     waiting count — which is the whole reason that count is not computed here.
+
+    `status` is real: a refused save answers 400 (or 409 for a form built
+    before somebody else's) and still hands back the panel with the reason in
+    it. The page's htmx config swaps those two codes, so the owner reads the
+    refusal instead of watching a button do nothing.
     """
     body = deps.env.get_template(template).render(
         _context(request, deps, session, context))
-    return web.Response(text=body, content_type="text/html")
+    return web.Response(text=body, status=status, content_type="text/html")
 
 
 def _context(request, deps: Deps, session, context: dict,

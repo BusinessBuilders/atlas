@@ -1,0 +1,26 @@
+{% from "_section_frame.html" import section_form, field_error, described_by, rows with context %}
+{% call section_form(section, "Save transfer") %}
+<div class="checkline">
+  <input type="checkbox" id="transfer_on" name="transfer_on" value="on"
+         {{ 'checked' if section.fields.transfer_on else '' }}>
+  <label class="label flush" for="transfer_on">Put callers through to a person
+    when they ask</label>
+</div>
+<div>
+  <label class="label" for="forward_to">Ring this number</label>
+  <input class="input" id="forward_to" name="forward_to" type="tel"
+         inputmode="tel" autocomplete="tel"
+         value="{{ section.fields.forward_to | fmt_phone if section.fields.forward_to else '' }}"
+         {{ described_by(section, "forward_to", "hint-forward_to") }}>
+  <p class="hint" id="hint-forward_to">Type it however you say it. The agent
+    tells the person who is calling before it connects them.</p>
+  {{ field_error(section, "forward_to") }}
+</div>
+{% if section.fields.phrases_are_standard %}
+{% set transfer_hint = "These are the standard phrases every line starts with. Edit them, remove the ones that do not suit you, or add your own." %}
+{% else %}
+{% set transfer_hint = "A caller has to say one of these before the agent offers to put them through." %}
+{% endif %}
+{{ rows(section, "phrase", section.fields.phrases, "Only when a caller says",
+        transfer_hint, "Add a phrase — “put me through”, “speak to the boss”…") }}
+{% endcall %}

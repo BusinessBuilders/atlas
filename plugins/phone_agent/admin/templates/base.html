@@ -10,7 +10,19 @@
 {# htmx ships its own indicator CSS as an inline <style>, which this page's
    Content-Security-Policy refuses. The same two rules live in app.css instead.
    Configured by meta tag because an inline <script> is refused too. #}
-<meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+{# `responseHandling`: a refused save answers 400 (or 409 when the form was
+   built before somebody else's) and hands back the same panel with the reason
+   and every value still in it. htmx ignores an error response by default,
+   which would show the owner a button that did nothing — these two codes are
+   swapped in, everything else in the 4xx/5xx range is still an error.
+
+   `attributesToSettle` drops `style` from htmx's default list. Settling it
+   writes a `style` ATTRIBUTE onto every element it matches by id, which is an
+   inline style — and this page's Content-Security-Policy forbids those on
+   purpose. Nothing here styles anything inline, so the only thing that
+   setting could ever produce is a console full of refusals on a page a
+   customer is looking at. #}
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"attributesToSettle":["class","width","height"],"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"40[09]","swap":true,"error":false},{"code":"[45]..","swap":false,"error":true}]}'>
 {% if fonts_url %}
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="{{ fonts_url }}">
@@ -41,15 +53,20 @@
       {% endif %}
       <span class="eyebrow accent">{{ product_name }}</span>
     </div>
+    {# A screen reached at /settings/acme belongs to the /settings row: the
+       highlight follows the section an owner is in, not an exact URL match. #}
+    {% macro is_here(url) %}{{ 'yes' if url and (path == url or (url != '/' and path.startswith(url ~ '/'))) else '' }}{% endmacro %}
     <nav class="nav">
       {% for item in nav %}
+        {% set here = is_here(item.url) | trim %}
         {% if item.url %}
-      <a class="nav-item{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon) }}<span>{{ item.label }}</span>{% if item.badge %}{{ waiting_badge(waiting) }}{% endif %}</a>
+      <a class="nav-item{{ ' active' if here else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon) }}<span>{{ item.label }}</span>{% if item.badge %}{{ waiting_badge(waiting) }}{% endif %}</a>
         {% else %}
       <span class="nav-item nav-group">{{ icon(item.icon) }}<span>{{ item.label }}</span></span>
         {% endif %}
         {% for child in item.children %}
-      <a class="nav-item nav-sub{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{% if path == child.url %} aria-current="page"{% endif %}><span>{{ child.label }}</span></a>
+        {% set child_here = is_here(child.url) | trim %}
+      <a class="nav-item nav-sub{{ ' active' if child_here else '' }}" href="{{ child.url }}"{% if child_here %} aria-current="page"{% endif %}><span>{{ child.label }}</span></a>
         {% endfor %}
       {% endfor %}
     </nav>
@@ -75,14 +92,14 @@
   </main>
 </div>
 {% if nav %}
+{# Top level only. A phone's tab bar holds four or five thumb-sized targets;
+   the Settings screens each carry their own picker across the top, which is
+   where an owner moves between them on a small screen. #}
 <nav class="tabbar"{% if dialog_open %} inert{% endif %} aria-label="Sections">
   {% for item in nav %}
     {% if item.url %}
-  <a class="tab{{ ' active' if path == item.url else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon, 22) }}<span>{{ item.label }}{% if item.badge %}{{ waiting_count_tab(waiting) }}{% endif %}</span></a>
+  <a class="tab{{ ' active' if (path == item.url or (item.url != '/' and path.startswith(item.url ~ '/'))) else '' }}" href="{{ item.url }}"{% if path == item.url %} aria-current="page"{% endif %}>{{ icon(item.icon, 22) }}<span>{{ item.label }}{% if item.badge %}{{ waiting_count_tab(waiting) }}{% endif %}</span></a>
     {% endif %}
-    {% for child in item.children %}
-  <a class="tab{{ ' active' if path == child.url else '' }}" href="{{ child.url }}"{% if path == child.url %} aria-current="page"{% endif %}>{{ icon(child.icon, 22) }}<span>{{ child.label }}</span></a>
-    {% endfor %}
   {% endfor %}
 </nav>
 {% endif %}

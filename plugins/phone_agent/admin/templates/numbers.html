@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Numbers{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Numbers</h1>
+    <p class="muted flush">The phone numbers on this line, and which business
+      each one answers for</p>
+  </div>
+</div>
+
+<nav class="filter-tabs settings-tabs" aria-label="Settings screens">
+  <a class="filter" href="/settings">Business</a>
+  <a class="filter" href="/hours">Hours</a>
+  <a class="filter on" href="/numbers" aria-current="page">Numbers</a>
+  <a class="filter" href="/notifications">Notifications</a>
+  <a class="filter" href="/activity">Activity</a>
+</nav>
+
+{% if flash %}
+<p class="notice notice-ok" role="status" aria-live="polite">{{ flash }}</p>
+{% endif %}
+{% if error %}
+<p class="notice notice-bad" role="alert">{{ error }}</p>
+{% endif %}
+
+<div class="card stack-12">
+  <span class="eyebrow">The address the phone network calls</span>
+  <p class="flush"><code class="webhook">{{ webhook }}</code></p>
+  <p class="hint flush">In your Twilio console, the number's “A call comes in”
+    webhook has to be this address, as an HTTP POST. A number that has never
+    seen a call from the phone network is almost always a number pointed
+    somewhere else.</p>
+  <button class="btn btn-quiet self-start" type="button" data-copy="{{ webhook }}"
+          data-copied-label="Copied" data-failed-label="Could not copy">{{ icon("copy", 16) }}<span data-copy-label>Copy the address</span></button>
+</div>
+
+{% if not can_change %}
+<p class="notice" role="status">These are your numbers. Which business a number
+  answers for is how the whole line is wired, so it is changed by whoever
+  manages the line.</p>
+{% endif %}
+
+{% if not rows %}
+<div class="card empty-first-run">
+  <h2 class="display display-m flush">No phone number yet</h2>
+  <p class="muted flush">Nothing rings this line until a number points at it.
+    {% if can_change %}Add one below.{% else %}Whoever manages the line adds
+    one.{% endif %}</p>
+</div>
+{% endif %}
+
+{% if load_error %}
+<p class="notice notice-bad" role="alert">{{ load_error }}</p>
+{% endif %}
+
+<form method="post" action="/numbers" class="stack-16" data-dirty-watch>
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="version" value="{{ version }}">
+  {% if rows %}
+  <div class="card flat">
+    <table class="table">
+      <caption class="visually-hidden">Every phone number on this line</caption>
+      <thead>
+        <tr><th scope="col">Number</th><th scope="col">Answers for</th>
+          <th scope="col">Phone network</th>
+          {% if can_change %}<th scope="col">Remove</th>{% endif %}</tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><span class="strong nowrap">{{ row.number | fmt_phone }}</span>
+            <span class="subtle">{{ row.number }}</span></td>
+          <td>
+            {% if can_change %}
+            <label class="visually-hidden" for="business-for-{{ loop.index }}">Which business {{ row.number | fmt_phone }} answers for</label>
+            <select class="input" id="business-for-{{ loop.index }}"
+                    name="business_for:{{ row.number }}"
+                    {% if errors.get('business_for:' ~ row.number) %}aria-invalid="true"{% endif %}>
+              {% for key, name in businesses %}
+              <option value="{{ key }}"{{ ' selected' if key == row.profile_key else '' }}>{{ name }}</option>
+              {% endfor %}
+            </select>
+            {% if errors.get('business_for:' ~ row.number) %}
+            <p class="hint field-error" role="alert">{{ errors.get('business_for:' ~ row.number) }}</p>
+            {% endif %}
+            {% else %}
+            <span>{{ row.business }}</span>
+            {% endif %}
+            {% if not row.known %}
+            <p class="hint field-error" role="alert">This number points at a
+              business that is not set up any more, so nothing answers on it.</p>
+            {% endif %}
+          </td>
+          <td>
+            <span class="state-{{ 'ok' if row.seen.level == 'ok' else ('unknown' if row.seen.level == 'unknown' else 'bad') }}">{{ row.seen.text }}</span>
+            {% if row.seen.at %}
+            <span class="subtle">{{ row.seen.at | fmt_ago }}</span>
+            {% else %}
+            <span class="subtle">Paste the address above into your Twilio
+              console for this number.</span>
+            {% endif %}
+          </td>
+          {% if can_change %}
+          <td>
+            <span class="checkline">
+              <input type="checkbox" id="remove-{{ loop.index }}" name="remove"
+                     value="{{ row.number }}">
+              <label class="label flush" for="remove-{{ loop.index }}">Take
+                <span class="visually-hidden">{{ row.number | fmt_phone }} </span>off
+                this line</label>
+            </span>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if can_change %}
+  <section class="card stack-12">
+    <h2 class="display display-m flush">Add a number</h2>
+    <div class="row-gap add-number">
+      <div class="filter-search">
+        <label class="label" for="new_number">Phone number</label>
+        <input class="input" id="new_number" name="new_number" type="tel"
+               inputmode="tel" autocomplete="off"
+               value="{{ values.get('new_number', '') }}"
+               aria-describedby="hint-new-number{% if errors.get('new_number') %} error-new-number{% endif %}"
+               {% if errors.get('new_number') %}aria-invalid="true"{% endif %}>
+        <p class="hint" id="hint-new-number">The number as you would dial it.
+          It has to be a number your Twilio account already owns.</p>
+        {% if errors.get('new_number') %}
+        <p class="hint field-error" id="error-new-number" role="alert">{{ errors.get('new_number') }}</p>
+        {% endif %}
+      </div>
+      <div class="filter-field">
+        <label class="label" for="new_business">Answers for</label>
+        <select class="input" id="new_business" name="new_business"
+                {% if errors.get('new_business') %}aria-invalid="true"{% endif %}>
+          <option value="">Pick a business</option>
+          {% for key, name in businesses %}
+          <option value="{{ key }}"{{ ' selected' if values.get('new_business') == key else '' }}>{{ name }}</option>
+          {% endfor %}
+        </select>
+        {% if errors.get('new_business') %}
+        <p class="hint field-error" role="alert">{{ errors.get('new_business') }}</p>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <div class="row-gap">
+    <button class="btn btn-primary" type="submit" data-busy-label="Saving…">Save numbers</button>
+    <a class="btn btn-quiet" href="/numbers">Discard</a>
+  </div>
+  {% endif %}
+</form>
+{% endblock %}

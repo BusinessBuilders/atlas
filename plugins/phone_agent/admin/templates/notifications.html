@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Notifications{% endblock %}
+{% block main %}
+{% with head_title = "Notifications",
+        head_blurb = "Where a message goes the moment a caller leaves one",
+        head_here = "notifications",
+        head_picker_action = "/notifications" %}
+{% include "_settings_head.html" %}
+{% endwith %}
+
+{% if error %}
+<p class="notice notice-bad" role="alert">{{ error }}</p>
+{% endif %}
+
+{% if result %}
+<div class="notice {{ 'notice-ok' if result.ok else 'notice-bad' }}"
+     role="{{ 'status' if result.ok else 'alert' }}" aria-live="polite">
+  <span class="strong">{{ 'Test alert sent to ' if result.ok else 'The test alert failed. ' }}{% if result.ok %}{{ result.target }}{% endif %}</span>
+  <span>{{ result.text }}</span>
+</div>
+{% endif %}
+
+<div class="settings-grid">
+  <div class="settings-column">
+    <section class="card stack-16">
+      <div class="card-head">
+        <h2 class="display display-m flush">Push to your phone</h2>
+        {% if targets.anywhere %}
+        <span class="tag tag-ok">On</span>
+        {% else %}
+        <span class="tag tag-bad">Nowhere to send</span>
+        {% endif %}
+      </div>
+      {% if targets.using_default and targets.anywhere %}
+      <p class="notice" role="status">This business is using the line's own
+        alert address — <span class="strong">{{ targets.live_url }}/{{ targets.live_topic }}</span>.
+        Fill both boxes in below to send its messages somewhere of its own.</p>
+      {% elif not targets.anywhere %}
+      <p class="notice notice-bad" role="status">No push address is set up for
+        this business or for the line, so nobody is told when a caller leaves a
+        message. The message itself is still written down and is on the
+        Messages screen.</p>
+      {% endif %}
+
+      <form method="post" action="/notifications/{{ business_key }}"
+            class="stack-16" data-dirty-watch>
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="version" value="{{ version }}">
+        <div>
+          <label class="label" for="ntfy_url">Push server address</label>
+          <input class="input" id="ntfy_url" name="ntfy_url" type="url"
+                 inputmode="url" autocomplete="off"
+                 value="{{ values.ntfy_url }}"
+                 aria-describedby="hint-ntfy-url{% if errors.get('ntfy_url') %} error-ntfy-url{% endif %}"
+                 {% if errors.get('ntfy_url') %}aria-invalid="true"{% endif %}>
+          <p class="hint" id="hint-ntfy-url">Your ntfy server, starting with
+            https://. Leave both boxes empty to use the line's own address.</p>
+          {% if errors.get('ntfy_url') %}
+          <p class="hint field-error" id="error-ntfy-url" role="alert">{{ errors.get('ntfy_url') }}</p>
+          {% endif %}
+        </div>
+        <div>
+          <label class="label" for="ntfy_topic">Topic</label>
+          <input class="input" id="ntfy_topic" name="ntfy_topic"
+                 autocomplete="off" value="{{ values.ntfy_topic }}"
+                 aria-describedby="hint-ntfy-topic{% if errors.get('ntfy_topic') %} error-ntfy-topic{% endif %}"
+                 {% if errors.get('ntfy_topic') %}aria-invalid="true"{% endif %}>
+          <p class="hint" id="hint-ntfy-topic">The name your phone is subscribed
+            to on that server.</p>
+          {% if errors.get('ntfy_topic') %}
+          <p class="hint field-error" id="error-ntfy-topic" role="alert">{{ errors.get('ntfy_topic') }}</p>
+          {% endif %}
+        </div>
+        {% if errors.get('confirm_disable') %}
+        <div class="checkline notice notice-bad" role="alert">
+          <input type="checkbox" id="confirm_disable" name="confirm_disable" value="on">
+          <label class="label flush" for="confirm_disable">{{ errors.get('confirm_disable') }}
+            Tick this box and save again to go ahead.</label>
+        </div>
+        {% endif %}
+        <div class="row-gap">
+          <button class="btn btn-primary" type="submit" data-busy-label="Saving…">Save</button>
+        </div>
+      </form>
+
+      <form method="post" action="/notifications/{{ business_key }}/test">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="btn btn-ghost" type="submit" data-busy-label="Sending…"
+                {{ 'disabled' if not targets.anywhere else '' }}>{{ icon("send", 16) }}Send a test alert</button>
+      </form>
+      <p class="hint flush">The test is a real push, sent the same way and to
+        the same place as a caller's message. Whatever comes back is what you
+        see.</p>
+    </section>
+  </div>
+
+  <div class="settings-column">
+    <section class="card stack-12">
+      <h2 class="eyebrow flush">Last {{ attempts | length }} attempts</h2>
+      {% if log_error %}
+      <p class="notice notice-bad" role="alert">{{ log_error }}</p>
+      {% elif not attempts %}
+      <p class="muted flush">Nothing has been sent for this business yet. A
+        caller's message, or the test button, puts the first line here.</p>
+      {% else %}
+      <ul class="alerts">
+        {% for attempt in attempts %}
+        <li class="alert{{ '' if attempt.ok else ' alert-error' }}">
+          <span class="alert-icon" aria-hidden="true">{{ icon("check", 16) if attempt.ok else icon("warn", 16) }}</span>
+          <span>
+            <span class="strong">{{ 'Delivered' if attempt.ok else 'Did not get through' }}</span>
+            <span class="subtle">{{ attempt.ts | fmt_local }} · {{ attempt.target }}</span>
+            {% if attempt.error %}
+            <span class="subtle">{{ attempt.error }}</span>
+            {% endif %}
+          </span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

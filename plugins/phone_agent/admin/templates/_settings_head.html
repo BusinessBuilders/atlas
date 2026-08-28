@@ -1,0 +1,36 @@
+{# The top of every settings screen: which business you are editing, which
+   screen you are on, and the receipt a redirect left behind.
+
+   The section links are here as well as in the rail because the rail is hidden
+   on a phone, and "change my opening hours" has to be reachable with a thumb.
+   The business picker is a plain GET form with its own button: no script, and
+   it works on a keyboard the same way it works with a mouse. #}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">{{ head_title }}</h1>
+    <p class="muted flush">{{ head_blurb }}</p>
+  </div>
+  {% if businesses | length > 1 %}
+  <form class="row-gap" method="get" action="{{ head_picker_action }}">
+    <label class="label flush" for="business-picker">Business</label>
+    <select class="input filter-field" id="business-picker" name="business">
+      {% for key, name in businesses %}
+      <option value="{{ key }}"{{ ' selected' if key == business_key else '' }}>{{ name }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn btn-ghost" type="submit">Show</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if flash %}
+<p class="notice notice-ok" role="status" aria-live="polite">{{ flash }}</p>
+{% endif %}
+
+<nav class="filter-tabs settings-tabs" aria-label="Settings screens">
+  <a class="filter{{ ' on' if head_here == 'business' else '' }}" href="/settings/{{ business_key }}"{% if head_here == 'business' %} aria-current="page"{% endif %}>Business</a>
+  <a class="filter{{ ' on' if head_here == 'hours' else '' }}" href="/hours/{{ business_key }}"{% if head_here == 'hours' %} aria-current="page"{% endif %}>Hours</a>
+  <a class="filter{{ ' on' if head_here == 'numbers' else '' }}" href="/numbers"{% if head_here == 'numbers' %} aria-current="page"{% endif %}>Numbers</a>
+  <a class="filter{{ ' on' if head_here == 'notifications' else '' }}" href="/notifications/{{ business_key }}"{% if head_here == 'notifications' %} aria-current="page"{% endif %}>Notifications</a>
+  <a class="filter{{ ' on' if head_here == 'activity' else '' }}" href="/activity"{% if head_here == 'activity' %} aria-current="page"{% endif %}>Activity</a>
+</nav>

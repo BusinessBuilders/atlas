@@ -18,6 +18,7 @@ businesses answer on.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 
 from aiohttp import web
@@ -136,40 +137,24 @@ async def switch_brain(request: web.Request) -> web.Response:
                   "every caller hears an apology. Tick the box below if you "
                   "want to switch anyway.")
 
-    errors = await asyncio.to_thread(_apply_switch, deps, session, wanted, active)
-    if errors:
+    error = await asyncio.to_thread(_apply_switch, deps, session, wanted, active)
+    if error:
         return await _page(request, deps, session, confirming=wanted,
-                           error="Nothing was changed. " + " ".join(errors))
+                           error="Nothing was changed. " + error)
     log.info("dashboard: %s switched the model that answers calls to %r",
              session.owner_key, wanted)
     raise web.HTTPSeeOther(f"/brain?switched={wanted}")
 
 
-def _apply_switch(deps, session, wanted: str, previous: str) -> list:
+def _apply_switch(deps, session, wanted: str, previous: str):
     """Re-emit the whole config with a new active brain and apply it.
 
-    Runs in a thread: writing and re-parsing businesses.toml is blocking work
-    on the event loop that is streaming live calls.
+    The same one path every other settings save takes — `apply_config` emits
+    the file, validates it fail-closed, backs the old one up, hot-applies it and
+    writes the audit row. Runs in a thread: that is blocking work on the event
+    loop streaming live calls.
     """
-    numbers, profiles = deps.get_state()
-    brains, _active = deps.get_brains()
-    try:
-        text = deps.emit_business_toml(numbers, profiles, brains, wanted,
-                                       deps.get_branding(), deps.get_owners())
-    except ValueError as e:
-        # The emitter refuses what it cannot write back faithfully. The owner
-        # reads that sentence on the page — it must never escape as a 500.
-        errors = [str(e)]
-    else:
-        errors = deps.apply_config_text(text)
-    summary = (f"The model that answers calls changed from {previous} to "
-               f"{wanted}") if not errors else (
-        f"Tried to change the model that answers calls to {wanted}")
-    try:
-        deps.store.record_config_change(
-            actor=session.owner_key, summary=summary,
-            diff=f"-active_brain = {previous!r}\n+active_brain = {wanted!r}",
-            applied=not errors, reason="; ".join(errors))
-    except Exception:
-        log.exception("call store: could not record the model change")
-    return errors
+    config = dataclasses.replace(deps.get_config(), active_brain=wanted)
+    return deps.apply_config(
+        config, session.owner_key,
+        f"Changed the model that answers calls from {previous} to {wanted}")

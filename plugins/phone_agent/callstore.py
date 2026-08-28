@@ -529,7 +529,8 @@ class CallStore:
         return where, params
 
     def list_messages(self, profile_keys, status=None, include_test=False, *,
-                      call_sids=None, limit=None, offset=0) -> list:
+                      call_sids=None, limit=None, offset=0,
+                      oldest_first=False) -> list:
         """The owner's message list, newest first, with the caller's number
         joined in from the call.
 
@@ -537,6 +538,10 @@ class CallStore:
         page it — a caller that wants the status of ten calls must not read
         every message this line has ever taken to find them, and neither must
         the screen that lists them.
+
+        `oldest_first` turns the order around, which is how the Overview asks
+        "how long has the oldest one been waiting?" with `limit=1` instead of
+        reading every waiting message to find the smallest timestamp.
         """
         keys = [str(k) for k in profile_keys]
         if not keys:
@@ -544,8 +549,9 @@ class CallStore:
         where, params = self._message_where(keys, status, include_test, call_sids)
         if where is None:
             return []
+        order = "ASC" if oldest_first else "DESC"
         sql = (MESSAGE_SELECT + "WHERE " + " AND ".join(where)
-               + " ORDER BY m.created_at DESC, m.id DESC")
+               + f" ORDER BY m.created_at {order}, m.id {order}")
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params += [int(limit), int(offset)]
@@ -830,6 +836,38 @@ class CallStore:
                 "SELECT * FROM config_changes ORDER BY ts DESC, id DESC LIMIT ?",
                 (int(limit),)).fetchall()
         return [dict(r) for r in rows]
+
+    def newest_config_change_id(self) -> int:
+        """The id of the last settings change, or 0 when there has never been
+        one.
+
+        It is the version a settings form carries: a form built before somebody
+        else saved comes back with an old number, and the save is refused
+        instead of quietly overwriting what they did.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT MAX(id) FROM config_changes").fetchone()
+        return int(row[0] or 0)
+
+    def last_call_per_number(self, numbers) -> dict:
+        """When each of these numbers last took a real call: {number: started_at}.
+
+        This is what the Numbers screen calls "verified": a call row exists only
+        because a signed request from the phone network reached this bridge on
+        that number. Test rows are excluded — a fixture must never be the
+        evidence that a customer's number is wired up.
+        """
+        wanted = [str(n) for n in numbers]
+        if not wanted:
+            return {}
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT to_number, MAX(started_at) AS newest FROM calls "
+                "WHERE is_test = 0 AND to_number IN (%s) GROUP BY to_number"
+                % ",".join("?" * len(wanted)), wanted).fetchall()
+        return {str(r["to_number"]): float(r["newest"]) for r in rows
+                if r["newest"] is not None}
 
     def create_session(self, owner_key: str) -> str:
         """A dashboard login. The id is the credential, so it comes from

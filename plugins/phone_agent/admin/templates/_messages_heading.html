@@ -1,0 +1,11 @@
+{# The sentence under the Messages title. It is its own file because a status
+   change swaps it out of band alongside the navigation badge: a heading still
+   reading "2 waiting" beside the message just marked done is the screen
+   contradicting itself, in exactly the way the badge used to. #}
+<p class="muted flush" id="messages-count"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {% if error %}Your messages could not be read
+  {% elif chosen %}{{ total }} in this list · newest first
+  {# The same number the navigation badge draws, not a second count of the
+     same thing: two counts that disagree are worse than either alone. #}
+  {% else %}{{ waiting }} waiting · newest first{% endif %}
+</p>

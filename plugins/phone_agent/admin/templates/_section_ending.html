@@ -1,0 +1,10 @@
+{% from "_section_frame.html" import section_form, rows with context %}
+{% call section_form(section, "Save endings") %}
+{% if section.fields.phrases_are_standard %}
+{% set end_hint = "These are the standard phrases every line starts with. Edit or remove any of them." %}
+{% else %}
+{% set end_hint = "When a caller says one of these, the agent says goodbye and hangs up." %}
+{% endif %}
+{{ rows(section, "phrase", section.fields.phrases, "Phrases that end a call",
+        end_hint, "Add a phrase — “that's everything”, “cheers, bye”…") }}
+{% endcall %}

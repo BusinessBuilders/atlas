@@ -1,0 +1,14 @@
+{% from "_section_frame.html" import section_form, field_error, described_by with context %}
+{% call section_form(section, "Save instructions") %}
+<div>
+  <label class="label" for="extra_instructions">Anything else the agent should know</label>
+  <textarea class="input tall" id="extra_instructions" name="extra_instructions"
+            rows="10"
+            {{ described_by(section, "extra_instructions", "hint-extra_instructions") }}>{{ section.fields.extra_instructions }}</textarea>
+  <p class="hint" id="hint-extra_instructions">House rules in plain English — how
+    to handle a price question, when to offer a callback, what never to promise.
+    It cannot override the safety rules: the agent still never books, confirms
+    or commits to anything.</p>
+  {{ field_error(section, "extra_instructions") }}
+</div>
+{% endcall %}

@@ -104,11 +104,33 @@ def _numbers_check(numbers: dict, profiles) -> Check:
                  f"{len(mapped)} number{'' if len(mapped) == 1 else 's'} answering")
 
 
-def _notify_check(health: dict, notify_failure) -> Check:
-    failures = int(health.get("ntfy_failures") or 0)
-    last = dict(health.get("last_delivery") or {})
+def _notify_check(health: dict, notify_failure, whole_line: bool,
+                  last_notify=None) -> Check:
+    """Are this owner's message alerts getting through?
+
+    `ntfy_failures` and `last_delivery` count the WHOLE line: on a shared line
+    they can be another business's push target failing. Showing a scoped owner
+    amber for that is an alarm about something they cannot see, cannot fix and
+    are not even told the name of. So an owner of one business is judged on
+    their OWN newest attempt, which the store scoped for us; the line-wide
+    counters are for the account that owns the whole line.
+    """
     target = str((notify_failure or {}).get("target", "")).strip()
     named = f" to {target}" if target else ""
+    if not whole_line:
+        newest = dict(last_notify or {})
+        if newest and not newest.get("ok"):
+            failed_target = str(newest.get("target", "")).strip()
+            return Check("notifications", "Message alerts", WARN,
+                         "The last message alert"
+                         + (f" to {failed_target}" if failed_target else "")
+                         + " did not get through")
+        if not newest:
+            return Check("notifications", "Message alerts", OK,
+                         "No message alerts sent yet")
+        return Check("notifications", "Message alerts", OK, "Alerts delivering")
+    failures = int(health.get("ntfy_failures") or 0)
+    last = dict(health.get("last_delivery") or {})
     if failures:
         return Check("notifications", "Message alerts", WARN,
                      f"Message alerts{named} are failing "
@@ -120,11 +142,14 @@ def _notify_check(health: dict, notify_failure) -> Check:
 
 
 def line_status(*, health: dict, numbers: dict, profiles, last_call_at=None,
-                notify_failure=None, owner_brains=None, now=None) -> LineStatus:
+                notify_failure=None, owner_brains=None, now=None,
+                whole_line=True, last_notify=None) -> LineStatus:
     """The band across the top of the Overview.
 
     `owner_brains` names the model backends this reader's businesses actually
-    run on; None means every one on the line.
+    run on; None means every one on the line. `whole_line` says whether this
+    reader owns the line itself — the line-wide health counters mean nothing to
+    an owner of one business on it.
     """
     moment = time.time() if now is None else float(now)
     bridge_ok = str(health.get("bridge", "")) == "ok"
@@ -135,7 +160,7 @@ def line_status(*, health: dict, numbers: dict, profiles, last_call_at=None,
         _brain_check(health, owner_brains),
         _twilio_check(last_call_at, moment),
         _numbers_check(numbers, profiles),
-        _notify_check(health, notify_failure),
+        _notify_check(health, notify_failure, whole_line, last_notify),
     )
     worst = max(_SEVERITY[c.level] for c in checks)
     if worst == _SEVERITY[DOWN]:

@@ -1,0 +1,69 @@
+{% from "_icons.html" import icon %}
+{% from "_section_frame.html" import section_form, field_error, described_by with context %}
+{% call section_form(section, "Save greeting") %}
+<div>
+  <label class="label" for="greeting">What callers hear first</label>
+  <input class="input" id="greeting" name="greeting" required
+         value="{{ section.fields.greeting }}"
+         {{ described_by(section, "greeting", "hint-greeting") }}>
+  <p class="hint" id="hint-greeting">{{ section.fields.greeting | length }} characters.
+    You can write {business_name} and {assistant_name} and the line fills them in.</p>
+  {{ field_error(section, "greeting") }}
+</div>
+
+<div class="preview">
+  <span class="eyebrow">Exactly what a caller will hear</span>
+  {% if section.preview.problem %}
+  <p class="notice notice-bad flush" role="alert">{{ section.preview.problem }}</p>
+  {% else %}
+  <p class="preview-line flush">“{{ section.preview.line }}”</p>
+  <p class="hint flush">{{ section.preview.characters }} characters · about
+    {{ section.preview.seconds }} seconds at a normal speaking pace. The notices
+    are spoken before your closing question, so a caller hears them before they
+    start talking.</p>
+  {% endif %}
+</div>
+
+<fieldset class="stack-12">
+  <legend class="label">What the caller is told</legend>
+  <div class="checkline">
+    <input type="checkbox" id="ai_disclosure" name="ai_disclosure" value="on"
+           {{ 'checked' if section.fields.ai_disclosure else '' }}>
+    <label class="label flush" for="ai_disclosure">Say it is an AI assistant</label>
+  </div>
+  <div>
+    <label class="label" for="ai_disclosure_text">The words used</label>
+    <input class="input" id="ai_disclosure_text" name="ai_disclosure_text"
+           value="{{ section.fields.ai_disclosure_text }}"
+           {{ described_by(section, "ai_disclosure_text", "hint-ai_disclosure_text") }}>
+    <p class="hint" id="hint-ai_disclosure_text">Leave it as it is unless your
+      trade has its own wording.</p>
+    {{ field_error(section, "ai_disclosure_text") }}
+  </div>
+  <div class="checkline">
+    <input type="checkbox" id="recording_notice" name="recording_notice" value="on"
+           {{ 'checked' if section.fields.recording_notice else '' }}>
+    <label class="label flush" for="recording_notice">Say the call may be recorded</label>
+  </div>
+  <div>
+    <label class="label" for="recording_notice_text">The words used</label>
+    <input class="input" id="recording_notice_text" name="recording_notice_text"
+           value="{{ section.fields.recording_notice_text }}"
+           {{ described_by(section, "recording_notice_text", "hint-recording_notice_text") }}>
+    <p class="hint" id="hint-recording_notice_text">Some places require this
+      wording exactly; most do not. Leave it as it is if you are not sure.</p>
+    {{ field_error(section, "recording_notice_text") }}
+  </div>
+  <div class="checkline{{ ' notice notice-bad' if section.errors.get('ack_disclosure_waived') else '' }}">
+    <input type="checkbox" id="ack_disclosure_waived" name="ack_disclosure_waived"
+           value="on" {{ 'checked' if section.fields.ack_disclosure_waived else '' }}
+           {{ described_by(section, "ack_disclosure_waived", "hint-ack") }}>
+    <label class="label flush" for="ack_disclosure_waived">This line does not
+      need one of these notices, and I am recording that decision.</label>
+  </div>
+  <p class="hint" id="hint-ack">Callers in many places have a right to be told
+    they are speaking to a machine and that the call is kept. Switching either
+    notice off needs the box above ticked.</p>
+  {{ field_error(section, "ack_disclosure_waived") }}
+</fieldset>
+{% endcall %}

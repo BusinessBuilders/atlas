@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Activity{% endblock %}
+{% block main %}
+<div class="page-head">
+  <div>
+    <h1 class="display display-l flush">Activity</h1>
+    <p class="muted flush">Everything that changed on this line, who changed it,
+      and how to put it back</p>
+  </div>
+</div>
+
+<nav class="filter-tabs settings-tabs" aria-label="Settings screens">
+  <a class="filter" href="/settings">Business</a>
+  <a class="filter" href="/hours">Hours</a>
+  <a class="filter" href="/numbers">Numbers</a>
+  <a class="filter" href="/notifications">Notifications</a>
+  <a class="filter on" href="/activity" aria-current="page">Activity</a>
+</nav>
+
+{% if flash %}
+<p class="notice" role="status" aria-live="polite">{{ flash }}</p>
+{% endif %}
+
+{% if removed %}
+<section class="card stack-12">
+  <h2 class="display display-m flush">Removed businesses</h2>
+  <p class="hint flush">A removed business can be put back for
+    {{ recovery_days }} days, with the settings it had on the day it went.</p>
+  <ul class="alerts">
+    {% for row in removed %}
+    <li class="alert">
+      <span class="alert-icon" aria-hidden="true">{{ icon("trash", 16) }}</span>
+      <span class="grow">
+        <span class="strong">{{ row.name }}</span>
+        {# One line, deliberately: `trim_blocks` eats the newline after a block
+           tag, so a phrase split across template lines runs into the next one
+           with no space between them. #}
+        <span class="subtle">{% if row.at %}Removed {{ row.at | fmt_local }}{% else %}Removed — the date was not recorded{% endif %}{% if row.restorable %} · {{ row.window_days - row.age_days }} day{{ '' if (row.window_days - row.age_days) == 1 else 's' }} left to put it back{% else %} · past the {{ row.window_days }}-day window{% endif %}</span>
+      </span>
+      {% if row.restorable and whole_line %}
+      <form method="post" action="/activity/restore-business">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="business" value="{{ row.key }}">
+        <button class="btn btn-ghost btn-small" type="submit"
+                data-busy-label="Putting back…">{{ icon("undo", 16) }}Put it back</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% if removed_error %}
+<p class="notice notice-bad" role="alert">{{ removed_error }}</p>
+{% endif %}
+
+<section class="card stack-12">
+  <h2 class="display display-m flush">Settings changes</h2>
+  {% if changes_error %}
+  <p class="notice notice-bad" role="alert">{{ changes_error }}</p>
+  {% elif not changes %}
+  <p class="muted flush">Nothing has been changed on this line yet. Every save
+    from now on is written down here, with what it changed.</p>
+  {% else %}
+  <ul class="changes">
+    {% for change in changes %}
+    <li class="change{{ '' if change.applied else ' change-refused' }}">
+      <div class="change-head">
+        <span class="strong">{{ change.summary }}</span>
+        <span class="subtle">{{ change.ts | fmt_local }} · by {{ change.actor_label }}</span>
+      </div>
+      {% if not change.applied %}
+      <p class="hint field-error flush" role="note">Refused, so nothing
+        changed{% if change.reason %}: {{ change.reason }}{% endif %}</p>
+      {% endif %}
+      {% if change.lines %}
+      <details class="change-diff">
+        <summary class="label">What changed</summary>
+        {# The exact lines, because "the greeting changed" is the headline and
+           this is the evidence. It is the settings as the line stores them, so
+           it reads like a settings file — which is what an owner wants when
+           they are working out what somebody else did. #}
+        <p class="hint">The exact lines that changed in your settings.</p>
+        <table class="diff">
+          <caption class="visually-hidden">The lines this change added and removed</caption>
+          <tbody>
+            {% for line in change.lines %}
+            <tr class="diff-{{ line.kind }}">
+              <td class="diff-mark" aria-hidden="true">{{ '+' if line.kind == 'added' else ('−' if line.kind == 'removed' else '') }}</td>
+              <td class="diff-text">
+                {%- if line.kind == 'added' %}<span class="visually-hidden">Added: </span>
+                {%- elif line.kind == 'removed' %}<span class="visually-hidden">Removed: </span>{% endif -%}
+                {{ line.text }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </details>
+      {% endif %}
+      {% if change.can_restore and whole_line %}
+      <form method="post" action="/activity/restore" class="change-restore">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="change_id" value="{{ change.id }}">
+        <button class="btn btn-quiet btn-small" type="submit"
+                data-busy-label="Putting back…">{{ icon("undo", 16) }}Put the settings back to before this</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
+<div class="settings-grid">
+  <section class="card stack-12">
+    <h2 class="display display-m flush">Sign-ins</h2>
+    {% if events_error %}
+    <p class="notice notice-bad" role="alert">{{ events_error }}</p>
+    {% elif not sign_ins %}
+    <p class="muted flush">No sign-in has been recorded yet.</p>
+    {% else %}
+    <ul class="alerts">
+      {% for row in sign_ins %}
+      <li class="alert{{ ' alert-error' if row.level == 'error' else '' }}">
+        <span class="alert-icon" aria-hidden="true">{{ icon("warn", 16) if row.level in ('warning', 'error') else icon("check", 16) }}</span>
+        <span>
+          <span class="strong">{{ row.label }}</span>
+          <span class="subtle">{{ row.ts | fmt_local }}{% if row.detail %} · {{ row.detail }}{% endif %}</span>
+        </span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="card stack-12">
+    <h2 class="display display-m flush">What your line reported</h2>
+    {% if events_error %}
+    <p class="notice notice-bad" role="alert">{{ events_error }}</p>
+    {% elif not service_events %}
+    <p class="muted flush">Your line has not reported a problem. This is where a
+      model that stopped answering, an alert that did not get through, or a
+      clear-out that did not run would appear.</p>
+    {% else %}
+    <ul class="alerts">
+      {% for row in service_events %}
+      <li class="alert{{ ' alert-error' if row.level == 'error' else '' }}">
+        <span class="alert-icon" aria-hidden="true">{{ icon("warn", 16) }}</span>
+        <span>
+          <span class="strong">{{ row.label }}</span>
+          <span class="subtle">{{ row.ts | fmt_local }}{% if row.detail %} · {{ row.detail }}{% endif %}</span>
+        </span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

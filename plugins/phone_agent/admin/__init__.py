@@ -33,7 +33,9 @@ import os
 from aiohttp import web
 
 from . import auth as auth_module
-from . import render, views_brain, views_calls, views_messages, views_overview
+from . import (render, views_activity, views_brain, views_calls, views_hours,
+               views_messages, views_notifications, views_numbers,
+               views_overview, views_settings)
 
 log = logging.getLogger("atlas-phone")
 
@@ -111,10 +113,12 @@ async def _loud_failures(request: web.Request, handler):
                    "It has been written to the service log.")
 
 
-def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
-                    get_health, get_brain_health, apply_config_text,
-                    emit_business_toml, acknowledge_delivery_failure,
-                    store) -> web.Application:
+def build_admin_app(*, get_state, get_config, get_brains, get_branding,
+                    get_owners, get_health, get_brain_health, apply_config,
+                    delivery_targets, profile_setting, opening_line,
+                    parse_config, config_from_diff,
+                    acknowledge_delivery_failure, store, public_base="",
+                    product_defaults=None) -> web.Application:
     """The owner dashboard, wired to one running bridge.
 
     `get_health` is the service's `health_snapshot()`: it answers
@@ -130,12 +134,15 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
         auth=auth_module.Auth(store=store, get_owners=get_owners,
                               get_state=get_state),
         env=render.make_env(), store=store, get_state=get_state,
+        get_config=get_config,
         get_brains=get_brains, get_branding=get_branding, get_owners=get_owners,
         get_health=get_health, get_brain_health=get_brain_health,
-        apply_config_text=apply_config_text,
-        emit_business_toml=emit_business_toml,
+        apply_config=apply_config, delivery_targets=delivery_targets,
+        profile_setting=profile_setting, opening_line=opening_line,
+        parse_config=parse_config, config_from_diff=config_from_diff,
         acknowledge_delivery_failure=acknowledge_delivery_failure,
-        asset_version=asset_version,
+        public_base=public_base, asset_version=asset_version,
+        product_defaults=dict(product_defaults or {}),
     )
 
     # ------------------------------------------------------- sign in/out --
@@ -143,6 +150,13 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
     async def sign_in_page(request: web.Request) -> web.Response:
         if deps.auth.session_for(request) is not None:
             raise web.HTTPFound("/")
+        # A form that is closed says so BEFORE it is submitted. The lockout is
+        # what an owner rings up about ("it says my code is wrong and now the
+        # button does nothing"), and a page that looks ready and then refuses
+        # every attempt is the version of that conversation nobody can settle.
+        locked = deps.auth.lock_remaining(deps.auth.client_ip(request))
+        if locked:
+            return await _locked_out(request, locked)
         return await render.page(request, deps, "sign_in.html", error="", locked=0)
 
     async def sign_in(request: web.Request) -> web.Response:
@@ -189,6 +203,10 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
             return await render.page(request, deps, "refused.html", session=session,
                                status=403, reason=reason)
         await asyncio.to_thread(store.delete_session, session.id)
+        # The one-page receipt this login was owed dies with the login: a dict
+        # keyed by session id that nothing ever removed from would hold a
+        # signed-out owner's last message for as long as the process ran.
+        request.app[render.FLASH].pop(session.id, None)
         response = web.HTTPSeeOther(auth_module.SIGN_IN_PATH)
         deps.auth.clear_cookie(response)
         return response
@@ -202,6 +220,7 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
                                status=403, reason=reason)
         gone = await asyncio.to_thread(store.delete_owner_sessions,
                                        session.owner_key)
+        request.app[render.FLASH].pop(session.id, None)
         log.info("dashboard: %s signed out of %d device(s)",
                  session.owner_key, gone)
         response = web.HTTPSeeOther(auth_module.SIGN_IN_PATH)
@@ -263,6 +282,26 @@ def build_admin_app(*, get_state, get_brains, get_branding, get_owners,
     app.router.add_get("/messages", views_messages.messages)
     app.router.add_get("/messages.csv", views_messages.messages_csv)
     app.router.add_post("/messages/{id}/status", views_messages.message_status)
+    app.router.add_get("/settings", views_settings.settings)
+    app.router.add_get("/settings/{profile}", views_settings.settings_for)
+    app.router.add_post("/settings/{profile}/{section}", views_settings.save_section)
+    app.router.add_get("/business/{profile}/delete", views_settings.delete_page)
+    app.router.add_post("/business/{profile}/delete", views_settings.delete_business)
+    app.router.add_get("/hours", views_hours.hours)
+    app.router.add_get("/hours/{profile}", views_hours.hours_for)
+    app.router.add_post("/hours/{profile}", views_hours.save_hours)
+    app.router.add_get("/numbers", views_numbers.numbers)
+    app.router.add_post("/numbers", views_numbers.save_numbers)
+    app.router.add_get("/notifications", views_notifications.notifications)
+    app.router.add_get("/notifications/{profile}",
+                       views_notifications.notifications_for)
+    app.router.add_post("/notifications/{profile}", views_notifications.save)
+    app.router.add_post("/notifications/{profile}/test",
+                        views_notifications.send_test)
+    app.router.add_get("/activity", views_activity.activity)
+    app.router.add_post("/activity/restore", views_activity.restore)
+    app.router.add_post("/activity/restore-business",
+                        views_activity.restore_business)
     app.router.add_get("/brain", views_brain.brain)
     app.router.add_post("/brain", views_brain.switch_brain)
     app.router.add_get(auth_module.SIGN_IN_PATH, sign_in_page)

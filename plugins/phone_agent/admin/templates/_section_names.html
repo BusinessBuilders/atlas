@@ -1,0 +1,19 @@
+{% from "_section_frame.html" import section_form, field_error, described_by, rows with context %}
+{% call section_form(section, "Save names") %}
+<div>
+  <label class="label" for="assistant_name">Your assistant's name</label>
+  <input class="input" id="assistant_name" name="assistant_name"
+         value="{{ section.fields.assistant_name }}" placeholder="Atlas"
+         {{ described_by(section, "assistant_name", "hint-assistant_name") }}>
+  <p class="hint" id="hint-assistant_name">What it calls itself on the phone.
+    Left empty it answers as Atlas.</p>
+  {{ field_error(section, "assistant_name") }}
+</div>
+{% if section.fields.aliases_are_standard %}
+{% set alias_hint = "The mishearings this product already knows about for that name. Add the ones your callers actually say." %}
+{% else %}
+{% set alias_hint = "A phone line mangles names. Anything here is treated as the assistant's name when a caller says it." %}
+{% endif %}
+{{ rows(section, "alias", section.fields.aliases, "Ways callers get the name wrong",
+        alias_hint, "Add a mishearing you have heard on a call") }}
+{% endcall %}

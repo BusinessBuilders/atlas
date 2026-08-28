@@ -1,0 +1,100 @@
+{% from "_icons.html" import icon %}
+{# The shape every settings section shares: its own heading, its own form, its
+   own save button, its own "saved" line — and, when a save is refused, the
+   reason with every value the owner typed still in the boxes.
+
+   `hx-post` swaps this whole <section> for the server's answer. Without
+   JavaScript the same form posts, the server redirects, and the page comes
+   back with the receipt: nothing here depends on the swap. #}
+
+{% macro field_error(section, name) -%}
+{% if section.errors.get(name) %}
+<p class="hint field-error" id="error-{{ section.name }}-{{ name }}" role="alert">{{ section.errors.get(name) }}</p>
+{% endif %}
+{%- endmacro %}
+
+{% macro described_by(section, name, hint_id) -%}
+aria-describedby="{{ hint_id }}{% if section.errors.get(name) %} error-{{ section.name }}-{{ name }}{% endif %}"{% if section.errors.get(name) %} aria-invalid="true"{% endif %}
+{%- endmacro %}
+
+{% macro section_form(section, save_label) %}
+<section class="card section-card{{ ' section-refused' if section.error or section.errors else '' }}"
+         id="section-{{ section.name }}">
+  <div class="card-head">
+    <h2 class="display display-m flush">{{ section.title }}</h2>
+    <div class="live" role="status" aria-live="polite">
+      {% if section.saved %}
+      <span class="tag tag-ok">{{ icon("check", 12) }}{{ section.saved_message }}</span>
+      {% endif %}
+    </div>
+  </div>
+  {% if section.error %}
+  <p class="notice notice-bad" role="alert">{{ section.error }}</p>
+  {% endif %}
+  <form class="stack-16" method="post"
+        action="/settings/{{ section.profile_key }}/{{ section.name }}"
+        hx-post="/settings/{{ section.profile_key }}/{{ section.name }}"
+        hx-target="#section-{{ section.name }}" hx-swap="outerHTML"
+        data-dirty-watch>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {# The version this form was built from. A save whose number no longer
+       matches the newest change is refused, so a page left open on another
+       device cannot quietly undo somebody else's work. It carries an id
+       because a successful save has to hand the new number to the OTHER
+       sections on this page — see the swap under this form. #}
+    <input type="hidden" id="version-{{ section.name }}" name="version"
+           value="{{ section.version }}">
+    {{ caller() }}
+    {% if section.errors.get('confirm_disable') %}
+    <div class="checkline notice notice-bad" role="alert">
+      <input type="checkbox" id="confirm-{{ section.name }}" name="confirm_disable" value="on">
+      <label class="label flush" for="confirm-{{ section.name }}">{{ section.errors.get('confirm_disable') }}
+        Tick this box and save again to go ahead.</label>
+    </div>
+    {% endif %}
+    <div class="row-gap section-actions">
+      <button class="btn btn-primary" type="submit" data-busy-label="Saving…">{{ save_label }}</button>
+    </div>
+  </form>
+</section>
+{# A save that went through moves the version on. Without this, saving the
+   greeting would leave every other section on the page carrying a number that
+   is now old, and the owner's next save — of something nobody else touched —
+   would come back "this page is out of date". The concurrency check is not
+   weakened: this only ever runs after a save that was current. #}
+{% for other in section.oob_versions %}
+<input type="hidden" id="version-{{ other }}" name="version"
+       value="{{ section.version }}" hx-swap-oob="true">
+{% endfor %}
+{% endmacro %}
+
+{# One repeatable row group: the lines that are there, plus an empty one to
+   type the next into. app.js adds a fresh empty line as soon as the last one
+   is used and makes Remove take a line away; with no JavaScript, clearing a
+   line and saving removes it, which is what the hint says. #}
+{% macro rows(section, field, values, label, hint, placeholder) %}
+<fieldset class="rows" data-rows>
+  <legend class="label">{{ label }}</legend>
+  <p class="hint" id="hint-{{ section.name }}-{{ field }}">{{ hint }}
+    Clear a line and save to remove it.</p>
+  {{ field_error(section, field) }}
+  {% for value in values %}
+  <div class="row-line" data-row>
+    <label class="visually-hidden" for="{{ section.name }}-{{ field }}-{{ loop.index }}">{{ label }} line {{ loop.index }}</label>
+    <input class="input" id="{{ section.name }}-{{ field }}-{{ loop.index }}"
+           name="{{ field }}" value="{{ value }}"
+           aria-describedby="hint-{{ section.name }}-{{ field }}">
+    <button class="btn btn-quiet btn-small row-remove" type="button"
+            data-remove-row>Remove<span class="visually-hidden"> line {{ loop.index }}</span></button>
+  </div>
+  {% endfor %}
+  <div class="row-line" data-row data-row-blank>
+    <label class="visually-hidden" for="{{ section.name }}-{{ field }}-new">Add another {{ label | lower }} line</label>
+    <input class="input" id="{{ section.name }}-{{ field }}-new" name="{{ field }}"
+           value="" placeholder="{{ placeholder }}"
+           aria-describedby="hint-{{ section.name }}-{{ field }}">
+    <button class="btn btn-quiet btn-small row-remove" type="button"
+            data-remove-row hidden>Remove</button>
+  </div>
+</fieldset>
+{% endmacro %}

@@ -140,6 +140,7 @@ implicit brain, exactly as before brains existed.
 
 import asyncio
 import collections
+import difflib
 import hashlib
 import hmac
 import json
@@ -1503,7 +1504,12 @@ def parse_owners_config(data: dict, profiles: dict) -> dict:
 
 
 _TOP_LEVEL_KNOWN_KEYS = ("numbers", "profiles", "brains", "active_brain",
-                         "branding", "owners")
+                         "branding", "owners", "deleted_profiles")
+
+# How long a removed business can still be put back from the dashboard.
+DELETED_PROFILE_RECOVERY_DAYS = 30
+# The one key this file adds to a business when it is put away.
+DELETED_AT_KEY = "deleted_at"
 
 
 @dataclass
@@ -1515,6 +1521,62 @@ class Config:
     active_brain: str
     branding: Branding
     owners: dict
+    # Businesses the owner removed from the dashboard. Kept in the file, word
+    # for word, so "remove this business" is undoable — nothing here is read by
+    # a live call, and nothing here is validated as a working profile: it is the
+    # settings exactly as they were on the day they were put away.
+    deleted_profiles: dict = field(default_factory=dict)
+
+
+def parse_deleted_profiles(data: dict, profiles: dict) -> dict:
+    """`[deleted_profiles.*]`, checked only for the little this file promises.
+
+    Deliberately NOT validated as a business profile: a removed business may
+    well be missing the things a working one needs (that can be why it was
+    removed), and refusing to load the whole config over it would make a
+    removal unrecoverable — the exact opposite of what a soft delete is for.
+
+    What IS checked: it is a table of tables, its names are names TOML can
+    write back, it does not shadow a live business, and every entry says when
+    it was removed — because "restorable for 30 days" is a promise the file has
+    to be able to keep.
+    """
+    removed = data.get("deleted_profiles", {})
+    if not isinstance(removed, dict):
+        raise ValueError(
+            "[deleted_profiles] must be a table of removed businesses, not a "
+            f"{type(removed).__name__}"
+        )
+    for key, profile in removed.items():
+        if not re.match(r"^[A-Za-z0-9_-]+$", str(key)):
+            raise ValueError(
+                f"removed business {key!r} has a name TOML cannot write back — "
+                "letters, digits, underscores and hyphens only"
+            )
+        if not isinstance(profile, dict):
+            raise ValueError(
+                f"removed business {key!r} must be a table like "
+                f"[deleted_profiles.{key}], not a {type(profile).__name__}"
+            )
+        if key in profiles:
+            raise ValueError(
+                f"{key!r} is listed both as a business and as a removed "
+                "business. Rename or delete one of the two sections."
+            )
+        stamp = str(profile.get(DELETED_AT_KEY, "")).strip()
+        if not stamp:
+            raise ValueError(
+                f"removed business {key!r} does not say when it was removed — "
+                f'it needs {DELETED_AT_KEY} = "2026-08-27T09:00:00-04:00"'
+            )
+        try:
+            datetime.fromisoformat(stamp)
+        except ValueError:
+            raise ValueError(
+                f"removed business {key!r} has {DELETED_AT_KEY} = {stamp!r}, "
+                "which is not a date and time this bridge can read"
+            )
+    return removed
 
 
 def parse_config(data: dict) -> Config:
@@ -1543,7 +1605,8 @@ def parse_config(data: dict) -> Config:
                 f"brain ({', '.join(sorted(brains))})"
             )
     return Config(numbers=numbers, profiles=profiles, brains=brains,
-                  active_brain=active, branding=branding, owners=owners)
+                  active_brain=active, branding=branding, owners=owners,
+                  deleted_profiles=parse_deleted_profiles(data, profiles))
 
 
 def load_business_config(path: str) -> Config:
@@ -1813,11 +1876,40 @@ def _toml_inline_table(value, where: str) -> str:
     return "{ " + ", ".join(parts) + " }" if parts else "{}"
 
 
+def _emit_profile_body(lines: list, key: str, profile: dict,
+                       section: str = "profiles") -> None:
+    """One `[profiles.key]` (or `[deleted_profiles.key]`) table's own lines.
+
+    Known settings first, in the order an owner meets them, then anything the
+    owner hand-wrote that this bridge does not read — kept exactly as typed, and
+    with its type intact.
+    """
+    for field_name in _PROFILE_KNOWN_KEYS:
+        if field_name not in profile:
+            continue
+        value = profile[field_name]
+        where = f"{section}.{key}.{field_name}"
+        if isinstance(value, str):
+            if value.strip():
+                lines.append(f"{field_name} = {_toml_str(value.strip())}")
+        elif field_name in _PROFILE_INLINE_TABLE_KEYS:
+            lines.append(f"{field_name} = {_toml_inline_table(value, where)}")
+        else:
+            # false, 0 and [] are answers, not absences: writing them out is
+            # what keeps a switched-off setting switched off after a save.
+            lines.append(f"{field_name} = {_toml_value(value, where)}")
+    for field_name, value in profile.items():
+        if field_name not in _PROFILE_KNOWN_KEYS:
+            lines.append(f"{field_name} = "
+                         f"{_toml_value(value, f'{section}.{key}.{field_name}')}")
+
+
 def emit_business_toml(numbers: dict, profiles: dict,
                        brains: dict[str, Brain] | None = None,
                        active_brain: str = "",
                        branding: "Branding | None" = None,
-                       owners: dict | None = None) -> str:
+                       owners: dict | None = None,
+                       deleted_profiles: dict | None = None) -> str:
     """Serialize the config back to TOML (round-trips through tomllib).
     Used by the dashboard; hand edits with unknown keys survive a save, and so
     do types — a hand-written number comes back a number.
@@ -1869,24 +1961,12 @@ def emit_business_toml(numbers: dict, profiles: dict,
                 lines.append(f"{field_name} = {_toml_str(value)}")
     for key, profile in profiles.items():
         lines += ["", f"[profiles.{key}]"]
-        for field_name in _PROFILE_KNOWN_KEYS:
-            if field_name not in profile:
-                continue
-            value = profile[field_name]
-            where = f"profiles.{key}.{field_name}"
-            if isinstance(value, str):
-                if value.strip():
-                    lines.append(f"{field_name} = {_toml_str(value.strip())}")
-            elif field_name in _PROFILE_INLINE_TABLE_KEYS:
-                lines.append(f"{field_name} = {_toml_inline_table(value, where)}")
-            else:
-                # false, 0 and [] are answers, not absences: writing them out is
-                # what keeps a switched-off setting switched off after a save.
-                lines.append(f"{field_name} = {_toml_value(value, where)}")
-        for field_name, value in profile.items():
-            if field_name not in _PROFILE_KNOWN_KEYS:
-                lines.append(f"{field_name} = "
-                             f"{_toml_value(value, f'profiles.{key}.{field_name}')}")
+        _emit_profile_body(lines, key, profile)
+    # Last in the file, because a removed business is the last thing anybody
+    # reading it needs — and because everything above it is what answers calls.
+    for key, profile in (deleted_profiles or {}).items():
+        lines += ["", f"[deleted_profiles.{key}]"]
+        _emit_profile_body(lines, key, profile, "deleted_profiles")
     return "\n".join(lines) + "\n"
 
 
@@ -2255,6 +2335,116 @@ def apply_config_text(text: str) -> list[str]:
              len(profiles), len(config.numbers), config.active_brain,
              config.brains[config.active_brain].model, len(config.owners))
     return []
+
+
+# What the settings screens have to show the owner about the product itself:
+# the standard phrase lists they can edit or remove, the caps a save is held
+# to, the modes an after-hours call can take, and how long a removed business
+# can be put back. Handed to the dashboard rather than copied into it, so there
+# is exactly one place any of these is written down.
+PRODUCT_DEFAULTS = {
+    "transfer_phrases": tuple(DEFAULT_TRANSFER_PHRASES),
+    "end_phrases": tuple(DEFAULT_END_PHRASES),
+    "assistant_aliases": {name: tuple(aliases) for name, aliases
+                          in DEFAULT_ASSISTANT_ALIASES.items()},
+    "max_phrases": MAX_PHRASES,
+    "max_phrase_len": MAX_PHRASE_LEN,
+    "after_hours_modes": tuple(_AFTER_HOURS_MODES),
+    "number_limits": tuple(_PROFILE_NUMBER_LIMITS),
+    "recovery_days": DELETED_PROFILE_RECOVERY_DAYS,
+    "deleted_at_key": DELETED_AT_KEY,
+    "known_profile_keys": tuple(_PROFILE_KNOWN_KEYS),
+}
+
+
+def config_toml(config: Config) -> str:
+    """One validated Config back as the file it came from."""
+    return emit_business_toml(config.numbers, config.profiles, config.brains,
+                              config.active_brain, config.branding,
+                              config.owners, config.deleted_profiles)
+
+
+def config_diff(before: str, after: str) -> str:
+    """What one save changed, as a unified diff that carries BOTH versions.
+
+    The context is deliberately unlimited. Two things need this to be complete:
+    the Activity screen shows the changed lines with their neighbours, and its
+    "put this back" button rebuilds the previous file from this text — with a
+    three-line context that would be a guess, and the settings a customer's
+    phone line answers on are not something to guess at. The diff of a few-KB
+    config is a few KB.
+    """
+    old, new = before.splitlines(), after.splitlines()
+    return "\n".join(difflib.unified_diff(
+        old, new, fromfile="businesses.toml (before)",
+        tofile="businesses.toml (after)", lineterm="",
+        n=max(len(old), len(new), 1)))
+
+
+def config_from_diff(diff: str, *, side: str) -> str:
+    """One of the two versions a `config_diff` carries, rebuilt exactly.
+
+    `side` is "before" or "after". Returns "" for a diff that is empty (a save
+    that changed nothing) — the caller must treat that as "there is nothing to
+    put back", never as "an empty config file".
+    """
+    keep = {"before": (" ", "-"), "after": (" ", "+")}[side]
+    body = [line for line in str(diff).splitlines()
+            if not line.startswith(("---", "+++", "@@", "\\"))]
+    if not body:
+        return ""
+    return "".join(line[1:] + "\n" for line in body if line[:1] in keep)
+
+
+def apply_config(config: Config, actor: str, summary: str) -> str | None:
+    """Write one whole Config to the live line, and write down that it happened.
+
+    The single path every dashboard save goes through — a greeting, the opening
+    hours, a number's business, the model that answers, a removed business.
+    Returns None when the line is now answering on the new settings, or the
+    sentence explaining why nothing changed.
+
+    Fail-closed all the way down: the emitter refuses what it cannot write back
+    faithfully, `apply_config_text` refuses what does not validate, and either
+    refusal leaves the file and the live config exactly as they were. The
+    `config_changes` row is written for the REFUSALS too — "I changed the
+    greeting and nothing happened" is a question that has to have an answer.
+    """
+    before = ""
+    try:
+        with open(BUSINESS_CONFIG, "r", encoding="utf-8") as f:
+            before = f.read()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        # Not fatal to the save — the file below is written whole — but the
+        # audit line would be a diff against nothing, so say so out loud.
+        log.warning("could not read %s to work out what this save changes: %s",
+                    BUSINESS_CONFIG, e)
+    text = ""
+    try:
+        text = config_toml(config)
+    except ValueError as e:
+        errors = [str(e)]
+    else:
+        errors = apply_config_text(text)
+    reason = "; ".join(str(e) for e in errors)
+    try:
+        STORE.record_config_change(
+            actor=str(actor), summary=str(summary),
+            diff=config_diff(before, text) if text else "",
+            applied=not errors, reason=reason)
+    except Exception:
+        # The change itself already happened (or already did not). An audit row
+        # we could not write is loud here and nowhere else.
+        log.exception("call store: could not record the settings change %r",
+                      summary)
+    if errors:
+        log.warning("dashboard: %s tried to change settings (%s) and it was "
+                    "refused: %s", actor, summary, reason)
+        return reason
+    log.info("dashboard: %s changed settings — %s", actor, summary)
+    return None
 
 # ----------------------------------------------------- end-call scrubbing --
 
@@ -4456,14 +4646,21 @@ async def _serve() -> None:
         import admin
         admin_app = admin.build_admin_app(
             get_state=lambda: (NUMBERS, PROFILES),
+            get_config=lambda: CONFIG,
             get_brains=lambda: (BRAINS, ACTIVE_BRAIN),
             get_branding=lambda: BRANDING,
             get_owners=lambda: OWNERS,
             get_health=health_snapshot,
             get_brain_health=lambda: BRAIN_HEALTH,
-            apply_config_text=apply_config_text,
-            emit_business_toml=emit_business_toml,
+            apply_config=apply_config,
+            delivery_targets=delivery_targets,
+            profile_setting=profile_setting,
+            opening_line=opening_line,
+            parse_config=parse_config,
+            config_from_diff=config_from_diff,
             acknowledge_delivery_failure=acknowledge_delivery_failure,
+            public_base=PUBLIC_BASE,
+            product_defaults=PRODUCT_DEFAULTS,
             store=STORE,
         )
         admin_runner = web.AppRunner(admin_app, access_log=None)

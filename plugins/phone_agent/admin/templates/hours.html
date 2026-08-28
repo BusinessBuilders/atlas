@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Hours{% endblock %}
+{% block main %}
+{% with head_title = "Hours & availability",
+        head_blurb = "Your line answers around the clock — this decides what it does outside your hours",
+        head_here = "hours",
+        head_picker_action = "/hours" %}
+{% include "_settings_head.html" %}
+{% endwith %}
+
+<div class="band band-{{ 'ok' if state.level == 'ok' else 'warn' }}">
+  <span class="band-dot" aria-hidden="true"></span>
+  <div class="band-words"><span class="strong">{{ state.text }}</span></div>
+</div>
+
+{% if error %}
+<p class="notice notice-bad" role="alert">{{ error }}</p>
+{% endif %}
+{% if saved %}
+<p class="notice notice-ok" role="status" aria-live="polite">Saved — live on the next call.</p>
+{% endif %}
+
+<form method="post" action="/hours/{{ business_key }}" class="hours-grid"
+      data-dirty-watch>
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="version" value="{{ version }}">
+
+  <section class="card stack-16">
+    <div class="card-head">
+      <h2 class="display display-m flush">Weekly hours</h2>
+      <div class="row-gap">
+        <label class="label flush" for="timezone">Time zone</label>
+        <select class="input zone-select" id="timezone" name="timezone"
+                aria-describedby="hint-timezone{% if errors.get('timezone') %} error-timezone{% endif %}">
+          <option value=""{{ ' selected' if not values.timezone else '' }}>Not set</option>
+          {% for name, label in zones %}
+          <option value="{{ name }}"{{ ' selected' if values.timezone == name else '' }}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p class="hint" id="hint-timezone">Every time below is read in this zone,
+      whatever zone the machine answering your calls is in.</p>
+    {% if errors.get('timezone') %}
+    <p class="hint field-error" id="error-timezone" role="alert">{{ errors.get('timezone') }}</p>
+    {% endif %}
+
+    {% if values.always_open and not errors %}
+    <p class="notice notice-ok" role="status">Always open — the agent answers
+      24/7 and the same way at 3am as at 3pm. Switch a day on below to change
+      that.</p>
+    {% endif %}
+
+    <div class="week">
+      {% for day in values.days %}
+      <fieldset class="day-row{{ ' day-closed' if not day.open else '' }}">
+        <legend class="visually-hidden">{{ day.name }}</legend>
+        <span class="day-name">{{ day.name }}</span>
+        <span class="checkline day-toggle">
+          <input type="checkbox" id="open_{{ day.key }}" name="open_{{ day.key }}"
+                 value="on" {{ 'checked' if day.open else '' }}>
+          <label class="label flush" for="open_{{ day.key }}">
+            <span class="visually-hidden">{{ day.name }} </span>Open</label>
+        </span>
+        <span class="day-times">
+          <label class="visually-hidden" for="from_{{ day.key }}">{{ day.name }} opens at</label>
+          <input class="input" id="from_{{ day.key }}" name="from_{{ day.key }}"
+                 value="{{ day['from'] }}" autocomplete="off"
+                 aria-describedby="hint-times{% if errors.get('day_' ~ day.key) %} error-day-{{ day.key }}{% endif %}">
+          <span class="subtle day-to">to</span>
+          <label class="visually-hidden" for="to_{{ day.key }}">{{ day.name }} closes at</label>
+          <input class="input" id="to_{{ day.key }}" name="to_{{ day.key }}"
+                 value="{{ day.to }}" autocomplete="off"
+                 aria-describedby="hint-times{% if errors.get('day_' ~ day.key) %} error-day-{{ day.key }}{% endif %}">
+        </span>
+        {% if day.overnight %}
+        <span class="subtle day-note">Runs past midnight into the next morning.</span>
+        {% endif %}
+        {% if errors.get('day_' ~ day.key) %}
+        <p class="hint field-error day-note" id="error-day-{{ day.key }}" role="alert">{{ errors.get('day_' ~ day.key) }}</p>
+        {% endif %}
+      </fieldset>
+      {% endfor %}
+    </div>
+    <p class="hint" id="hint-times">Write times however you say them — 9:00 AM,
+      9am or 09:00 all work. A day with the switch off is closed all day.</p>
+  </section>
+
+  <div class="stack-16">
+    <section class="card stack-12">
+      <h2 class="eyebrow flush">After hours</h2>
+      <fieldset class="stack-12">
+        <legend class="visually-hidden">What the line does outside your hours</legend>
+        {% for value, label, blurb in after_hours_choices %}
+        <div class="checkline">
+          <input type="radio" id="after_{{ value }}" name="after_hours" value="{{ value }}"
+                 {{ 'checked' if values.after_hours == value else '' }}
+                 aria-describedby="after-blurb-{{ value }}">
+          {# One line for the sentence: `trim_blocks` eats the newline after a
+             block tag, so a phrase split across template lines runs straight
+             into the next one with no space between them. #}
+          <label class="label flush" for="after_{{ value }}">{{ label }}
+            <span class="subtle after-blurb" id="after-blurb-{{ value }}">{{ blurb }}{% if value == 'transfer' %}{% if forward_to %} Rings {{ forward_to | fmt_phone }}.{% else %} This business has no number to transfer to yet.{% endif %}{% endif %}</span></label>
+        </div>
+        {% endfor %}
+      </fieldset>
+      {% if errors.get('after_hours') %}
+      <p class="hint field-error" role="alert">{{ errors.get('after_hours') }}</p>
+      {% endif %}
+      <div>
+        <label class="label" for="after_hours_greeting">Closed greeting</label>
+        <textarea class="input" id="after_hours_greeting" name="after_hours_greeting"
+                  rows="4" aria-describedby="hint-closed-greeting">{{ values.after_hours_greeting }}</textarea>
+        <p class="hint" id="hint-closed-greeting">What a caller hears instead of
+          your usual greeting when you are closed. Leave it empty to use the
+          same greeting around the clock.</p>
+        {% if errors.get('after_hours_greeting') %}
+        <p class="hint field-error" role="alert">{{ errors.get('after_hours_greeting') }}</p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="card stack-12">
+      <h2 class="eyebrow flush">Holidays and closures</h2>
+      <fieldset class="rows" data-rows>
+        <legend class="visually-hidden">Days you are closed</legend>
+        <p class="hint" id="hint-holidays">One date, like 2026-12-25, or a range
+          written 2026-12-24..2026-12-26. A closure shuts the whole day
+          whatever your weekly hours say. Clear a line and save to remove it.</p>
+        {% if errors.get('holidays') %}
+        <p class="hint field-error" role="alert">{{ errors.get('holidays') }}</p>
+        {% endif %}
+        {% if not values.holidays %}
+        <p class="subtle flush">No closures yet — the weekly hours above are the
+          whole story.</p>
+        {% endif %}
+        {% for item in values.holidays %}
+        <div class="row-line" data-row>
+          <label class="visually-hidden" for="holiday-{{ loop.index }}">Closure {{ loop.index }}</label>
+          <input class="input" id="holiday-{{ loop.index }}" name="holiday"
+                 value="{{ item }}" aria-describedby="hint-holidays">
+          <button class="btn btn-quiet btn-small row-remove" type="button"
+                  data-remove-row>Remove<span class="visually-hidden"> closure {{ loop.index }}</span></button>
+        </div>
+        {% endfor %}
+        <div class="row-line" data-row data-row-blank>
+          <label class="visually-hidden" for="holiday-new">Add a closure</label>
+          <input class="input" id="holiday-new" name="holiday" value=""
+                 placeholder="2026-12-24..2026-12-26" aria-describedby="hint-holidays">
+          <button class="btn btn-quiet btn-small row-remove" type="button"
+                  data-remove-row hidden>Remove</button>
+        </div>
+      </fieldset>
+    </section>
+
+    <div class="row-gap">
+      <button class="btn btn-primary" type="submit" data-busy-label="Saving…">Save hours</button>
+      <a class="btn btn-quiet" href="/hours/{{ business_key }}">Discard</a>
+    </div>
+  </div>
+</form>
+{% endblock %}

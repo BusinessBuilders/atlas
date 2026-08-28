@@ -1,0 +1,11 @@
+{% from "_section_frame.html" import section_form, rows with context %}
+{% call section_form(section, "Save facts") %}
+{% if not section.fields.facts %}
+<p class="notice notice-bad" role="status">Your agent currently cannot answer a
+  single question about your business. Add your hours, your email and where you
+  work, and it will use them — and nothing else.</p>
+{% endif %}
+{% set facts_hint = "These are the ONLY specifics it will give a caller — hours, email, service area, how you price. Anything not written here, it says it cannot say." %}
+{{ rows(section, "fact", section.fields.facts, "Facts the agent may state",
+        facts_hint, "Add a fact — hours, email, service area, pricing…") }}
+{% endcall %}

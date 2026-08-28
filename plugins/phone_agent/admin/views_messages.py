@@ -19,6 +19,7 @@ import csv
 import io
 import logging
 import time
+from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import web
 
@@ -139,22 +140,32 @@ def _message_in_scope(deps, session, message_id: int):
     return message
 
 
-def _set_status(deps, session, message_id: int, wanted: str):
-    """(the card, how many are still waiting), or (None, 0) when it is not
-    theirs.
+def _set_status(deps, session, message_id: int, wanted: str, chosen: str):
+    """(the card, how many are still waiting, how many are in this list), or
+    (None, 0, None) when the message is not theirs.
 
-    One blocking call, one read: the row comes back once, the write is applied
-    to it in memory rather than read again. These are SQLite reads on the loop
-    that carries live calls.
+    One blocking call: the row comes back once, the write is applied to it in
+    memory rather than read again, and the two counts the screen shows are
+    taken here so the card and the heading can never disagree. These are SQLite
+    reads on the loop that carries live calls.
     """
     message = _message_in_scope(deps, session, message_id)
     if message is None:
-        return None, 0
+        return None, 0, None
     deps.store.set_message_status(message["id"], wanted)
     message["status"], message["updated_at"] = wanted, time.time()
     from . import views_calls
     card = decorate_message(message, views_calls.business_names(deps))
-    return card, render.count_waiting(deps, session)
+    total = (deps.store.count_messages(session.profile_keys, chosen)
+             if chosen else None)
+    return card, render.count_waiting(deps, session), total
+
+
+def _filter_of(back: str) -> str:
+    """The status tab the card was on, read back off the link it came from."""
+    query = parse_qs(urlsplit(str(back or "")).query)
+    wanted = (query.get("status") or [""])[0].strip()
+    return wanted if wanted in STATUSES else ""
 
 
 async def message_status(request: web.Request) -> web.Response:
@@ -177,8 +188,9 @@ async def message_status(request: web.Request) -> web.Response:
         message_id = int(request.match_info["id"])
     except ValueError:
         message_id = -1
-    updated, waiting = await asyncio.to_thread(_set_status, deps, session,
-                                               message_id, wanted)
+    back = str(form.get("back", "/messages"))
+    updated, waiting, total = await asyncio.to_thread(
+        _set_status, deps, session, message_id, wanted, _filter_of(back))
     if updated is None:
         # Not theirs, or gone. The same answer either way.
         return await render.page(
@@ -190,12 +202,16 @@ async def message_status(request: web.Request) -> web.Response:
         # The card, plus the navigation's waiting count swapped out of band: a
         # badge still reading "2" beside the message just moved off the list is
         # the screen contradicting itself.
-        return render.partial(request, deps, "_message_card.html",
-                              session=session, message=updated,
-                              many_businesses=len(session.profile_keys) > 1,
-                              oob_waiting=waiting,
-                              back=str(form.get("back", "/messages")))
-    back = str(form.get("back", "")).strip()
+        return render.partial(
+            request, deps, "_message_card.html", session=session,
+            message=updated, many_businesses=len(session.profile_keys) > 1,
+            oob_waiting=waiting, back=back,
+            # The heading is swapped too, but only on the screen that HAS one:
+            # an out-of-band swap with nothing to land on is an error in the
+            # browser's console of a page a customer is looking at.
+            on_messages_screen=back.startswith("/messages"),
+            chosen=_filter_of(back), total=total, error="")
+    back = back.strip()
     raise web.HTTPSeeOther(back if back.startswith("/messages") else "/messages")
 
 

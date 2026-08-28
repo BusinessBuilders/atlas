@@ -59,8 +59,12 @@
   </div>
 </article>
 {% if oob_waiting is defined %}
-{# htmx swaps these two out of band so the navigation's count agrees with the
-   card that has just moved. Rendered only for an htmx status change. #}
+{# htmx swaps these out of band so the navigation's count AND the sentence
+   under the heading agree with the card that has just moved. Rendered only for
+   an htmx status change on the Messages screen. #}
 {{ waiting_badge(oob_waiting, oob=true) }}
 {{ waiting_count_tab(oob_waiting, oob=true) }}
+{% if on_messages_screen %}
+{% with oob = true, waiting = oob_waiting %}{% include "_messages_heading.html" %}{% endwith %}
+{% endif %}
 {% endif %}

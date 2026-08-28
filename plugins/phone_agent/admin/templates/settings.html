@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ business }}{% endblock %}
+{% block main %}
+{% with head_title = business,
+        head_blurb = "How your line introduces itself and what it may say",
+        head_here = "business",
+        head_picker_action = "/settings" %}
+{% include "_settings_head.html" %}
+{% endwith %}
+
+{# The unsaved-changes bar is in the page from the start and app.js shows it
+   the moment something is typed. Every section still saves on its own, so a
+   browser with no JavaScript loses nothing — it simply never sees the bar. #}
+<div class="dirty-bar" id="dirty-bar" hidden role="status" aria-live="polite">
+  <span class="strong">You have changes that are not saved yet.</span>
+  <span class="muted">Each section saves with its own button.</span>
+  <a class="btn btn-quiet" href="/settings/{{ business_key }}">Discard and reload</a>
+</div>
+
+<div class="settings-grid">
+  <div class="settings-column">
+    {% for section in main_sections %}
+    {% include "_section_" ~ section.name ~ ".html" %}
+    {% endfor %}
+  </div>
+  <div class="settings-column">
+    {% for section in side_sections %}
+    {% include "_section_" ~ section.name ~ ".html" %}
+    {% endfor %}
+
+    <section class="card danger-card stack-12">
+      <h2 class="eyebrow state-bad flush">Danger zone</h2>
+      <p class="muted flush">Removing this business stops the line answering
+        for it and unhooks its phone numbers. You can put it back from Activity
+        for 30 days.</p>
+      <a class="btn btn-quiet danger-link self-start"
+         href="/business/{{ business_key }}/delete">{{ icon("trash", 16) }}Remove business…</a>
+    </section>
+  </div>
+</div>
+{% endblock %}

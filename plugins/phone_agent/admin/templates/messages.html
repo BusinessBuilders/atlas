@@ -8,13 +8,7 @@
 <div class="page-head">
   <div>
     <h1 class="display display-l flush">Messages</h1>
-    <p class="muted flush">
-      {% if error %}Your messages could not be read
-      {% elif chosen %}{{ total }} in this list · newest first
-      {# The same number the navigation badge draws, not a second count of the
-         same thing: two counts that disagree are worse than either alone. #}
-      {% else %}{{ waiting }} waiting · newest first{% endif %}
-    </p>
+    {% with oob = false %}{% include "_messages_heading.html" %}{% endwith %}
   </div>
   <div class="row-gap">
     <a class="btn btn-quiet" href="/messages.csv{{ '?status=' + chosen if chosen else '' }}">Export CSV</a>

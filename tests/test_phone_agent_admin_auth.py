@@ -132,22 +132,40 @@ class Dashboard:
         self.store = svc.STORE
 
 
-def dashboard(svc, *, health=health_ok, brain_health=None):
-    """Serve the real dashboard against a real service module."""
-    admin = load_admin()
-    app = admin.build_admin_app(
+def dashboard_kwargs(svc, *, health=health_ok, brain_health=None, store=True):
+    """Every dependency `build_admin_app` needs, wired to a real service.
+
+    One place, so a test that builds the app by hand cannot drift from the one
+    the service itself builds — that drift is exactly what let the old
+    dashboard ship 39 lines behind the file it was deployed over.
+    """
+    return dict(
         get_state=lambda: (svc.NUMBERS, svc.PROFILES),
+        get_config=lambda: svc.CONFIG,
         get_brains=lambda: (svc.BRAINS, svc.ACTIVE_BRAIN),
         get_branding=lambda: svc.BRANDING,
         get_owners=lambda: svc.OWNERS,
         get_health=health,
         get_brain_health=(lambda: svc.BRAIN_HEALTH) if brain_health is None
         else (lambda: brain_health),
-        apply_config_text=svc.apply_config_text,
-        emit_business_toml=svc.emit_business_toml,
+        apply_config=svc.apply_config,
+        delivery_targets=svc.delivery_targets,
+        profile_setting=svc.profile_setting,
+        opening_line=svc.opening_line,
+        parse_config=svc.parse_config,
+        config_from_diff=svc.config_from_diff,
         acknowledge_delivery_failure=svc.acknowledge_delivery_failure,
-        store=svc.STORE,
+        public_base=svc.PUBLIC_BASE,
+        product_defaults=svc.PRODUCT_DEFAULTS,
+        store=svc.STORE if store else None,
     )
+
+
+def dashboard(svc, *, health=health_ok, brain_health=None):
+    """Serve the real dashboard against a real service module."""
+    admin = load_admin()
+    app = admin.build_admin_app(**dashboard_kwargs(
+        svc, health=health, brain_health=brain_health))
     return _Serving(svc, admin, app)
 
 
@@ -548,17 +566,7 @@ def test_the_navigation_never_points_at_a_route_this_build_does_not_serve(line):
     urls = set()
 
     async def build():
-        app = admin.build_admin_app(
-            get_state=lambda: (line.NUMBERS, line.PROFILES),
-            get_brains=lambda: (line.BRAINS, line.ACTIVE_BRAIN),
-            get_branding=lambda: line.BRANDING,
-            get_owners=lambda: line.OWNERS,
-            get_health=health_ok,
-            get_brain_health=lambda: line.BRAIN_HEALTH,
-            apply_config_text=line.apply_config_text,
-            emit_business_toml=line.emit_business_toml,
-            acknowledge_delivery_failure=line.acknowledge_delivery_failure,
-            store=line.STORE)
+        app = admin.build_admin_app(**dashboard_kwargs(line))
         urls.update(r.resource.canonical for r in app.router.routes())
 
     asyncio.run(build())
@@ -572,14 +580,4 @@ def test_the_navigation_never_points_at_a_route_this_build_does_not_serve(line):
 def test_the_dashboard_refuses_to_start_without_the_call_store(line):
     admin = load_admin()
     with pytest.raises(RuntimeError, match="call store"):
-        admin.build_admin_app(
-            get_state=lambda: (line.NUMBERS, line.PROFILES),
-            get_brains=lambda: (line.BRAINS, line.ACTIVE_BRAIN),
-            get_branding=lambda: line.BRANDING,
-            get_owners=lambda: line.OWNERS,
-            get_health=health_ok,
-            get_brain_health=lambda: line.BRAIN_HEALTH,
-            apply_config_text=line.apply_config_text,
-            emit_business_toml=line.emit_business_toml,
-            acknowledge_delivery_failure=line.acknowledge_delivery_failure,
-            store=None)
+        admin.build_admin_app(**dashboard_kwargs(line, store=False))

@@ -81,4 +81,113 @@
       say(button, failed, true);
     });
   });
+
+  /* Third: the settings screens.
+   *
+   * Two small jobs, both of which the page works without.
+   *
+   *   1. A sticky bar that appears the moment something is typed and says the
+   *      change is not saved yet. Every section still has its own save button
+   *      and the server does not care about this at all — with JavaScript off
+   *      the bar simply never appears.
+   *   2. Repeatable rows: Remove takes a line away, and a fresh empty line
+   *      appears as soon as the last one is used. With JavaScript off the form
+   *      still has one empty line to type into, and clearing a line and saving
+   *      still removes it — which is what the hint under every row group says.
+   */
+  function markDirty() {
+    var bar = document.getElementById("dirty-bar");
+    if (bar) {
+      bar.hidden = false;
+    }
+  }
+
+  document.addEventListener("input", function (event) {
+    if (event.target.closest("[data-dirty-watch]")) {
+      markDirty();
+      addBlankRow(event.target);
+    }
+  });
+
+  document.addEventListener("change", function (event) {
+    if (event.target.closest("[data-dirty-watch]")) {
+      markDirty();
+    }
+  });
+
+  /* A save that went through leaves the panel with nothing unsaved in it. Any
+     other panel on the page may still be dirty, so the bar only goes away when
+     no field in the page differs from what the server last sent. Simplest
+     honest rule: the swap replaces the section's markup, so re-check every
+     watched form for a value the browser still thinks is edited. */
+  document.body.addEventListener("htmx:afterSwap", function () {
+    var bar = document.getElementById("dirty-bar");
+    if (!bar) {
+      return;
+    }
+    var edited = document.querySelectorAll("[data-dirty-watch] :is(input, textarea, select)");
+    for (var i = 0; i < edited.length; i++) {
+      var field = edited[i];
+      if (field.type === "checkbox" || field.type === "radio") {
+        if (field.checked !== field.defaultChecked) {
+          return;
+        }
+      } else if (field.value !== field.defaultValue && field.tagName !== "SELECT") {
+        return;
+      }
+    }
+    bar.hidden = true;
+  });
+
+  function addBlankRow(field) {
+    var row = field.closest ? field.closest("[data-row-blank]") : null;
+    if (!row || !field.value) {
+      return;
+    }
+    var group = row.parentNode;
+    var fresh = row.cloneNode(true);
+    /* The one that has just been typed into stops being the blank one, and
+       gets its Remove button; the copy becomes the new blank line. */
+    row.removeAttribute("data-row-blank");
+    var remove = row.querySelector("[data-remove-row]");
+    if (remove) {
+      remove.hidden = false;
+    }
+    var next = fresh.querySelector("input");
+    if (next) {
+      next.value = "";
+      next.removeAttribute("id");
+      var label = fresh.querySelector("label");
+      if (label) {
+        label.removeAttribute("for");
+      }
+    }
+    group.appendChild(fresh);
+  }
+
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest ? event.target.closest("[data-remove-row]") : null;
+    if (!button) {
+      return;
+    }
+    event.preventDefault();
+    var row = button.closest("[data-row]");
+    var group = row ? row.parentNode : null;
+    if (!row || !group) {
+      return;
+    }
+    /* Never leave a group with nothing to type into: removing the last line
+       empties it instead of taking it away. */
+    if (group.querySelectorAll("[data-row]").length <= 1) {
+      var only = row.querySelector("input");
+      if (only) {
+        only.value = "";
+        only.focus();
+      }
+      markDirty();
+      return;
+    }
+    row.parentNode.removeChild(row);
+    markDirty();
+  });
 })();

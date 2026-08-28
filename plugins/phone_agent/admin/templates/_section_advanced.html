@@ -1,0 +1,63 @@
+{% from "_section_frame.html" import section_form, field_error, described_by with context %}
+{# Collapsed by default: none of it is needed to run a phone line, and an owner
+   who opens it is looking for something specific. Kept open when a save was
+   refused, so the reason is not hidden behind a click. #}
+{% call section_form(section, "Save advanced") %}
+<details class="advanced"{{ ' open' if section.errors or section.error else '' }}>
+  <summary class="label">Advanced settings</summary>
+  <div class="stack-16 advanced-body">
+    {% if section.timezone_missing %}
+    <p class="notice notice-bad" role="status">This business has no time zone
+      set, so opening hours and message times use whatever zone this machine is
+      in. Set it on the <a href="/hours/{{ section.profile_key }}">Hours</a>
+      screen.</p>
+    {% endif %}
+    <div>
+      <label class="label" for="brain">Which model answers this business</label>
+      <select class="input" id="brain" name="brain"
+              {{ described_by(section, "brain", "hint-brain") }}>
+        <option value=""{{ ' selected' if not section.fields.brain else '' }}>Whatever the line is set to</option>
+        {% for key, label in section.brains %}
+        <option value="{{ key }}"{{ ' selected' if section.fields.brain == key else '' }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <p class="hint" id="hint-brain">The line answers on
+        {{ section.active_brain }} unless this business names its own.</p>
+      {{ field_error(section, "brain") }}
+    </div>
+    <div>
+      <label class="label" for="model">Model name to use instead</label>
+      <input class="input" id="model" name="model" value="{{ section.fields.model }}"
+             {{ described_by(section, "model", "hint-model") }}>
+      <p class="hint" id="hint-model">Leave empty unless your supplier has told
+        you to put something here.</p>
+      {{ field_error(section, "model") }}
+    </div>
+    <div>
+      <label class="label" for="retention_days">Keep callers' words for</label>
+      <input class="input" id="retention_days" name="retention_days"
+             type="number" inputmode="numeric"
+             min="{{ section.retention_range[0] }}" max="{{ section.retention_range[1] }}"
+             value="{{ section.fields.retention_days }}"
+             {{ described_by(section, "retention_days", "hint-retention_days") }}>
+      <p class="hint" id="hint-retention_days">Days. After this the transcript
+        and the message text are cleared; the call, its time and your own notes
+        stay.</p>
+      {{ field_error(section, "retention_days") }}
+    </div>
+    {% if section.unknown %}
+    <div class="stack-4">
+      <span class="label">Settings this line does not read</span>
+      <p class="hint">Somebody wrote these into your configuration by hand.
+        They are kept exactly as they are and nothing acts on them — most often
+        that means one of them is a spelling mistake.</p>
+      <dl class="facts">
+        {% for name, value in section.unknown %}
+        <dt class="subtle">{{ name }}</dt><dd>{{ value }}</dd>
+        {% endfor %}
+      </dl>
+    </div>
+    {% endif %}
+  </div>
+</details>
+{% endcall %}

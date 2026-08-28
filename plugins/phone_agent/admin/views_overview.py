@@ -34,6 +34,8 @@ ALERT_WORDS = {
     "brain_unreachable": "The model that answers calls did not respond",
     "brain_missing": "A business points at a model that is not set up",
     "config_backup_failed": "A settings backup could not be written",
+    "caller_deleted": "Every record of one caller was deleted",
+    "dashboard_signin": "Signed in to this dashboard",
     "dashboard_signin_failed": "Someone tried to sign in with the wrong access code",
     "dashboard_signin_locked": "Sign-in was closed for a minute after too many wrong access codes",
     "delivery_failed": "A message could not be delivered",
@@ -77,11 +79,6 @@ def alert_words(kind: str) -> str:
 _read = render.guarded_read
 
 
-def _oldest_waiting(messages) -> float | None:
-    waiting = [m["created_at"] for m in messages if m["status"] == "new"]
-    return min(waiting) if waiting else None
-
-
 def delivery_is_this_owners(deps, session, delivery: dict) -> bool:
     """Whether the bridge's last failed message alert belongs to THIS owner.
 
@@ -96,19 +93,33 @@ def delivery_is_this_owners(deps, session, delivery: dict) -> bool:
     cannot be resolved — a message that failed to reach somebody has to be
     visible to SOMEONE. A scoped owner is shown only what is provably theirs.
     """
+    return whose_delivery(deps, session, delivery)["mine"]
+
+
+def whose_delivery(deps, session, delivery: dict) -> dict:
+    """{"mine": bool, "unreadable": sentence} for one failed message alert.
+
+    The two "no" answers are NOT the same answer, and the button that clears
+    the alert has to tell them apart: "this belongs to another business" is a
+    statement of fact, and saying it when the truth is "the database would not
+    open" is the dashboard inventing a reason.
+    """
     if delivery.get("ok") is not False:
-        return False
+        return {"mine": False, "unreadable": ""}
     if session.sees_whole_line:
-        return True
+        return {"mine": True, "unreadable": ""}
     call_sid = str(delivery.get("call_sid") or "").strip()
     if not call_sid:
-        return False
-    call, _reason = _read("your call log", deps.store.get_call, call_sid)
+        return {"mine": False, "unreadable": ""}
+    call, reason = _read("your call log", deps.store.get_call, call_sid)
+    if reason:
+        return {"mine": False,
+                "unreadable": ("Could not check whose message this was: "
+                               + reason)}
     if not call:
-        # Unknown call, or a store that would not answer (logged with its
-        # traceback by _read). Either way it is not provably this owner's.
-        return False
-    return str(call.get("profile_key") or "") in set(session.profile_keys)
+        return {"mine": False, "unreadable": ""}
+    return {"mine": str(call.get("profile_key") or "")
+            in set(session.profile_keys), "unreadable": ""}
 
 
 def gather(deps, session, *, now=None, delivery=None) -> dict:
@@ -126,8 +137,13 @@ def gather(deps, session, *, now=None, delivery=None) -> dict:
                                now=moment)
     messages, messages_error = _read("your messages", store.list_messages, keys,
                                      limit=LATEST_MESSAGES)
-    waiting, waiting_error = _read("your messages", store.list_messages, keys,
-                                   status="new")
+    # One indexed COUNT and one indexed LIMIT 1 — never the whole waiting list.
+    # Messages are never deleted, only aged of their words, so counting them by
+    # reading them grows without bound on a line that is working.
+    waiting_count, waiting_error = _read("your messages", store.count_messages,
+                                         keys, "new")
+    oldest, oldest_error = _read("your messages", store.list_messages, keys,
+                                 status="new", limit=1, oldest_first=True)
     alerts, alerts_error = _read("what needs attention", store.list_events, keys,
                                  since=moment - ALERT_WINDOW_SECONDS,
                                  levels=("warning", "error"), limit=20,
@@ -135,6 +151,12 @@ def gather(deps, session, *, now=None, delivery=None) -> dict:
     newest, newest_error = _read("your call log", store.list_calls, keys, limit=1)
     notify, _notify_error = _read("your alert history", store.list_notify, keys,
                                   ok=False, limit=1, include_unscoped=whole_line)
+    # The newest attempt of ANY kind, which is what tells an owner of one
+    # business whether THEIR alerts are getting through — the line-wide failure
+    # counters in the health snapshot are somebody else's business.
+    newest_notify, _newest_error = _read("your alert history",
+                                         store.list_notify, keys, limit=1,
+                                         include_unscoped=whole_line)
     for alert in alerts or []:
         alert["label"] = alert_words(alert["kind"])
     for message in messages or []:
@@ -144,13 +166,14 @@ def gather(deps, session, *, now=None, delivery=None) -> dict:
     return {
         "stats": stats, "stats_error": stats_error,
         "messages": messages or [], "messages_error": messages_error,
-        "waiting_count": len(waiting or []),
-        "oldest_waiting_at": _oldest_waiting(waiting or []),
-        "waiting_error": waiting_error,
+        "waiting_count": int(waiting_count or 0),
+        "oldest_waiting_at": (oldest[0]["created_at"] if oldest else None),
+        "waiting_error": waiting_error or oldest_error,
         "alerts": alerts or [], "alerts_error": alerts_error,
         "last_call_at": (newest[0]["started_at"] if newest else None),
         "calls_error": newest_error,
         "notify_failure": (notify[0] if notify else None),
+        "last_notify": (newest_notify[0] if newest_notify else None),
         "delivery_is_mine": delivery_is_this_owners(deps, session,
                                                     dict(delivery or {})),
     }
@@ -241,7 +264,8 @@ async def overview(request: web.Request) -> web.Response:
     band = status.line_status(
         health=health, numbers=numbers, profiles=session.profile_keys,
         last_call_at=data["last_call_at"], notify_failure=data["notify_failure"],
-        owner_brains=owner_brains(deps, session))
+        owner_brains=owner_brains(deps, session),
+        whole_line=session.sees_whole_line, last_notify=data["last_notify"])
     stats = data["stats"] or {}
     per_day = stats.get("per_day") or []
     week_total = sum(int(d["calls"]) for d in per_day)
@@ -275,7 +299,8 @@ async def status_band(request: web.Request) -> web.Response:
         health=health, numbers=scoped_numbers(deps, session),
         profiles=session.profile_keys, last_call_at=data["last_call_at"],
         notify_failure=data["notify_failure"],
-        owner_brains=owner_brains(deps, session))
+        owner_brains=owner_brains(deps, session),
+        whole_line=session.sees_whole_line, last_notify=data["last_notify"])
     return render.partial(request, deps, "_status_band.html", session=session,
                           band=band, checked_at=health.get("probe_checked_at"))
 
@@ -295,7 +320,8 @@ async def health_detail(request: web.Request) -> web.Response:
     band = status.line_status(
         health=health, numbers=numbers, profiles=session.profile_keys,
         last_call_at=data["last_call_at"], notify_failure=data["notify_failure"],
-        owner_brains=owner_brains(deps, session))
+        owner_brains=owner_brains(deps, session),
+        whole_line=session.sees_whole_line, last_notify=data["last_notify"])
     body = dict(health)
     body["profiles"] = list(session.profile_keys)
     body["numbers"] = len(numbers)
@@ -307,6 +333,11 @@ async def health_detail(request: web.Request) -> web.Response:
         body.pop("model", None)
         body.pop("probe_error", None)     # can name the backend's own host
         body.pop("recent_events", None)
+        # Both of these count the WHOLE line's push health, which on a shared
+        # line is somebody else's target failing. Handing them over here would
+        # be the amber chip this screen just stopped showing, in JSON.
+        body.pop("ntfy", None)
+        body.pop("ntfy_failures", None)
         if not data["delivery_is_mine"]:
             # The same sentence the banner hides: it can name another
             # business's push target. Hiding it on the page and handing it over
@@ -340,9 +371,15 @@ async def acknowledge_delivery(request: web.Request) -> web.Response:
                            status=403, reason=reason)
     health, _model_ok = await deps.get_health()
     delivery = dict(health.get("last_delivery") or {})
-    mine = await asyncio.to_thread(delivery_is_this_owners, deps, session,
-                                   delivery)
-    if delivery.get("ok") is False and not mine:
+    whose = await asyncio.to_thread(whose_delivery, deps, session, delivery)
+    if delivery.get("ok") is False and whose["unreadable"]:
+        # The store would not answer. Saying "it belongs to another business"
+        # here would be the dashboard making up a reason for its own outage.
+        return await render.page(
+            request, deps, "refused.html", session=session, status=503,
+            reason=(whose["unreadable"] + ". Nothing was marked as seen — try "
+                    "again in a moment."))
+    if delivery.get("ok") is False and not whose["mine"]:
         log.warning("dashboard: %s tried to clear a failed message alert that "
                     "belongs to another business on this line",
                     session.owner_key)
